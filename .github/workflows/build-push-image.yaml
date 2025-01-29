@@ -12,7 +12,7 @@ on:
 # Define Environment Variables
 # -------------------------------------
 env:
-  GHCR_IMAGE: ghcr.io/${{ github.repository }}/codexray-node-agent:latest
+  GHCR_IMAGE: ghcr.io/codifinary/codexray-node-agent:latest
 
 permissions:
   packages: write    # Required for pushing Docker images to GHCR
