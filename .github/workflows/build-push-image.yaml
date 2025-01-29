@@ -12,14 +12,11 @@ on:
 # Define Environment Variables
 # -------------------------------------
 env:
-  GCR_IMAGE: gcr.io/${{ secrets.GCP_PROJECT_ID }}/codexray-node-agent:latest
-  GKE_CLUSTER: codexray-cluster
-  GKE_REGION: asia-south1
-  GKE_NAMESPACE: codexray
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}/codexray-node-agent:latest
 
 permissions:
-  id-token: write   # Required for Workload Identity Federation
-  contents: read    # Required for accessing repository contents
+  packages: write    # Required for pushing Docker images to GHCR
+  contents: read     # Required for accessing repository contents
 
 # -------------------------------------
 # Job 1: CI - Build, Test, Lint
@@ -27,42 +24,26 @@ permissions:
 jobs:
 
 # -------------------------------------
-# Job 2: Build and Push Docker Image to GCR
+# Job 2: Build and Push Docker Image to GHCR
 # -------------------------------------
   build-and-push:
-    name: Build and Push Docker Image to GCR
+    name: Build and Push Docker Image to GHCR
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-
-      # Authenticate to Google Cloud using Workload Identity Federation
-      - name: Authenticate with Workload Identity Federation
-        uses: google-github-actions/auth@v1
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
-
-      # Set up gcloud CLI
-      - name: Set up Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@v1
-        with:
-          version: 'latest'
-
-      # Configure Docker to use GCR
-      - name: Configure Docker for GCR
-        run: |
-          gcloud auth configure-docker --quiet
+      # Log in to GHCR
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       # Build Docker Image
       - name: Build Docker Image
         run: |
-          docker build -t $GCR_IMAGE -f Dockerfile .
+          docker build -t $GHCR_IMAGE -f Dockerfile .
 
-      # Push Docker Image to GCR
-      - name: Push Docker Image to GCR
+      # Push Docker Image to GHCR
+      - name: Push Docker Image to GHCR
         run: |
-          docker push $GCR_IMAGE
-
+          docker push $GHCR_IMAGE
