@@ -16,7 +16,7 @@ env:
 
 permissions:
   packages: write    # Required for pushing Docker images to GHCR
-  contents: read     # Required for accessing repository contents
+  contents: write     # Required for accessing repository contents
 
 # -------------------------------------
 # Job 1: CI - Build, Test, Lint
@@ -47,7 +47,7 @@ jobs:
       - name: Push Docker Image to GHCR
         run: |
           docker push $GHCR_IMAGE
-          
+
    # Install systemd development headers
       - name: Install systemd development headers
         run: |
