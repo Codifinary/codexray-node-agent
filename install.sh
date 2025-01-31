@@ -10,7 +10,7 @@ fi
 
 BIN_DIR=/usr/bin
 SYSTEMD_DIR=/etc/systemd/system
-VERSION=v
+VERSION=1
 SYSTEM_NAME=codexray-node-agent
 SYSTEMD_SERVICE=${SYSTEM_NAME}.service
 UNINSTALL_SH=${BIN_DIR}/${SYSTEM_NAME}-uninstall.sh
@@ -102,7 +102,7 @@ get_release_version() {
 
 download_binary() {
     info "Downloading binary"
-    URL="https://github.com/Codifinary/codexray-node-agent/releases/download/v/codexray-node-agent"
+    URL="https://github.com/Codifinary/codexray-node-agent/releases/download/v1/codexray-node-agent"
    # URL="${GITHUB_URL}/download/${VERSION}/codexray-node-agent"
    
     #URL="${GITHUB_URL}/download/${VERSION}/codexray-node-agent-${ARCH}"
