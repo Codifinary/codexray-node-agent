@@ -10,7 +10,7 @@ fi
 
 BIN_DIR=/usr/bin
 SYSTEMD_DIR=/etc/systemd/system
-VERSION=v2
+VERSION=v3
 SYSTEM_NAME=codexray-node-agent
 SYSTEMD_SERVICE=${SYSTEM_NAME}.service
 UNINSTALL_SH=${BIN_DIR}/${SYSTEM_NAME}-uninstall.sh
