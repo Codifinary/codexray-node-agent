@@ -47,6 +47,12 @@ jobs:
       - name: Push Docker Image to GHCR
         run: |
           docker push $GHCR_IMAGE
+          
+   # Install systemd development headers
+      - name: Install systemd development headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsystemd-dev
 
       #Build the codexray-node-agent Binary
       - name: Build codexray-node-agent Binary
