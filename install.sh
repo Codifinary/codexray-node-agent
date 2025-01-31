@@ -102,7 +102,8 @@ get_release_version() {
 
 download_binary() {
     info "Downloading binary"
-    URL="${GITHUB_URL}/download/${VERSION}/codexray-node-agent"
+    URL="https://github.com/Codifinary/codexray-node-agent/releases/download/v/codexray-node-agent"
+   # URL="${GITHUB_URL}/download/${VERSION}/codexray-node-agent"
    
     #URL="${GITHUB_URL}/download/${VERSION}/codexray-node-agent-${ARCH}"
     set +e
