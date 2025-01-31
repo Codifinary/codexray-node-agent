@@ -399,7 +399,7 @@ func calcId(cg *cgroup.Cgroup, md *ContainerMetadata) ContainerID {
 	case cgroup.ContainerTypeTalosRuntime:
 		return ContainerID(cg.ContainerId)
 	case cgroup.ContainerTypeStandaloneProcess:
-		return ContainerID(fmt.Sprintf("/standalone/%s", cg.ContainerId))
+		return ContainerID(fmt.Sprintf("/standalone/%s", md.name))
 	case cgroup.ContainerTypeDocker, cgroup.ContainerTypeContainerd, cgroup.ContainerTypeSandbox, cgroup.ContainerTypeCrio:
 	default:
 		return ""
