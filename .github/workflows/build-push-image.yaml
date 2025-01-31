@@ -47,3 +47,35 @@ jobs:
       - name: Push Docker Image to GHCR
         run: |
           docker push $GHCR_IMAGE
+
+      #Build the codexray-node-agent Binary
+      - name: Build codexray-node-agent Binary
+        run: |
+          # Build the binary using the provided command.
+          # The VERSION environment variable is set above.
+          GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -mod=readonly -ldflags "-X main.version=$VERSION" -o codexray-node-agent .
+          # List the output to verify the binary is created.
+          ls -la codexray-node-agent
+
+      # Create a GitHub Release
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: "v${{ env.VERSION }}"           # Using the version from the env variable.
+          release_name: "Release v${{ env.VERSION }}"  # Using the version from the env variable.
+          draft: false
+          prerelease: false
+
+      # Upload Binary as a Release Asset
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./codexray-node-agent      # Path to your binary
+          asset_name: codexray-node-agent          # Name for the asset in the release
+          asset_content_type: application/octet-stream
