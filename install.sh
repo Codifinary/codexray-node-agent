@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-GITHUB_URL="https://github.com/coroot/coroot-node-agent/releases"
+GITHUB_URL="https://github.com/Codifinary/codexray-node-agent/releases/"
 DOWNLOADER=
 SUDO=sudo
 if [ $(id -u) -eq 0 ]; then
@@ -11,7 +11,7 @@ fi
 BIN_DIR=/usr/bin
 SYSTEMD_DIR=/etc/systemd/system
 VERSION=
-SYSTEM_NAME=coroot-node-agent
+SYSTEM_NAME=codexray-node-agent
 SYSTEMD_SERVICE=${SYSTEM_NAME}.service
 UNINSTALL_SH=${BIN_DIR}/${SYSTEM_NAME}-uninstall.sh
 FILE_SERVICE=${SYSTEMD_DIR}/${SYSTEMD_SERVICE}
@@ -37,8 +37,8 @@ verify_system() {
 }
 
 verify_executable() {
-    if [ ! -x ${BIN_DIR}/coroot-node-agent ]; then
-        fatal "Executable coroot-node-agent binary not found at ${BIN_DIR}/coroot-node-agent"
+    if [ ! -x ${BIN_DIR}/codexray-node-agent ]; then
+        fatal "Executable codexray-node-agent binary not found at ${BIN_DIR}/codexray-node-agent"
     fi
 }
 
@@ -71,8 +71,8 @@ verify_downloader() {
 }
 
 setup_tmp() {
-    TMP_DIR=$(mktemp -d -t coroot-agent-install.XXXXXXXXXX)
-    TMP_BIN=${TMP_DIR}/coroot-node-agent
+    TMP_DIR=$(mktemp -d -t codexray-agent-install.XXXXXXXXXX)
+    TMP_BIN=${TMP_DIR}/codexray-node-agent
     cleanup() {
         code=$?
         set +e
@@ -102,7 +102,9 @@ get_release_version() {
 
 download_binary() {
     info "Downloading binary"
-    URL="${GITHUB_URL}/download/${VERSION}/coroot-node-agent-${ARCH}"
+    URL="${GITHUB_URL}/download/${VERSION}/codexray-node-agent"
+   
+    #URL="${GITHUB_URL}/download/${VERSION}/codexray-node-agent-${ARCH}"
     set +e
     case $DOWNLOADER in
         curl)
@@ -122,9 +124,9 @@ download_binary() {
 
 setup_binary() {
     chmod 755 ${TMP_BIN}
-    info "Installing coroot-node-agent to ${BIN_DIR}/coroot-node-agent"
+    info "Installing codexray-node-agent to ${BIN_DIR}/codexray-node-agent"
     $SUDO chown root:root ${TMP_BIN}
-    $SUDO mv -f ${TMP_BIN} ${BIN_DIR}/coroot-node-agent
+    $SUDO mv -f ${TMP_BIN} ${BIN_DIR}/codexray-node-agent
 }
 
 download() {
@@ -157,8 +159,8 @@ remove_uninstall() {
 }
 trap remove_uninstall EXIT
 
-rm -rf /var/lib/coroot-node-agent || true
-rm -f ${BIN_DIR}/coroot-node-agent
+rm -rf /var/lib/codexray-node-agent || true
+rm -f ${BIN_DIR}/codexray-node-agent
 EOF
     $SUDO chmod 755 ${UNINSTALL_SH}
     $SUDO chown root:root ${UNINSTALL_SH}
@@ -181,8 +183,8 @@ create_systemd_service_file() {
     info "systemd: Creating service file ${FILE_SERVICE}"
     $SUDO tee ${FILE_SERVICE} >/dev/null << EOF
 [Unit]
-Description=Coroot node agent
-Documentation=https://coroot.com
+Description=codexray node agent
+Documentation=https://codexray.io
 Wants=network-online.target
 After=network-online.target
 
@@ -205,7 +207,7 @@ TasksMax=infinity
 TimeoutStartSec=0
 Restart=always
 RestartSec=5s
-ExecStart=${BIN_DIR}/coroot-node-agent
+ExecStart=${BIN_DIR}/codexray-node-agent
 EOF
 }
 
@@ -215,7 +217,7 @@ create_service_file() {
 }
 
 get_installed_hashes() {
-    $SUDO sha256sum ${BIN_DIR}/coroot-node-agent ${FILE_SERVICE} ${FILE_ENV} 2>&1 || true
+    $SUDO sha256sum ${BIN_DIR}/codexray-node-agent ${FILE_SERVICE} ${FILE_ENV} 2>&1 || true
 }
 
 systemd_enable() {
