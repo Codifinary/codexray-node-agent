@@ -391,6 +391,9 @@ func (r *Registry) getFQDN(ip netaddr.IP) string {
 
 func calcId(cg *cgroup.Cgroup, md *ContainerMetadata) ContainerID {
 	switch cg.ContainerType {
+	case cgroup.ContainerTypeStandaloneProcess, cgroup.ContainerTypeUnknown:
+		return ContainerID(fmt.Sprintf("/standalone/%s", strconv.FormatInt(time.Now().UnixNano(), 10)))
+
 	case cgroup.ContainerTypeSystemdService:
 		if strings.HasPrefix(cg.ContainerId, "/system.slice/crio-conmon-") {
 			return ""
@@ -398,8 +401,6 @@ func calcId(cg *cgroup.Cgroup, md *ContainerMetadata) ContainerID {
 		return ContainerID(cg.ContainerId)
 	case cgroup.ContainerTypeTalosRuntime:
 		return ContainerID(cg.ContainerId)
-	case cgroup.ContainerTypeStandaloneProcess, cgroup.ContainerTypeUnknown:
-		return ContainerID(fmt.Sprintf("/standalone/%s", strconv.FormatInt(time.Now().UnixNano(), 10)))
 	case cgroup.ContainerTypeDocker, cgroup.ContainerTypeContainerd, cgroup.ContainerTypeSandbox, cgroup.ContainerTypeCrio:
 	default:
 		return ""
