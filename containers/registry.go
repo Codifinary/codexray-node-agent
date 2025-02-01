@@ -325,7 +325,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		if cg.Id == "/init.scope" && pid != 1 {
 			klog.InfoS("ignoring without persisting", "cg", cg.Id, "pid", pid)
 		} else {
-			klog.InfoS("ignoring", "cg", cg.Id, "pid", pid)
+			klog.InfoS("ignoring", "cg", cg.Id, "pid", pid, "name", md.name)
 			r.containersByPid[pid] = nil
 		}
 		return nil
@@ -396,6 +396,8 @@ func calcId(cg *cgroup.Cgroup, md *ContainerMetadata) ContainerID {
 			return ""
 		}
 		return ContainerID(cg.ContainerId)
+	case cgroup.ContainerTypeUnknown:
+		return ContainerID(fmt.Sprintf("apps/%s", md.name))
 	case cgroup.ContainerTypeTalosRuntime:
 		return ContainerID(cg.ContainerId)
 	case cgroup.ContainerTypeDocker, cgroup.ContainerTypeContainerd, cgroup.ContainerTypeSandbox, cgroup.ContainerTypeCrio:
