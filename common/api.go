@@ -1,7 +1,7 @@
 package common
 
 import (
-	"github.com/coroot/coroot-node-agent/flags"
+	"github.com/codifinary/codexray-node-agent/flags"
 )
 
 func AuthHeaders() map[string]string {

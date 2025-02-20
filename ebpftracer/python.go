@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf/link"
-	"github.com/coroot/coroot-node-agent/proc"
+	"github.com/codifinary/codexray-node-agent/proc"
 	"golang.org/x/exp/maps"
 	"k8s.io/klog/v2"
 )

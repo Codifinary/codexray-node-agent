@@ -3,9 +3,9 @@ package containers
 import (
 	"fmt"
 
-	"github.com/coroot/coroot-node-agent/cgroup"
-	"github.com/coroot/coroot-node-agent/logs"
-	"github.com/coroot/coroot-node-agent/proc"
+	"github.com/codifinary/codexray-node-agent/cgroup"
+	"github.com/codifinary/codexray-node-agent/logs"
+	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/coroot/logparser"
 )
 

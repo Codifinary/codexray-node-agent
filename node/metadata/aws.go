@@ -8,7 +8,7 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/coroot/coroot-node-agent/proc"
+	"github.com/codifinary/codexray-node-agent/proc"
 	"k8s.io/klog/v2"
 )
 

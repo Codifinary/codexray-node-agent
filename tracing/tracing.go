@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/coroot/coroot-node-agent/common"
-	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
-	"github.com/coroot/coroot-node-agent/flags"
+	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/ebpftracer/l7"
+	"github.com/codifinary/codexray-node-agent/flags"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"

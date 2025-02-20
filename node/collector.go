@@ -1,9 +1,9 @@
 package node
 
 import (
-	"github.com/coroot/coroot-node-agent/common"
-	"github.com/coroot/coroot-node-agent/flags"
-	"github.com/coroot/coroot-node-agent/node/metadata"
+	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/flags"
+	"github.com/codifinary/codexray-node-agent/node/metadata"
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/klog/v2"
 )

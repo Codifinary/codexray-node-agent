@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf/link"
-	"github.com/coroot/coroot-node-agent/ebpftracer"
-	"github.com/coroot/coroot-node-agent/proc"
+	"github.com/codifinary/codexray-node-agent/ebpftracer"
+	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/jpillora/backoff"
 	"github.com/mdlayher/taskstats"
 )

@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/coroot/coroot-node-agent/cgroup"
+	"github.com/codifinary/codexray-node-agent/cgroup"
 )
 
 var root = "/proc"

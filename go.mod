@@ -1,4 +1,4 @@
-module github.com/coroot/coroot-node-agent
+module github.com/codifinary/codexray-node-agent
 
 go 1.23
 

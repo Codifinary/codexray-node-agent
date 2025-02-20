@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
-	"github.com/coroot/coroot-node-agent/proc"
+	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/florianl/go-conntrack"
 	"github.com/vishvananda/netns"
 	"inet.af/netaddr"

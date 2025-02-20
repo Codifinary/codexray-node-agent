@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/coroot/coroot-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/common"
 )
 
 type CPUStat struct {

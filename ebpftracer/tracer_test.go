@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coroot/coroot-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/common"
 
 	"github.com/containerd/cgroups"
 	cgroupsV2 "github.com/containerd/cgroups/v2"

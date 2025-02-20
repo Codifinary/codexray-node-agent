@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coroot/coroot-node-agent/common"
-	"github.com/coroot/coroot-node-agent/containers"
-	"github.com/coroot/coroot-node-agent/flags"
+	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/containers"
+	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/go-kit/log"
 	ebpfspy "github.com/grafana/pyroscope/ebpf"
 	"github.com/grafana/pyroscope/ebpf/cpp/demangle"
