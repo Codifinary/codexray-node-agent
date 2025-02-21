@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-GITHUB_URL="https://github.com/Codifinary/codexray-node-agent/releases/"
+GITHUB_URL="https://github.com/codifinary/codexray-node-agent/releases"
 DOWNLOADER=
 SUDO=sudo
 if [ $(id -u) -eq 0 ]; then
@@ -102,10 +102,7 @@ get_release_version() {
 
 download_binary() {
     info "Downloading binary"
-    #URL="https://github.com/Codifinary/codexray-node-agent/releases/download/v1/codexray-node-agent"
-   URL="${GITHUB_URL}/download/${VERSION}/codexray-node-agent"
-   
-    #URL="${GITHUB_URL}/download/${VERSION}/codexray-node-agent-${ARCH}"
+    URL="${GITHUB_URL}/download/${VERSION}/codexray-node-agent-${ARCH}"
     set +e
     case $DOWNLOADER in
         curl)
@@ -184,7 +181,7 @@ create_systemd_service_file() {
     info "systemd: Creating service file ${FILE_SERVICE}"
     $SUDO tee ${FILE_SERVICE} >/dev/null << EOF
 [Unit]
-Description=codexray node agent
+Description=Codexray node agent
 Documentation=https://codexray.io
 Wants=network-online.target
 After=network-online.target

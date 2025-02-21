@@ -3,7 +3,7 @@ package node
 import (
 	"regexp"
 
-	"github.com/coroot/coroot-node-agent/proc"
+	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"inet.af/netaddr"

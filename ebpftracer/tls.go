@@ -12,8 +12,8 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf/link"
-	"github.com/coroot/coroot-node-agent/common"
-	"github.com/coroot/coroot-node-agent/proc"
+	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/proc"
 	"golang.org/x/arch/arm64/arm64asm"
 	"golang.org/x/arch/x86/x86asm"
 	"k8s.io/klog/v2"

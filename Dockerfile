@@ -6,17 +6,17 @@ COPY go.sum .
 RUN go mod download
 COPY . .
 ARG VERSION=unknown
-RUN  GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -mod=readonly -ldflags "-X main.version=$VERSION" -o coroot-node-agent .
+RUN GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -mod=readonly -ldflags "-X main.version=$VERSION" -o codexray-node-agent .
 
 FROM registry.access.redhat.com/ubi9/ubi
 
 ARG VERSION=unknown
-LABEL name="coroot-node-agent" \
-      vendor="Coroot, Inc." \
+LABEL name="codexray-node-agent" \
+      vendor="Codexray, Inc." \
       version=${VERSION} \
-      summary="Coroot Node Agent."
+      summary="Codexray Node Agent."
 
 COPY LICENSE /licenses/LICENSE
 
-COPY --from=builder /tmp/src/coroot-node-agent /usr/bin/coroot-node-agent
-ENTRYPOINT ["coroot-node-agent"]
+COPY --from=builder /tmp/src/codexray-node-agent /usr/bin/codexray-node-agent
+ENTRYPOINT ["codexray-node-agent"]

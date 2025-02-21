@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coroot/coroot-node-agent/proc"
+	"github.com/codifinary/codexray-node-agent/proc"
 
 	"github.com/coreos/go-systemd/v22/dbus"
 	gdbus "github.com/godbus/dbus/v5"

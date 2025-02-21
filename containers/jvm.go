@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/coroot/coroot-node-agent/common"
-	"github.com/coroot/coroot-node-agent/proc"
+	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/xin053/hsperfdata"
 	"k8s.io/klog/v2"

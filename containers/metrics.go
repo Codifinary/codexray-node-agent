@@ -1,7 +1,7 @@
 package containers
 
 import (
-	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
+	"github.com/codifinary/codexray-node-agent/ebpftracer/l7"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

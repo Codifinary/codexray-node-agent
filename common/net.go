@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/coroot/coroot-node-agent/flags"
+	"github.com/codifinary/codexray-node-agent/flags"
 	"inet.af/netaddr"
 	"k8s.io/klog/v2"
 )
