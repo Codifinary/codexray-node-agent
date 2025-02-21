@@ -116,8 +116,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: "v${{ env.VERSION }}" # Using the version from the env variable.
-          release_name: "Release v${{ env.VERSION }}" # Using the version from the env variable.
+          tag_name: "v${{ env.VERSION }}-${{ github.run_id }}" # Using the version and run ID for a unique tag.
+          release_name: "Release v${{ env.VERSION }}-${{ github.run_id }}" # Using the version and run ID for a unique release name.
           draft: false
           prerelease: false
 
