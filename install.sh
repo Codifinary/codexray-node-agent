@@ -182,7 +182,7 @@ create_systemd_service_file() {
     $SUDO tee ${FILE_SERVICE} >/dev/null << EOF
 [Unit]
 Description=Codexray node agent
-Documentation=https://codexray.com
+Documentation=https://codexray.io
 Wants=network-online.target
 After=network-online.target
 

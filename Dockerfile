@@ -6,7 +6,7 @@ COPY go.sum .
 RUN go mod download
 COPY . .
 ARG VERSION=unknown
-RUN CGO_ENABLED=1 go build -mod=readonly -ldflags "-X main.version=$VERSION" -o codexray-node-agent .
+RUN GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -mod=readonly -ldflags "-X main.version=$VERSION" -o codexray-node-agent .
 
 FROM registry.access.redhat.com/ubi9/ubi
 
