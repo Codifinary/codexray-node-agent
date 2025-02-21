@@ -53,6 +53,12 @@ jobs:
       - name: Install dependencies
         run: go mod download
 
+      # Install systemd development headers
+      - name: Install systemd development headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsystemd-dev
+
       # Build the Go project
       - name: Build
         run: go build -o codexray-node-agent .
