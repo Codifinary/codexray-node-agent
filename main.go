@@ -133,22 +133,38 @@ func main() {
 	registry := prometheus.NewRegistry()
 	registerer := prometheus.WrapRegistererWith(prometheus.Labels{"machine_id": machineId, "system_uuid": systemUuid}, registry)
 
-	registerer.MustRegister(info("node_agent_info", version))
+	if *flags.EnableNodeRegistration {
+		klog.Infoln("Running in registry-only mode")
+		registerer.MustRegister(info("node_agent_info", version))
 
-	if err := registerer.Register(node.NewCollector(hostname, kv)); err != nil {
-		klog.Exitln(err)
+		if err := registerer.Register(node.NewCollector(hostname, kv)); err != nil {
+			klog.Exitln(err)
+		}
+	} else {
+		klog.Infoln("Running with tracing and profiling enabled")
+
+		tracing.Init(machineId, hostname, version)
+		logs.Init(machineId, hostname, version)
+
+		registerer.MustRegister(info("node_agent_info", version))
+
+		if err := registerer.Register(node.NewCollector(hostname, kv)); err != nil {
+			klog.Exitln(err)
+		}
+
+		processInfoCh := profiling.Init(machineId, hostname)
+
+		cr, err := containers.NewRegistry(registerer, processInfoCh)
+		if err != nil {
+			klog.Exitln(err)
+		}
+
+		defer cr.Close()
+
+		defer profiling.Stop()
+		profiling.Start()
+
 	}
-
-	processInfoCh := profiling.Init(machineId, hostname)
-
-	cr, err := containers.NewRegistry(registerer, processInfoCh)
-	if err != nil {
-		klog.Exitln(err)
-	}
-	defer cr.Close()
-
-	profiling.Start()
-	defer profiling.Stop()
 
 	if err := prom.StartAgent(machineId); err != nil {
 		klog.Exitln(err)
