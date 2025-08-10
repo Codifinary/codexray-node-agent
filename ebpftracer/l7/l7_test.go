@@ -182,7 +182,7 @@ func TestParseClickHouse(t *testing.T) {
 		0x29, 0x29, 0x20, 0x41, 0x4e, 0x44, 0x20, 0x54, 0x69, 0x6d, 0x0,
 	}
 	assert.Equal(t,
-		`SELECT Timestamp, TraceId, SpanId, ParentSpanId, SpanName, ServiceName, Duration, StatusCode, StatusMessage, ResourceAttributes, SpanAttributes, Events.Timestamp, Events.Name, Events.Attributes FROM otel_traces_distributed WHERE ServiceName IN (['/k8s/coroot/coroot-coroot', '/system.slice/k3s-agent.service', '/system.slice/k3s.service']) AND (SpanAttributes['net.peer.name'] IN (['10.42.3.84', '10.42.1.73', '10.42.0.173', '10.42.5.69']) OR (SpanAttributes['net.peer.name'], SpanAttributes['net.peer.port']) IN (('10.42.3.84', '9009'), ('10.42.3.84', '0'), ('10.42.3.84', '9000'), ('10.42.3.84', '8123'), ('10.42.1.73', '0'), ('10.42.1.73', '8123'), ('10.42.1.73', '9009'), ('10.42.1.73', '9000'), ('10.42.0.173', '0'), ('10.42.0.173', '9009'), ('10.42.0.173', '9000'), ('10.42.0.173', '8123'), ('10.42.5.69', '9000'), ('10.42.5.69', '8123'), ('10.42.5.69', '9009'), ('10.42.5.69', '0'))) AND Tim...<TRUNCATED>`,
+		`SELECT Timestamp, TraceId, SpanId, ParentSpanId, SpanName, ServiceName, Duration, StatusCode, StatusMessage, ResourceAttributes, SpanAttributes, Events.Timestamp, Events.Name, Events.Attributes FROM otel_traces_distributed WHERE ServiceName IN (['/k8s/codexray/codexray-codexray', '/system.slice/k3s-agent.service', '/system.slice/k3s.service']) AND (SpanAttributes['net.peer.name'] IN (['10.42.3.84', '10.42.1.73', '10.42.0.173', '10.42.5.69']) OR (SpanAttributes['net.peer.name'], SpanAttributes['net.peer.port']) IN (('10.42.3.84', '9009'), ('10.42.3.84', '0'), ('10.42.3.84', '9000'), ('10.42.3.84', '8123'), ('10.42.1.73', '0'), ('10.42.1.73', '8123'), ('10.42.1.73', '9009'), ('10.42.1.73', '9000'), ('10.42.0.173', '0'), ('10.42.0.173', '9009'), ('10.42.0.173', '9000'), ('10.42.0.173', '8123'), ('10.42.5.69', '9000'), ('10.42.5.69', '8123'), ('10.42.5.69', '9009'), ('10.42.5.69', '0'))) AND Tim...<TRUNCATED>`,
 		ParseClickhouse(payload),
 	)
 }
@@ -210,7 +210,7 @@ func TestParseZookeeper(t *testing.T) {
 	}
 	op, arg := ParseZookeeper(payload)
 	assert.Equal(t, "multi(setData, ...)", op)
-	assert.Equal(t, "/clickhouse/tables/shard-1/coroot_3kuq8b3z/otel_traces_trace_id_ts/replicas/coroot-clickhouse-shard-1-0/min_unprocessed_insert_time", arg)
+	assert.Equal(t, "/clickhouse/tables/shard-1/codexray_3kuq8b3z/otel_traces_trace_id_ts/replicas/codexray-clickhouse-shard-1-0/min_unprocessed_insert_time", arg)
 
 	payload = []byte{
 		0x0, 0x0, 0x0, 0x53, 0x0, 0xce, 0x16, 0x90, 0x0, 0x0, 0x0, 0x4, 0x0, 0x0, 0x0, 0x46, 0x2f, 0x63, 0x6c, 0x69, 0x63,
@@ -222,7 +222,7 @@ func TestParseZookeeper(t *testing.T) {
 	op, arg = ParseZookeeper(payload)
 
 	assert.Equal(t, "getData", op)
-	assert.Equal(t, "/clickhouse/tables/shard-1/coroot_3kuq8b3z/otel_traces_trace_id_ts/log", arg)
+	assert.Equal(t, "/clickhouse/tables/shard-1/codexray_3kuq8b3z/otel_traces_trace_id_ts/log", arg)
 
 	payload = []byte{
 		0x0, 0x0, 0x0, 0x53, 0x0, 0xce, 0x16, 0x90, 0x0, 0x0, 0x0, 0x4, 0x0, 0x0, 0x0, 0x46, 0x2f, 0x63, 0x6c, 0x69, 0x63,
@@ -233,5 +233,5 @@ func TestParseZookeeper(t *testing.T) {
 	op, arg = ParseZookeeper(payload)
 
 	assert.Equal(t, "getData", op)
-	assert.Equal(t, "/clickhouse/tables/shard-1/coroot_3kuq8b3z/otel_t...<TRUNCATED>", arg)
+	assert.Equal(t, "/clickhouse/tables/shard-1/codexray_3kuq8b3z/otel_t...<TRUNCATED>", arg)
 }

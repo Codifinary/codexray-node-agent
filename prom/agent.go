@@ -21,7 +21,7 @@ import (
 
 const (
 	RemoteFlushDeadline = time.Minute
-	jobName             = "coroot-node-agent"
+	jobName             = "codexray-node-agent"
 	RemoteWriteTimeout  = 30 * time.Second
 )
 
