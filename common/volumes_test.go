@@ -21,7 +21,7 @@ func TestParseKubernetesVolumeSource(t *testing.T) {
 
 	assert.Equal(t,
 		"pvc-4bf620ab-bb10-4cd6-803a-5be8735ccaf6",
-		ParseKubernetesVolumeSource("/var/snap/microk8s/common/default-storage/codexray-codexray-data-pvc-4bf620ab-bb10-4cd6-803a-5be8735ccaf6"))
+		ParseKubernetesVolumeSource("/var/snap/microk8s/common/default-storage/coroot-coroot-data-pvc-4bf620ab-bb10-4cd6-803a-5be8735ccaf6"))
 
 	assert.Equal(t,
 		"",
