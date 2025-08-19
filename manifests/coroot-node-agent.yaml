@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: codexray
+  name: coroot
 
 ---
 
@@ -9,17 +9,17 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   labels:
-    app: codexray-node-agent
-  name: codexray-node-agent
-  namespace: codexray
+    app: coroot-node-agent
+  name: coroot-node-agent
+  namespace: coroot
 spec:
   selector:
     matchLabels:
-      app: codexray-node-agent
+      app: coroot-node-agent
   template:
     metadata:
       labels:
-        app: codexray-node-agent
+        app: coroot-node-agent
       annotations:
         prometheus.io/scrape: 'true'
         prometheus.io/port: '80'
@@ -28,8 +28,8 @@ spec:
         - operator: Exists
       hostPID: true
       containers:
-        - name: codexray-node-agent
-          image: ghcr.io/codexray/codexray-node-agent
+        - name: coroot-node-agent
+          image: ghcr.io/coroot/coroot-node-agent
           args: ["--cgroupfs-root", "/host/sys/fs/cgroup"]
           ports:
             - containerPort: 80

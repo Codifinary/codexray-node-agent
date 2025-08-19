@@ -82,7 +82,7 @@ func GetContainerTracer(containerId string) *Tracer {
 			)...,
 		)),
 	)
-	return &Tracer{otel: provider.Tracer("codexray-node-agent", trace.WithInstrumentationVersion(agentVersion))}
+	return &Tracer{otel: provider.Tracer("coroot-node-agent", trace.WithInstrumentationVersion(agentVersion))}
 }
 
 func (t *Tracer) NewTrace(destination common.HostPort) *Trace {
