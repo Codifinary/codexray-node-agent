@@ -135,7 +135,7 @@ jobs:
 
       # Build Docker Image
       - name: Build Docker Image
-        run: docker build -t $GHCR_IMAGE -f Dockerfile .
+        run: docker build --build-arg GHCR_PAT="${{ secrets.GHCR_PAT }}" --build-arg VERSION="${{ env.VERSION }}" -t $GHCR_IMAGE -f Dockerfile .
 
       # Push Docker Image to GHCR
       - name: Push Docker Image to GHCR

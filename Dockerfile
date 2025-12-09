@@ -17,6 +17,19 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 WORKDIR /tmp/src
 COPY go.mod .
 COPY go.sum .
+
+# Configure Git for private repositories
+ARG GHCR_PAT
+RUN if [ -n "$GHCR_PAT" ]; then \
+        git config --global credential.helper store && \
+        echo "https://x-access-token:${GHCR_PAT}@github.com" > ~/.git-credentials && \
+        chmod 600 ~/.git-credentials && \
+        git config --global url."https://x-access-token:${GHCR_PAT}@github.com/".insteadOf "https://github.com/"; \
+    fi && \
+    go env -w GOPRIVATE=github.com/codifinary/* && \
+    go env -w GONOPROXY=github.com/codifinary/* && \
+    go env -w GONOSUMDB=github.com/codifinary/*
+
 RUN go mod download
 COPY . .
 ARG VERSION=unknown
