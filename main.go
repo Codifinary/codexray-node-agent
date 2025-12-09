@@ -11,6 +11,7 @@ import (
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/containers"
 	"github.com/codifinary/codexray-node-agent/flags"
+	"github.com/codifinary/codexray-node-agent/gpu"
 	"github.com/codifinary/codexray-node-agent/logs"
 	"github.com/codifinary/codexray-node-agent/node"
 	"github.com/codifinary/codexray-node-agent/proc"
