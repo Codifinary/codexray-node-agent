@@ -2,8 +2,12 @@ FROM debian:bullseye AS builder
 # Using Debian instead of the official Golang image because it’s based on newer OS versions
 # with newer glibc, which causes compatibility issues.
 
-RUN apt-get update && apt-get install -y \
-    curl git build-essential pkg-config libsystemd-dev
+RUN for i in 1 2 3; do \
+        apt-get update && \
+        apt-get install -y --fix-missing \
+        curl git build-essential pkg-config libsystemd-dev && \
+        break || sleep 5; \
+    done
 
 ARG GO_VERSION=1.24.9
 RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz -o go.tar.gz && \
