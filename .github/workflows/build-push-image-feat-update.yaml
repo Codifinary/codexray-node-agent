@@ -38,6 +38,12 @@ jobs:
         with:
           go-version: 1.23
 
+      # Configure Git for private repositories
+      - name: Configure Git for private modules
+        run: |
+          git config --global url."https://${{ secrets.GHCR_PAT }}@github.com/".insteadOf "https://github.com/"
+          go env -w GOPRIVATE=github.com/codifinary/*
+
       # Cache Go modules to speed up the build process
       - name: Cache Go modules
         uses: actions/cache@v3
@@ -85,6 +91,18 @@ jobs:
       # Log in to GHCR
       - name: Log in to GHCR
         run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # Set up Go environment
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: 1.23
+
+      # Configure Git for private repositories
+      - name: Configure Git for private modules
+        run: |
+          git config --global url."https://${{ secrets.GHCR_PAT }}@github.com/".insteadOf "https://github.com/"
+          go env -w GOPRIVATE=github.com/codifinary/*
 
       # Install systemd development headers
       - name: Install systemd development headers
