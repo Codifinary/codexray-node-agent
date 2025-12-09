@@ -40,7 +40,7 @@ jobs:
 
       # Cache Go modules to speed up the build process
       - name: Cache Go modules
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
           path: |
             ~/.cache/go-build
