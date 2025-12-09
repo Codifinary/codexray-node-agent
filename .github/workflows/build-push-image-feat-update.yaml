@@ -40,10 +40,13 @@ jobs:
 
       # Configure Git for private repositories
       - name: Configure Git for private modules
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
         run: |
           git config --global credential.helper store
-          echo "https://${{ secrets.GHCR_PAT }}@github.com" > ~/.git-credentials
-          git config --global url."https://${{ secrets.GHCR_PAT }}@github.com/".insteadOf "https://github.com/"
+          echo "https://x-access-token:${GHCR_PAT}@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+          git config --global url."https://x-access-token:${GHCR_PAT}@github.com/".insteadOf "https://github.com/"
           go env -w GOPRIVATE=github.com/codifinary/*
           go env -w GONOPROXY=github.com/codifinary/*
           go env -w GONOSUMDB=github.com/codifinary/*
@@ -104,10 +107,13 @@ jobs:
 
       # Configure Git for private repositories
       - name: Configure Git for private modules
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
         run: |
           git config --global credential.helper store
-          echo "https://${{ secrets.GHCR_PAT }}@github.com" > ~/.git-credentials
-          git config --global url."https://${{ secrets.GHCR_PAT }}@github.com/".insteadOf "https://github.com/"
+          echo "https://x-access-token:${GHCR_PAT}@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+          git config --global url."https://x-access-token:${GHCR_PAT}@github.com/".insteadOf "https://github.com/"
           go env -w GOPRIVATE=github.com/codifinary/*
           go env -w GONOPROXY=github.com/codifinary/*
           go env -w GONOSUMDB=github.com/codifinary/*
