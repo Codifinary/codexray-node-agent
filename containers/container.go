@@ -17,7 +17,7 @@ import (
 	"github.com/codifinary/codexray-node-agent/pinger"
 	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/codifinary/codexray-node-agent/tracing"
-	"github.com/coroot/logparser"
+	"github.com/codifinary/logparser"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netns"
 	"golang.org/x/exp/maps"
@@ -29,6 +29,7 @@ var (
 	gcInterval                = 10 * time.Minute
 	pingTimeout               = 300 * time.Millisecond
 	multilineCollectorTimeout = time.Second
+	gpuStatsWindow            = 15 * time.Second
 )
 
 type ContainerID string
@@ -107,6 +108,7 @@ type ConnectionStats struct {
 
 type Container struct {
 	id       ContainerID
+	appId    string
 	cgroup   *cgroup.Cgroup
 	metadata *ContainerMetadata
 
@@ -118,7 +120,6 @@ type Container struct {
 
 	delays      Delays
 	delaysByPid map[uint32]Delays
-	delaysLock  sync.Mutex
 
 	listens map[netaddr.IPPort]map[uint32]*ListenDetails
 
@@ -131,8 +132,11 @@ type Container struct {
 	l7Stats  L7Stats
 	dnsStats *L7Metrics
 
-	oomKills                 int
-	pythonThreadLockWaitTime time.Duration
+	gpuStats map[string]*GpuUsage
+
+	oomKills    int
+	nodejsStats *ebpftracer.NodejsStats
+	pythonStats *ebpftracer.PythonStats
 
 	mounts     map[string]proc.MountInfo
 	seenMounts map[uint64]struct{}
@@ -143,7 +147,7 @@ type Container struct {
 
 	registry *Registry
 
-	lock sync.RWMutex
+	lock sync.Mutex
 
 	done chan struct{}
 }
@@ -154,8 +158,15 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		return nil, err
 	}
 	defer netNs.Close()
+
+	cid := string(id)
+	appId := common.ContainerIdToOtelServiceName(cid)
+	if appId == cid {
+		appId = ""
+	}
 	c := &Container{
 		id:       id,
+		appId:    appId,
 		cgroup:   cg,
 		metadata: md,
 
@@ -172,6 +183,8 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
 		l7Stats:                  L7Stats{},
 		dnsStats:                 &L7Metrics{},
+
+		gpuStats: map[string]*GpuUsage{},
 
 		mounts:     map[string]proc.MountInfo{},
 		seenMounts: map[uint64]struct{}{},
@@ -219,10 +232,10 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
-	c.registry.updateTrafficStatsIfNecessary()
+	c.registry.updateStatsFromEbpfMapsIfNecessary()
 
-	c.lock.RLock()
-	defer c.lock.RUnlock()
+	c.lock.Lock()
+	defer c.lock.Unlock()
 
 	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
 		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemdTriggeredBy)
@@ -252,6 +265,15 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
+	if psi := c.cgroup.PSI(); psi != nil {
+		ch <- counter(metrics.PsiCPU, psi.CPUSecondsSome, "some")
+		ch <- counter(metrics.PsiCPU, psi.CPUSecondsFull, "full")
+		ch <- counter(metrics.PsiMemory, psi.MemorySecondsSome, "some")
+		ch <- counter(metrics.PsiMemory, psi.MemorySecondsFull, "full")
+		ch <- counter(metrics.PsiIO, psi.IOSecondsSome, "some")
+		ch <- counter(metrics.PsiIO, psi.IOSecondsFull, "full")
+	}
+
 	if c.oomKills > 0 {
 		ch <- counter(metrics.OOMKills, float64(c.oomKills))
 	}
@@ -259,12 +281,12 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	if disks, err := node.GetDisks(); err == nil {
 		ioStat := c.cgroup.IOStat()
 		for majorMinor, mounts := range c.getMounts() {
-			dev := disks.GetParentBlockDevice(majorMinor)
-			if dev == nil {
-				continue
+			var device string
+			if dev := disks.GetParentBlockDevice(majorMinor); dev != nil {
+				device = dev.Name
 			}
 			for mountPoint, fsStat := range mounts {
-				dls := []string{mountPoint, dev.Name, c.metadata.volumes[mountPoint]}
+				dls := []string{mountPoint, device, c.metadata.volumes[mountPoint]}
 				ch <- gauge(metrics.DiskSize, float64(fsStat.CapacityBytes), dls...)
 				ch <- gauge(metrics.DiskUsed, float64(fsStat.UsedBytes), dls...)
 				ch <- gauge(metrics.DiskReserved, float64(fsStat.ReservedBytes), dls...)
@@ -315,7 +337,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 
 	for source, p := range c.logParsers {
 		for _, c := range p.parser.GetCounters() {
-			ch <- counter(metrics.LogMessages, float64(c.Messages), source, c.Level.String(), c.Hash, c.Sample)
+			ch <- counter(metrics.LogMessages, float64(c.Messages), source, c.Level.String(), c.Hash, common.TruncateUtf8(c.Sample, *flags.MaxLabelLength))
 		}
 	}
 
@@ -333,15 +355,20 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		if len(cmdline) == 0 {
 			continue
 		}
-		appType := guessApplicationType(cmdline)
-		if appType != "" {
+		if appType := guessApplicationTypeByCmdline(cmdline); appType != "" {
 			appTypes[appType] = struct{}{}
+		} else {
+			if exe, err := os.Readlink(proc.Path(pid, "exe")); err == nil {
+				if appType = guessApplicationTypeByExe(exe); appType != "" {
+					appTypes[appType] = struct{}{}
+				}
+			}
 		}
 		if process.isGolangApp {
 			appTypes["golang"] = struct{}{}
 		}
 		switch {
-		case isJvm(cmdline):
+		case proc.IsJvm(cmdline):
 			jvm, jMetrics := jvmMetrics(pid)
 			if len(jMetrics) > 0 && !seenJvms[jvm] {
 				seenJvms[jvm] = true
@@ -357,12 +384,35 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 				process.dotNetMonitor.Collect(ch)
 			}
 		}
+
+		for _, usage := range c.gpuStats {
+			usage.Reset()
+		}
+		if usage := process.getGPUUsage(); usage != nil {
+			for uuid, u := range usage {
+				tu := c.gpuStats[uuid]
+				if tu == nil {
+					tu = &GpuUsage{}
+					c.gpuStats[uuid] = tu
+				}
+				tu.GPU += u.GPU
+				tu.Memory += u.Memory
+			}
+		}
 	}
+	for uuid, usage := range c.gpuStats {
+		ch <- gauge(metrics.GpuUsagePercent, usage.GPU, uuid)
+		ch <- gauge(metrics.GpuMemoryUsagePercent, usage.Memory, uuid)
+	}
+
 	for appType := range appTypes {
 		ch <- gauge(metrics.ApplicationType, 1, appType)
 	}
-	if c.pythonThreadLockWaitTime > 0 {
-		ch <- counter(metrics.PythonThreadLockWaitTime, c.pythonThreadLockWaitTime.Seconds())
+	if c.pythonStats != nil {
+		ch <- counter(metrics.PythonThreadLockWaitTime, c.pythonStats.ThreadLockWaitTime.Seconds())
+	}
+	if c.nodejsStats != nil {
+		ch <- counter(metrics.NodejsEventLoopBlockedTime, c.nodejsStats.EventLoopBlockedTime.Seconds())
 	}
 
 	if c.dnsStats.Requests != nil {
@@ -539,7 +589,7 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	if common.ConnectionFilter.ShouldBeSkipped(dst.IP(), actualDst.IP()) {
 		return
 	}
-	key := common.NewDestinationKey(dst, actualDst, c.registry.getFQDN(dst.IP()))
+	key := common.NewDestinationKey(dst, actualDst, c.registry.getDomain(dst.IP()))
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	if failed {
@@ -616,7 +666,7 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 	ac.BytesReceived = received
 }
 
-func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]string {
+func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]*common.Domain {
 	status := r.Status.DNS()
 	if status == "" {
 		return nil
@@ -651,16 +701,17 @@ func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]string {
 		}
 		c.dnsStats.Latency.Observe(r.Duration.Seconds())
 	}
-	ip2fqdn := map[netaddr.IP]string{}
+	ip2fqdn := map[netaddr.IP]*common.Domain{}
 	if fqdn != "" {
+		d := common.NewDomain(fqdn, ips)
 		for _, ip := range ips {
-			ip2fqdn[ip] = fqdn
+			ip2fqdn[ip] = d
 		}
 	}
 	return ip2fqdn
 }
 
-func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) map[netaddr.IP]string {
+func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) map[netaddr.IP]*common.Domain {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -677,20 +728,38 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	}
 	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey)
 
-	trace := c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown())
+	ebpfTracesDisabled := false
+	for _, p := range c.processes {
+		if p.Flags.EbpfTracesDisabled {
+			ebpfTracesDisabled = true
+			break
+		}
+	}
+	var trace *tracing.Trace
+	if !ebpfTracesDisabled {
+		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown())
+	}
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
-		stats.observe(r.Status.Http(), "", r.Duration)
 		method, path := l7.ParseHttp(r.Payload)
-		trace.HttpRequest(method, path, r.Status, r.Duration)
+		if !common.HttpFilter.ShouldBeSkipped(path) {
+			stats.observe(r.Status.Http(), "", r.Duration)
+			trace.HttpRequest(method, path, r.Status, r.Duration)
+		}
 	case l7.ProtocolHTTP2:
 		if conn.http2Parser == nil {
 			conn.http2Parser = l7.NewHttp2Parser()
 		}
 		requests := conn.http2Parser.Parse(r.Method, r.Payload, uint64(r.Duration))
 		for _, req := range requests {
-			stats.observe(req.Status.Http(), "", req.Duration)
-			trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.Duration)
+			if !common.HttpFilter.ShouldBeSkipped(req.Path) {
+				status := req.Status.Http()
+				if req.GrpcStatus >= 0 {
+					status = req.GrpcStatus.GRPC()
+				}
+				stats.observe(status, "", req.Duration)
+				trace.Http2Request(req.Method, req.Path, req.Scheme, req.Status, req.GrpcStatus, req.Duration)
+			}
 		}
 	case l7.ProtocolPostgres:
 		if r.Method != l7.MethodStatementClose {
@@ -736,6 +805,8 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		stats.observe(r.Status.Zookeeper(), "", r.Duration)
 		op, arg := l7.ParseZookeeper(r.Payload)
 		trace.ZookeeperRequest(op, arg, r.Status, r.Duration)
+	case l7.ProtocolFoundationDB:
+		stats.observe(r.Status.String(), "", r.Duration)
 	}
 	return nil
 }
@@ -757,8 +828,6 @@ func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) boo
 }
 
 func (c *Container) updateDelays() {
-	c.delaysLock.Lock()
-	defer c.delaysLock.Unlock()
 	for pid := range c.processes {
 		stats, err := TaskstatsTGID(pid)
 		if err != nil {
@@ -771,6 +840,40 @@ func (c *Container) updateDelays() {
 		d.disk = stats.BlockIODelay
 		c.delaysByPid[pid] = d
 	}
+}
+
+func (c *Container) updateNodejsStats(s NodejsStatsUpdate) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	p := c.processes[s.Pid]
+	if p == nil || p.nodejsPrevStats == nil {
+		return
+	}
+	if delta := s.Stats.EventLoopBlockedTime - p.nodejsPrevStats.EventLoopBlockedTime; delta > 0 {
+		if c.nodejsStats == nil {
+			c.nodejsStats = &ebpftracer.NodejsStats{}
+		}
+		c.nodejsStats.EventLoopBlockedTime += delta
+	}
+	p.nodejsPrevStats = &s.Stats
+}
+
+func (c *Container) updatePythonStats(s PythonStatsUpdate) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	p := c.processes[s.Pid]
+	if p == nil || p.pythonPrevStats == nil {
+		return
+	}
+	if delta := s.Stats.ThreadLockWaitTime - p.pythonPrevStats.ThreadLockWaitTime; delta > 0 {
+		if c.pythonStats == nil {
+			c.pythonStats = &ebpftracer.PythonStats{}
+		}
+		c.pythonStats.ThreadLockWaitTime += delta
+	}
+	p.pythonPrevStats = &s.Stats
 }
 
 func (c *Container) getMounts() map[string]map[string]*proc.FSStat {
@@ -937,6 +1040,13 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 func (c *Container) runLogParser(logPath string) {
 	if *flags.DisableLogParsing {
 		return
+	}
+
+	for _, p := range c.processes {
+		if p.Flags.LogMonitoringDisabled {
+			klog.InfoS("skipping log monitoring due to CODEXRAY_LOG_MONITORING=disabled", "cg", c.cgroup.Id)
+			return
+		}
 	}
 
 	containerId := string(c.id)

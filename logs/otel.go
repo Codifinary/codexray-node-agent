@@ -12,7 +12,7 @@ import (
 	sdk "github.com/agoda-com/opentelemetry-logs-go/sdk/logs"
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/flags"
-	"github.com/coroot/logparser"
+	"github.com/codifinary/logparser"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.18.0"
@@ -50,14 +50,14 @@ func Init(machineId, hostname, version string) {
 		sdk.WithResource(
 			resource.NewWithAttributes(
 				semconv.SchemaURL,
-				semconv.ServiceName("coroot-node-agent"),
+				semconv.ServiceName("codexray-node-agent"),
 				semconv.HostName(hostname),
 				semconv.HostID(machineId),
 			),
 		),
 	)
 	otel.SetLoggerProvider(loggerProvider)
-	otelLogger = loggerProvider.Logger("coroot-node-agent", otelLogs.WithInstrumentationVersion(version))
+	otelLogger = loggerProvider.Logger("codexray-node-agent", otelLogs.WithInstrumentationVersion(version))
 }
 
 func OtelLogEmitter(containerId string) logparser.OnMsgCallbackF {

@@ -13,12 +13,12 @@ func TestContainerIdToServiceName(t *testing.T) {
 		"/k8s/otel-demo/otel-demo-frauddetectionservice")
 
 	assert.Equal(t,
-		f("/k8s/coroot/coroot-node-agent-np9pk/node-agent"),
-		"/k8s/coroot/coroot-node-agent")
+		f("/k8s/codifinary/codexray-node-agent-np9pk/node-agent"),
+		"/k8s/codifinary/codexray-node-agent")
 
 	assert.Equal(t,
-		f("/k8s/coroot/pyroscope-df884bb79-hhxtv/pyroscope"),
-		"/k8s/coroot/pyroscope")
+		f("/k8s/codifinary/pyroscope-df884bb79-hhxtv/pyroscope"),
+		"/k8s/codifinary/pyroscope")
 
 	assert.Equal(t,
 		f("/k8s/default/cassandra-main-12/cassandra"),

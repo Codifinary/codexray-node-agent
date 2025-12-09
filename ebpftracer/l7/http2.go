@@ -24,11 +24,12 @@ type Http2FrameHeader struct {
 }
 
 type Http2Request struct {
-	Method   string
-	Path     string
-	Scheme   string
-	Status   Status
-	Duration time.Duration
+	Method     string
+	Path       string
+	Scheme     string
+	Status     Status
+	GrpcStatus Status
+	Duration   time.Duration
 
 	kernelTime uint64
 }
@@ -61,7 +62,20 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 
 	var decoder *hpack.Decoder
 	statuses := map[uint32]Status{}
+	grpcStatuses := map[uint32]Status{}
+
 	offset := 0
+
+	switch method {
+	case MethodHttp2ClientFrames:
+		decoder = p.clientDecoder
+	case MethodHttp2ServerFrames:
+		decoder = p.serverDecoder
+	default:
+		return nil
+	}
+	defer decoder.Close()
+
 	for {
 		if len(payload)-offset < http2FrameHeaderLength {
 			break
@@ -87,7 +101,6 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 				req = &Http2Request{kernelTime: kernelTime}
 				p.activeRequests[h.StreamId] = req
 			}
-			decoder = p.clientDecoder
 			decoder.SetEmitFunc(func(hf hpack.HeaderField) {
 				switch hf.Name {
 				case ":method":
@@ -108,11 +121,14 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 			if _, ok := statuses[h.StreamId]; !ok {
 				statuses[h.StreamId] = 0
 			}
-			decoder = p.serverDecoder
 			decoder.SetEmitFunc(func(hf hpack.HeaderField) {
-				if hf.Name == ":status" {
+				switch hf.Name {
+				case ":status":
 					s, _ := strconv.Atoi(hf.Value)
 					statuses[h.StreamId] = Status(s)
+				case "grpc-status":
+					s, _ := strconv.Atoi(hf.Value)
+					grpcStatuses[h.StreamId] = Status(s)
 				}
 			})
 		}
@@ -132,6 +148,12 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 			continue
 		}
 		r.Status = status
+		grpcStatus, ok := grpcStatuses[streamId]
+		if ok {
+			r.GrpcStatus = grpcStatus
+		} else {
+			r.GrpcStatus = -1
+		}
 		r.Duration = time.Duration(kernelTime - r.kernelTime)
 		res = append(res, *r)
 		delete(p.activeRequests, streamId)

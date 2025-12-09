@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"math/rand"
 	"time"
 
 	"github.com/codifinary/codexray-node-agent/common"
@@ -29,6 +30,7 @@ var (
 	commonResourceAttrs []attribute.KeyValue
 	agentVersion        string
 	initialized         bool
+	samplingRate        float64
 )
 
 func Init(machineId, hostname, version string) {
@@ -36,6 +38,15 @@ func Init(machineId, hostname, version string) {
 	if endpointUrl == nil {
 		klog.Infoln("no OpenTelemetry traces collector endpoint configured")
 		return
+	}
+
+	samplingRate = *flags.TracesSampling
+	if samplingRate < 0.0 || samplingRate > 1.0 {
+		klog.Warningf("invalid traces-sampling value %f, must be between 0.0 and 1.0, using default 1.0", samplingRate)
+		samplingRate = 1.0
+	}
+	if samplingRate < 1.0 {
+		klog.Infof("trace sampling rate set to %f", samplingRate)
 	}
 	klog.Infoln("OpenTelemetry traces collector endpoint:", endpointUrl.String())
 	path := endpointUrl.Path
@@ -67,6 +78,17 @@ type Tracer struct {
 	otel trace.Tracer
 }
 
+func shouldSample() bool {
+	if samplingRate >= 1.0 {
+		return true
+	}
+	if samplingRate <= 0.0 {
+		return false
+	}
+
+	return rand.Float64() < samplingRate
+}
+
 func GetContainerTracer(containerId string) *Tracer {
 	if !initialized {
 		return &Tracer{otel: nil}
@@ -82,7 +104,7 @@ func GetContainerTracer(containerId string) *Tracer {
 			)...,
 		)),
 	)
-	return &Tracer{otel: provider.Tracer("coroot-node-agent", trace.WithInstrumentationVersion(agentVersion))}
+	return &Tracer{otel: provider.Tracer("codexray-node-agent", trace.WithInstrumentationVersion(agentVersion))}
 }
 
 func (t *Tracer) NewTrace(destination common.HostPort) *Trace {
@@ -103,6 +125,11 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, attr
 		return
 	}
 	end := time.Now()
+
+	if !shouldSample() {
+		return
+	}
+
 	start := end.Add(-duration)
 	_, span := t.tracer.otel.Start(nil, name, trace.WithTimestamp(start), trace.WithSpanKind(trace.SpanKindClient))
 	span.SetAttributes(attrs...)
@@ -124,7 +151,7 @@ func (t *Trace) HttpRequest(method, path string, status l7.Status, duration time
 	)
 }
 
-func (t *Trace) Http2Request(method, path, scheme string, status l7.Status, duration time.Duration) {
+func (t *Trace) Http2Request(method, path, scheme string, status, grpcStatus l7.Status, duration time.Duration) {
 	if t == nil {
 		return
 	}
@@ -137,11 +164,16 @@ func (t *Trace) Http2Request(method, path, scheme string, status l7.Status, dura
 	if scheme == "" {
 		scheme = "unknown"
 	}
-	t.createSpan(method, duration, status > 400,
+
+	attrs := []attribute.KeyValue{
 		semconv.HTTPURL(fmt.Sprintf("%s://%s%s", scheme, t.destination.String(), path)),
 		semconv.HTTPMethod(method),
 		semconv.HTTPStatusCode(int(status)),
-	)
+	}
+	if grpcStatus >= 0 {
+		attrs = append(attrs, semconv.RPCGRPCStatusCodeKey.Int(int(grpcStatus)))
+	}
+	t.createSpan(method, duration, status > 400 || grpcStatus > 0, attrs...)
 }
 
 func (t *Trace) PostgresQuery(query string, error bool, duration time.Duration) {

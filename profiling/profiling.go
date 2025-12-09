@@ -13,6 +13,8 @@ import (
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/containers"
 	"github.com/codifinary/codexray-node-agent/flags"
+	"github.com/codifinary/codexray-node-agent/jvm"
+	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/go-kit/log"
 	ebpfspy "github.com/grafana/pyroscope/ebpf"
 	"github.com/grafana/pyroscope/ebpf/cpp/demangle"
@@ -82,7 +84,7 @@ func Init(hostId, hostName string) chan<- containers.ProcessInfo {
 		},
 		SymbolOptions: symtab.SymbolOptions{
 			GoTableFallback:    true,
-			PythonFullFilePath: false,
+			PythonFullFilePath: true,
 			DemangleOptions:    demangle.DemangleFull,
 		},
 		Metrics: &metrics.Metrics{
@@ -115,7 +117,7 @@ func Start() {
 	if session == nil {
 		return
 	}
-	targetFinder.now = time.Now()
+	targetFinder.now = time.Now().UnixNano()
 	session.UpdateTargets(sd.TargetsOptions{})
 }
 
@@ -200,7 +202,7 @@ func upload(b *pprof.ProfileBuilder) error {
 type TargetFinder struct {
 	processes map[uint32]*processInfo
 	lock      sync.Mutex
-	now       time.Time
+	now       int64
 }
 
 func (tf *TargetFinder) start(processInfoCh <-chan containers.ProcessInfo) {
@@ -209,10 +211,11 @@ func (tf *TargetFinder) start(processInfoCh <-chan containers.ProcessInfo) {
 			tf.lock.Lock()
 			cid := string(pi.ContainerId)
 			tf.processes[pi.Pid] = &processInfo{
-				startedAt: pi.StartedAt,
+				startedAt: pi.StartedAt.UnixNano(),
 				target: sd.NewTargetForTesting(cid, 0, sd.DiscoveryTarget{
 					"service_name": common.ContainerIdToOtelServiceName(cid),
 				}),
+				flags: pi.Flags,
 			}
 			tf.lock.Unlock()
 		}
@@ -226,8 +229,28 @@ func (tf *TargetFinder) FindTarget(pid uint32) *sd.Target {
 	if pi == nil {
 		return nil
 	}
-	if tf.now.Sub(pi.startedAt) < CollectInterval {
+	if tf.now-pi.startedAt < int64(CollectInterval) {
 		return nil
+	}
+	var err error
+	if !pi.initialized {
+		pi.initialized = true
+		if !pi.flags.EbpfProfilingDisabled {
+			cmdline := proc.GetCmdline(pid)
+			if proc.IsJvm(cmdline) {
+				pi.jvmPerfmapDumpSupported = jvm.IsPerfmapDumpSupported(cmdline)
+				klog.Infof("JVM detected PID: %d, perfmap dump supported: %t", pid, pi.jvmPerfmapDumpSupported)
+			}
+		}
+	}
+	if pi.flags.EbpfProfilingDisabled {
+		return nil
+	}
+	if pi.jvmPerfmapDumpSupported && pi.lastPerfmapDump != tf.now {
+		pi.lastPerfmapDump = tf.now
+		if err = jvm.DumpPerfmap(pid); err != nil {
+			klog.Warningln(err)
+		}
 	}
 	return pi.target
 }
@@ -243,10 +266,16 @@ func (tf *TargetFinder) DebugInfo() []map[string]string {
 }
 
 func (tf *TargetFinder) Update(_ sd.TargetsOptions) {
-	tf.now = time.Now()
+	tf.now = time.Now().UnixNano()
 }
 
 type processInfo struct {
-	startedAt time.Time
+	startedAt int64
 	target    *sd.Target
+
+	initialized bool
+	flags       proc.Flags
+
+	jvmPerfmapDumpSupported bool
+	lastPerfmapDump         int64
 }

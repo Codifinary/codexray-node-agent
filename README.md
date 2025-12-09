@@ -1,4 +1,4 @@
-# Coroot-node-agent
+# Codexray-node-agent
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/coroot/coroot-node-agent)](https://goreportcard.com/report/github.com/coroot/coroot-node-agent)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -99,6 +99,6 @@ To start contributing, check out our [Contributing Guide](https://github.com/cor
 
 ## License
 
-Coroot-node-agent is licensed under the [Apache License, Version 2.0](https://github.com/coroot/coroot-node-agent/blob/main/LICENSE).
+codexray-node-agent is licensed under the [Apache License, Version 2.0](https://github.com/codexray/codexray-node-agent/blob/main/LICENSE).
 
 The BPF code is licensed under the General Public License, Version 2.0.

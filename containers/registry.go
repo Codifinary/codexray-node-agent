@@ -14,6 +14,7 @@ import (
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/ebpftracer"
 	"github.com/codifinary/codexray-node-agent/flags"
+	"github.com/codifinary/codexray-node-agent/gpu"
 	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netns"
@@ -21,7 +22,10 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const MinTrafficStatsUpdateInterval = 5 * time.Second
+const (
+	MinTrafficStatsUpdateInterval = 5 * time.Second
+	IgnoredContainersCacheTTL     = 15 * time.Second
+)
 
 var (
 	selfNetNs                = netns.None()
@@ -36,6 +40,7 @@ type ProcessInfo struct {
 	Pid         uint32
 	ContainerId ContainerID
 	StartedAt   time.Time
+	Flags       proc.Flags
 }
 
 type Registry struct {
@@ -44,20 +49,25 @@ type Registry struct {
 	tracer *ebpftracer.Tracer
 	events chan ebpftracer.Event
 
-	containersById       map[ContainerID]*Container
-	containersByCgroupId map[string]*Container
-	containersByPid      map[uint32]*Container
-	ip2fqdn              map[netaddr.IP]string
-	ip2fqdnLock          sync.RWMutex
+	containersById         map[ContainerID]*Container
+	containersByCgroupId   map[string]*Container
+	containersByPid        map[uint32]*Container
+	containersByPidIgnored map[uint32]*time.Time
+	ip2fqdn                map[netaddr.IP]*common.Domain
+	ip2fqdnLock            sync.RWMutex
 
 	processInfoCh chan<- ProcessInfo
 
-	trafficStatsLastUpdated time.Time
-	trafficStatsLock        sync.Mutex
-	trafficStatsUpdateCh    chan *TrafficStatsUpdate
+	ebpfStatsLastUpdated time.Time
+	ebpfStatsLock        sync.Mutex
+	trafficStatsUpdateCh chan *TrafficStatsUpdate
+	nodejsStatsUpdateCh  chan *NodejsStatsUpdate
+	pythonStatsUpdateCh  chan *PythonStatsUpdate
+
+	gpuProcessUsageSampleChan chan gpu.ProcessUsageSample
 }
 
-func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo) (*Registry, error) {
+func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gpuProcessUsageSampleChan chan gpu.ProcessUsageSample) (*Registry, error) {
 	ns, err := proc.GetSelfNetNs()
 	if err != nil {
 		return nil, err
@@ -79,35 +89,40 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo) (*
 	if err != nil {
 		return nil, err
 	}
-	if err := cgroup.Init(); err != nil {
+	if err = cgroup.Init(); err != nil {
 		return nil, err
 	}
-	if err := DockerdInit(); err != nil {
+	if err = DockerdInit(); err != nil {
 		klog.Warningln(err)
 	}
-	if err := ContainerdInit(); err != nil {
+	if err = ContainerdInit(); err != nil {
 		klog.Warningln(err)
 	}
-	if err := CrioInit(); err != nil {
+	if err = CrioInit(); err != nil {
 		klog.Warningln(err)
 	}
-	if err := JournaldInit(); err != nil {
+	if err = JournaldInit(); err != nil {
 		klog.Warningln(err)
 	}
 
 	r := &Registry{
-		reg:                  reg,
-		events:               make(chan ebpftracer.Event, 10000),
-		containersById:       map[ContainerID]*Container{},
-		containersByCgroupId: map[string]*Container{},
-		containersByPid:      map[uint32]*Container{},
-		ip2fqdn:              map[netaddr.IP]string{},
+		reg:                    reg,
+		events:                 make(chan ebpftracer.Event, 10000),
+		containersById:         map[ContainerID]*Container{},
+		containersByCgroupId:   map[string]*Container{},
+		containersByPid:        map[uint32]*Container{},
+		containersByPidIgnored: map[uint32]*time.Time{},
+		ip2fqdn:                map[netaddr.IP]*common.Domain{},
 
 		processInfoCh: processInfoCh,
 
 		tracer: ebpftracer.NewTracer(hostNetNs, selfNetNs, *flags.DisableL7Tracing),
 
 		trafficStatsUpdateCh: make(chan *TrafficStatsUpdate),
+		nodejsStatsUpdateCh:  make(chan *NodejsStatsUpdate),
+		pythonStatsUpdateCh:  make(chan *PythonStatsUpdate),
+
+		gpuProcessUsageSampleChan: gpuProcessUsageSampleChan,
 	}
 	if err = reg.Register(r); err != nil {
 		return nil, err
@@ -128,8 +143,10 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	r.ip2fqdnLock.RLock()
 	defer r.ip2fqdnLock.RUnlock()
-	for ip, fqdn := range r.ip2fqdn {
-		ch <- gauge(metrics.Ip2Fqdn, 1, ip.String(), fqdn)
+	for ip, domain := range r.ip2fqdn {
+		if domain.SpecifyIP {
+			ch <- gauge(metrics.Ip2Fqdn, 1, ip.String(), domain.FQDN)
+		}
 	}
 }
 
@@ -158,6 +175,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					c.onProcessExit(pid, false)
 				}
 			}
+			r.containersByPidIgnored = map[uint32]*time.Time{}
 			activeIPs := map[netaddr.IP]struct{}{}
 			for id, c := range r.containersById {
 				for dst := range c.lastConnectionAttempts {
@@ -177,7 +195,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 						delete(r.containersByPid, pid)
 					}
 				}
-				if ok := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id)}, r.reg).Unregister(c); !ok {
+				if ok := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(c.id), "app_id": c.appId}, r.reg).Unregister(c); !ok {
 					klog.Warningln("failed to unregister container:", id)
 				}
 				delete(r.containersById, id)
@@ -196,6 +214,26 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			}
 			if c := r.containersByPid[u.Pid]; c != nil {
 				c.updateTrafficStats(u)
+			}
+		case u := <-r.nodejsStatsUpdateCh:
+			if u == nil {
+				continue
+			}
+			if c := r.containersByPid[u.Pid]; c != nil {
+				c.updateNodejsStats(*u)
+			}
+		case u := <-r.pythonStatsUpdateCh:
+			if u == nil {
+				continue
+			}
+			if c := r.containersByPid[u.Pid]; c != nil {
+				c.updatePythonStats(*u)
+			}
+		case sample := <-r.gpuProcessUsageSampleChan:
+			if c := r.containersByPid[sample.Pid]; c != nil {
+				if p := c.processes[sample.Pid]; p != nil {
+					p.addGpuUsageSample(sample)
+				}
 			}
 		case e, more := <-ch:
 			if !more {
@@ -217,7 +255,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					p := c.onProcessStart(e.Pid)
 					if r.processInfoCh != nil && p != nil {
-						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt}
+						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}
 					}
 				}
 			case ebpftracer.EventTypeProcessExit:
@@ -272,14 +310,10 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if c := r.containersByPid[e.Pid]; c != nil {
 					ip2fqdn := c.onL7Request(e.Pid, e.Fd, e.Timestamp, e.L7Request)
 					r.ip2fqdnLock.Lock()
-					for ip, fqdn := range ip2fqdn {
-						r.ip2fqdn[ip] = fqdn
+					for ip, domain := range ip2fqdn {
+						r.ip2fqdn[ip] = domain
 					}
 					r.ip2fqdnLock.Unlock()
-				}
-			case ebpftracer.EventTypePythonThreadLock:
-				if c := r.containersByPid[e.Pid]; c != nil {
-					c.pythonThreadLockWaitTime += e.Duration
 				}
 			}
 		}
@@ -287,10 +321,16 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 }
 
 func (r *Registry) getOrCreateContainer(pid uint32) *Container {
-	if c, seen := r.containersByPid[pid]; c != nil {
+	if c := r.containersByPid[pid]; c != nil {
 		return c
-	} else if seen { // ignored
-		return nil
+	} else {
+		if t := r.containersByPidIgnored[pid]; t != nil {
+			if time.Since(*t) < IgnoredContainersCacheTTL {
+				return nil
+			} else {
+				delete(r.containersByPidIgnored, pid)
+			}
+		}
 	}
 	cg, err := proc.ReadCgroup(pid)
 	if err != nil {
@@ -325,11 +365,19 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		if cg.Id == "/init.scope" && pid != 1 {
 			klog.InfoS("ignoring without persisting", "cg", cg.Id, "pid", pid)
 		} else {
-			klog.InfoS("ignoring", "cg", cg.Id, "pid", pid, "name", md.name)
-			r.containersByPid[pid] = nil
+			klog.InfoS("ignoring", "cg", cg.Id, "pid", pid)
+			t := time.Now()
+			r.containersByPidIgnored[pid] = &t
 		}
 		return nil
 	}
+	if common.ContainerFilter.ShouldBeSkipped(string(id)) {
+		klog.InfoS("skipping due to user-defined settings", "id", id, "pid", pid)
+		t := time.Now()
+		r.containersByPidIgnored[pid] = &t
+		return nil
+	}
+
 	if c := r.containersById[id]; c != nil {
 		klog.Warningln("id conflict:", id)
 		if cg.CreatedAt().After(c.cgroup.CreatedAt()) {
@@ -346,9 +394,8 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		klog.Warningf("failed to create container pid=%d cg=%s id=%s: %s", pid, cg.Id, id, err)
 		return nil
 	}
-
-	klog.InfoS("detected a new container", "pid", pid, "cg", cg.Id, "id", id)
-	if err := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id)}, r.reg).Register(c); err != nil {
+	klog.InfoS("detected a new container", "pid", pid, "cg", cg.Id, "id", id, "app", c.appId)
+	if err := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id), "app_id": c.appId}, r.reg).Register(c); err != nil {
 		klog.Warningln("failed to register container:", err)
 		return nil
 	}
@@ -358,13 +405,22 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	return c
 }
 
-func (r *Registry) updateTrafficStatsIfNecessary() {
-	r.trafficStatsLock.Lock()
-	defer r.trafficStatsLock.Unlock()
+func (r *Registry) updateStatsFromEbpfMapsIfNecessary() {
+	r.ebpfStatsLock.Lock()
+	defer r.ebpfStatsLock.Unlock()
 
-	if time.Now().Sub(r.trafficStatsLastUpdated) < MinTrafficStatsUpdateInterval {
+	if time.Now().Sub(r.ebpfStatsLastUpdated) < MinTrafficStatsUpdateInterval {
 		return
 	}
+
+	r.updateTrafficStats()
+	r.updateNodejsStats()
+	r.updatePythonStats()
+
+	r.ebpfStatsLastUpdated = time.Now()
+}
+
+func (r *Registry) updateTrafficStats() {
 	iter := r.tracer.ActiveConnectionsIterator()
 	cid := ebpftracer.ConnectionId{}
 	stats := ebpftracer.Connection{}
@@ -380,10 +436,39 @@ func (r *Registry) updateTrafficStatsIfNecessary() {
 		klog.Warningln(err)
 	}
 	r.trafficStatsUpdateCh <- nil
-	r.trafficStatsLastUpdated = time.Now()
 }
 
-func (r *Registry) getFQDN(ip netaddr.IP) string {
+func (r *Registry) updateNodejsStats() {
+	iter := r.tracer.NodejsStatsIterator()
+	var pid uint64
+	stats := ebpftracer.NodejsStats{}
+
+	for iter.Next(&pid, &stats) {
+		r.nodejsStatsUpdateCh <- &NodejsStatsUpdate{Pid: uint32(pid), Stats: stats}
+	}
+
+	if err := iter.Err(); err != nil {
+		klog.Warningln(err)
+	}
+	r.nodejsStatsUpdateCh <- nil
+}
+
+func (r *Registry) updatePythonStats() {
+	iter := r.tracer.PythonStatsIterator()
+	var pid uint64
+	stats := ebpftracer.PythonStats{}
+
+	for iter.Next(&pid, &stats) {
+		r.pythonStatsUpdateCh <- &PythonStatsUpdate{Pid: uint32(pid), Stats: stats}
+	}
+
+	if err := iter.Err(); err != nil {
+		klog.Warningln(err)
+	}
+	r.pythonStatsUpdateCh <- nil
+}
+
+func (r *Registry) getDomain(ip netaddr.IP) *common.Domain {
 	r.ip2fqdnLock.RLock()
 	defer r.ip2fqdnLock.RUnlock()
 	return r.ip2fqdn[ip]
@@ -396,8 +481,6 @@ func calcId(cg *cgroup.Cgroup, md *ContainerMetadata) ContainerID {
 			return ""
 		}
 		return ContainerID(cg.ContainerId)
-	case cgroup.ContainerTypeUnknown:
-		return ContainerID(fmt.Sprintf("apps/%s", md.name))
 	case cgroup.ContainerTypeTalosRuntime:
 		return ContainerID(cg.ContainerId)
 	case cgroup.ContainerTypeDocker, cgroup.ContainerTypeContainerd, cgroup.ContainerTypeSandbox, cgroup.ContainerTypeCrio:
@@ -495,4 +578,14 @@ type TrafficStatsUpdate struct {
 	FD            uint64
 	BytesSent     uint64
 	BytesReceived uint64
+}
+
+type NodejsStatsUpdate struct {
+	Pid   uint32
+	Stats ebpftracer.NodejsStats
+}
+
+type PythonStatsUpdate struct {
+	Pid   uint32
+	Stats ebpftracer.PythonStats
 }

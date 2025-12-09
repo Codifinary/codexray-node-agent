@@ -15,16 +15,17 @@ type MemoryStat struct {
 }
 
 func (cg *Cgroup) MemoryStat() *MemoryStat {
-	if cg.Version == V1 {
-		st, _ := cg.memoryStatV1()
+	mem := cg.subsystems["memory"]
+	if mem == "" {
+		st, _ := cg.memoryStatV2()
 		return st
 	}
-	st, _ := cg.memoryStatV2()
+	st, _ := cg.memoryStatV1()
 	return st
 }
 
 func (cg *Cgroup) memoryStatV1() (*MemoryStat, error) {
-	if cg.subsystems["memory"] == "/" {
+	if cg.subsystems["memory"] == "" {
 		return nil, nil
 	}
 	vars, err := readVariablesFromFile(path.Join(cgRoot, "memory", cg.subsystems["memory"], "memory.stat"))
@@ -47,18 +48,21 @@ func (cg *Cgroup) memoryStatV1() (*MemoryStat, error) {
 	//	 mapped_file is accounted only when the memory cgroup is owner of page
 	//	 cache.)
 	return &MemoryStat{
-		RSS:   vars["rss"] + vars["mapped_file"],
-		Cache: vars["cache"],
+		RSS:   vars["total_rss"] + vars["total_mapped_file"],
+		Cache: vars["total_cache"],
 		Limit: limit,
 	}, nil
 }
 
 func (cg *Cgroup) memoryStatV2() (*MemoryStat, error) {
-	vars, err := readVariablesFromFile(path.Join(cgRoot, cg.subsystems[""], "memory.stat"))
+	if cg.subsystems[""] == "" {
+		return nil, nil
+	}
+	vars, err := readVariablesFromFile(path.Join(cg2Root, cg.subsystems[""], "memory.stat"))
 	if err != nil {
 		return nil, err
 	}
-	limit, _ := common.ReadUintFromFile(path.Join(cgRoot, cg.subsystems[""], "memory.max"))
+	limit, _ := common.ReadUintFromFile(path.Join(cg2Root, cg.subsystems[""], "memory.max"))
 	return &MemoryStat{
 		RSS:   vars["anon"] + vars["file_mapped"],
 		Cache: vars["file"],
