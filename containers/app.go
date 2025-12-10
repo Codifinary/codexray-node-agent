@@ -20,15 +20,11 @@ func guessApplicationTypeByCmdline(cmdline []byte) string {
 	cmd := bytes.TrimSuffix(bytes.Fields(parts[0])[0], []byte{':'})
 	switch {
 	case bytes.HasSuffix(cmd, []byte("codexray")):
-		return "codexray-community-edition"
-	case bytes.HasSuffix(cmd, []byte("codexray-ee")):
-		return "codexray-enterprise-edition"
+		return "codexray"
 	case bytes.HasSuffix(cmd, []byte("codexray-node-agent")):
 		return "codexray-node-agent"
 	case bytes.HasSuffix(cmd, []byte("codexray-cluster-agent")):
 		return "codexray-cluster-agent"
-	case bytes.HasSuffix(cmd, []byte("codexray-operator")):
-		return "codexray-operator"
 	case bytes.HasSuffix(cmd, []byte("memcached")):
 		return "memcached"
 	case bytes.HasSuffix(cmd, []byte("envoy")):
