@@ -17,8 +17,8 @@ func TestContainerIdToServiceName(t *testing.T) {
 		"/k8s/codifinary/codexray-node-agent")
 
 	assert.Equal(t,
-		f("/k8s/codexray/pyroscope-df884bb79-hhxtv/pyroscope"),
-		"/k8s/codexray/pyroscope")
+		f("/k8s/codifinary/pyroscope-df884bb79-hhxtv/pyroscope"),
+		"/k8s/codifinary/pyroscope")
 
 	assert.Equal(t,
 		f("/k8s/default/cassandra-main-12/cassandra"),

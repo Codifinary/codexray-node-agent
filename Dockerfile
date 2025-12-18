@@ -1,20 +1,50 @@
-FROM golang:1.23-bullseye AS builder
-RUN apt update && apt install -y libsystemd-dev
+FROM debian:bullseye AS builder
+# Using Debian instead of the official Golang image because it’s based on newer OS versions
+# with newer glibc, which causes compatibility issues.
+
+RUN for i in 1 2 3; do \
+        apt-get update && \
+        apt-get install -y --fix-missing \
+        curl git build-essential pkg-config libsystemd-dev && \
+        break || sleep 5; \
+    done
+
+ARG GO_VERSION=1.24.9
+RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz -o go.tar.gz && \
+    tar -C /usr/local -xzf go.tar.gz && rm go.tar.gz
+ENV PATH="/usr/local/go/bin:${PATH}"
+
 WORKDIR /tmp/src
 COPY go.mod .
 COPY go.sum .
+
+# Configure Git for private repositories
+ARG GHCR_PAT
+RUN if [ -n "$GHCR_PAT" ]; then \
+        git config --global credential.helper store && \
+        echo "https://x-access-token:${GHCR_PAT}@github.com" > ~/.git-credentials && \
+        chmod 600 ~/.git-credentials && \
+        git config --global url."https://x-access-token:${GHCR_PAT}@github.com/".insteadOf "https://github.com/"; \
+    fi && \
+    go env -w GOPRIVATE=github.com/codifinary/* && \
+    go env -w GONOPROXY=github.com/codifinary/* && \
+    go env -w GONOSUMDB=github.com/codifinary/*
+
 RUN go mod download
 COPY . .
 ARG VERSION=unknown
-RUN GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -mod=readonly -ldflags "-X main.version=$VERSION" -o codexray-node-agent .
+RUN CGO_ENABLED=1 go build -mod=readonly -ldflags "-extldflags='-Wl,-z,lazy' -X 'github.com/codifinary/codexray-node-agent/flags.Version=${VERSION}'" -o codexray-node-agent .
 
 FROM registry.access.redhat.com/ubi9/ubi
 
 ARG VERSION=unknown
 LABEL name="codexray-node-agent" \
-      vendor="Codexray, Inc." \
+      vendor="codexray" \
+      maintainer="codexray" \
       version=${VERSION} \
-      summary="Codexray Node Agent."
+      release="1" \
+      summary="Codexray Node Agent." \
+      description="Codexray Node Agent container image."
 
 COPY LICENSE /licenses/LICENSE
 

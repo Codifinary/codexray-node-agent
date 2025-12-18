@@ -1,6 +1,6 @@
 # Contributing
 
-Thank you for your interest in contributing to Coroot!
+Thank you for your interest in contributing to Codexray!
 Below are some basic guidelines.
 
 

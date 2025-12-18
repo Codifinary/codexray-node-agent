@@ -16,17 +16,18 @@ type CPUStat struct {
 	LimitCores           float64
 }
 
-func (cg Cgroup) CpuStat() *CPUStat {
-	if cg.Version == V1 {
-		st, _ := cg.cpuStatV1()
+func (cg *Cgroup) CpuStat() *CPUStat {
+	cpu, cpuacct := cg.subsystems["cpu"], cg.subsystems["cpuacct"]
+	if cpu == "" || cpuacct == "" {
+		st, _ := cg.cpuStatV2()
 		return st
 	}
-	st, _ := cg.cpuStatV2()
+	st, _ := cg.cpuStatV1()
 	return st
 }
 
-func (cg Cgroup) cpuStatV1() (*CPUStat, error) {
-	if cg.subsystems["cpu"] == "/" || cg.subsystems["cpuacct"] == "/" {
+func (cg *Cgroup) cpuStatV1() (*CPUStat, error) {
+	if cg.subsystems["cpu"] == "" || cg.subsystems["cpuacct"] == "" {
 		return nil, nil
 	}
 	throttling, err := readVariablesFromFile(path.Join(cgRoot, "cpu", cg.subsystems["cpu"], "cpu.stat"))
@@ -55,8 +56,11 @@ func (cg Cgroup) cpuStatV1() (*CPUStat, error) {
 	return res, nil
 }
 
-func (cg Cgroup) cpuStatV2() (*CPUStat, error) {
-	vars, err := readVariablesFromFile(path.Join(cgRoot, cg.subsystems[""], "cpu.stat"))
+func (cg *Cgroup) cpuStatV2() (*CPUStat, error) {
+	if cg.subsystems[""] == "" {
+		return nil, nil
+	}
+	vars, err := readVariablesFromFile(path.Join(cg2Root, cg.subsystems[""], "cpu.stat"))
 	if err != nil {
 		return nil, err
 	}
@@ -64,7 +68,7 @@ func (cg Cgroup) cpuStatV2() (*CPUStat, error) {
 		UsageSeconds:         float64(vars["usage_usec"]) / 1e6,
 		ThrottledTimeSeconds: float64(vars["throttled_usec"]) / 1e6,
 	}
-	if payload, err := os.ReadFile(path.Join(cgRoot, cg.subsystems[""], "cpu.max")); err == nil {
+	if payload, err := os.ReadFile(path.Join(cg2Root, cg.subsystems[""], "cpu.max")); err == nil {
 		data := strings.TrimSpace(string(payload))
 		parts := strings.Fields(data)
 		if len(parts) != 2 {

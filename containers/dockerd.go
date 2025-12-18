@@ -8,7 +8,7 @@ import (
 
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/proc"
-	"github.com/coroot/logparser"
+	"github.com/codifinary/logparser"
 	"github.com/docker/docker/client"
 	"inet.af/netaddr"
 )

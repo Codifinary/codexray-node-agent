@@ -13,7 +13,7 @@ import (
 
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/proc"
-	"github.com/coroot/logparser"
+	"github.com/codifinary/logparser"
 	"k8s.io/klog/v2"
 )
 

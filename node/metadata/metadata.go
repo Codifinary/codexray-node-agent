@@ -21,6 +21,9 @@ const (
 	CloudProviderHetzner      CloudProvider = "Hetzner"
 	CloudProviderDigitalOcean CloudProvider = "DigitalOcean"
 	CloudProviderAlibaba      CloudProvider = "Alibaba"
+	CloudProviderScaleway     CloudProvider = "Scaleway"
+	CloudProviderIBM          CloudProvider = "IBM"
+	CloudProviderOracle       CloudProvider = "Oracle"
 	CloudProviderUnknown      CloudProvider = ""
 )
 
@@ -61,8 +64,21 @@ func getCloudProvider() CloudProvider {
 			return CloudProviderHetzner
 		case "Alibaba Cloud":
 			return CloudProviderAlibaba
+		case "Scaleway":
+			return CloudProviderScaleway
 		}
 	}
+	if vendor, err := os.ReadFile("/sys/class/dmi/id/chassis_vendor"); err == nil {
+		if strings.HasPrefix(string(vendor), "IBM:Cloud Compute Server") {
+			return CloudProviderIBM
+		}
+	}
+	if vendor, err := os.ReadFile("/sys/class/dmi/id/chassis_asset_tag"); err == nil {
+		if strings.TrimSpace(string(vendor)) == "OracleCloud.com" {
+			return CloudProviderOracle
+		}
+	}
+
 	return CloudProviderUnknown
 }
 
@@ -82,6 +98,12 @@ func GetInstanceMetadata() *CloudMetadata {
 		return getDigitalOceanMetadata()
 	case CloudProviderAlibaba:
 		return getAlibabaMetadata()
+	case CloudProviderScaleway:
+		return getScalewayMetadata()
+	case CloudProviderIBM:
+		return getIBMMetadata()
+	case CloudProviderOracle:
+		return getOracleMetadata()
 	}
 	return nil
 }

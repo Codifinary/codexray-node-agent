@@ -11,6 +11,7 @@ import (
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/containers"
 	"github.com/codifinary/codexray-node-agent/flags"
+	"github.com/codifinary/codexray-node-agent/gpu"
 	"github.com/codifinary/codexray-node-agent/logs"
 	"github.com/codifinary/codexray-node-agent/node"
 	"github.com/codifinary/codexray-node-agent/proc"
@@ -25,7 +26,7 @@ import (
 )
 
 var (
-	version = "unknown"
+	version = flags.Version
 )
 
 func uname() (string, string, error) {
@@ -130,18 +131,36 @@ func main() {
 	tracing.Init(machineId, hostname, version)
 	logs.Init(machineId, hostname, version)
 
+	nodeCollector := node.NewCollector(hostname, kv)
+
 	registry := prometheus.NewRegistry()
-	registerer := prometheus.WrapRegistererWith(prometheus.Labels{"machine_id": machineId, "system_uuid": systemUuid}, registry)
 
-	registerer.MustRegister(info("node_agent_info", version))
-
-	if err := registerer.Register(node.NewCollector(hostname, kv)); err != nil {
+	registerer := prometheus.WrapRegistererWith(
+		prometheus.Labels{"machine_id": machineId, "system_uuid": systemUuid},
+		registry,
+	)
+	if err := registerer.Register(nodeCollector); err != nil {
 		klog.Exitln(err)
 	}
 
-	processInfoCh := profiling.Init(machineId, hostname)
+	gpuCollector, err := gpu.NewCollector()
+	if err != nil {
+		klog.Warningln("failed to initialize GPU collector:", err)
+	}
+	if err := registerer.Register(gpuCollector); err != nil {
+		klog.Exitln(err)
+	}
+	registerer.MustRegister(info("node_agent_info", version))
 
-	cr, err := containers.NewRegistry(registerer, processInfoCh)
+	if md := nodeCollector.Metadata(); md != nil {
+		region := md.Region
+		az := md.AvailabilityZone
+		if region != "" && az != "" {
+			registerer = prometheus.WrapRegistererWith(prometheus.Labels{"az": az, "region": region}, registerer)
+		}
+	}
+	processInfoCh := profiling.Init(machineId, hostname)
+	cr, err := containers.NewRegistry(registerer, processInfoCh, gpuCollector.ProcessUsageSampleCh)
 	if err != nil {
 		klog.Exitln(err)
 	}
@@ -150,7 +169,7 @@ func main() {
 	profiling.Start()
 	defer profiling.Stop()
 
-	if err := prom.StartAgent(machineId); err != nil {
+	if err := prom.StartAgent(registry, machineId, systemUuid); err != nil {
 		klog.Exitln(err)
 	}
 
