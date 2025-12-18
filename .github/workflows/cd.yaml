@@ -16,7 +16,6 @@ env:
   GO_VERSION: ${{ vars.GO_VERSION }}
   VERSION: ${{ vars.VERSION }}
   BINARY_NAME: ${{ vars.BINARY_NAME }}
-  GHCR_REGISTRY: ghcr.io/${{ github.repository }}
 
 permissions:
   packages: write # Required for pushing Docker images to GHCR
@@ -33,6 +32,10 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
+
+      # Set lowercase image name (Docker tags must be lowercase)
+      - name: Set image name
+        run: echo "GHCR_REGISTRY=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
 
       # Log in to GHCR
       - name: Log in to GHCR
