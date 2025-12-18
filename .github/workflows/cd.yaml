@@ -33,9 +33,11 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      # Set lowercase image name (Docker tags must be lowercase)
-      - name: Set image name
-        run: echo "GHCR_REGISTRY=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+      # Set lowercase image name and short SHA (Docker tags must be lowercase)
+      - name: Set image name and short SHA
+        run: |
+          echo "GHCR_REGISTRY=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
 
       # Log in to GHCR
       - name: Log in to GHCR
@@ -76,14 +78,14 @@ jobs:
       - name: Build Docker Image
         run: |
           docker build --build-arg GHCR_PAT="${{ secrets.GHCR_PAT }}" --build-arg VERSION="${{ env.VERSION }}" \
-            -t ${{ env.GHCR_REGISTRY }}:${{ github.sha }} \
+            -t ${{ env.GHCR_REGISTRY }}:${{ env.SHORT_SHA }} \
             -t ${{ env.GHCR_REGISTRY }}:latest \
             -f Dockerfile .
 
       # Push Docker Image to GHCR
       - name: Push Docker Image to GHCR
         run: |
-          docker push ${{ env.GHCR_REGISTRY }}:${{ github.sha }}
+          docker push ${{ env.GHCR_REGISTRY }}:${{ env.SHORT_SHA }}
           docker push ${{ env.GHCR_REGISTRY }}:latest
 
       # Create a GitHub Release
