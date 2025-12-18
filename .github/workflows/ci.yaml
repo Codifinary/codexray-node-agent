@@ -1,0 +1,84 @@
+name: CI - Build, Test, Lint
+
+# -------------------------------------
+# Triggers: Run on pull requests to any branch
+# -------------------------------------
+on:
+  pull_request:
+    branches:
+      - '**'
+
+# -------------------------------------
+# Environment Variables (from GitHub Settings → Secrets and variables → Actions → Variables)
+# Required vars: GO_VERSION, BINARY_NAME
+# -------------------------------------
+env:
+  GO_VERSION: ${{ vars.GO_VERSION }}
+  BINARY_NAME: ${{ vars.BINARY_NAME }}
+
+permissions:
+  contents: read
+
+# -------------------------------------
+# Job: CI - Build, Test, Lint
+# -------------------------------------
+jobs:
+  build:
+    name: Build, Test, Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checkout the repository code
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Set up Go environment
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Configure Git for private repositories
+      - name: Configure Git for private modules
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${GHCR_PAT}@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+          git config --global url."https://x-access-token:${GHCR_PAT}@github.com/".insteadOf "https://github.com/"
+          go env -w GOPRIVATE=github.com/${{ github.repository_owner }}/*
+          go env -w GONOPROXY=github.com/${{ github.repository_owner }}/*
+          go env -w GONOSUMDB=github.com/${{ github.repository_owner }}/*
+
+      # Cache Go modules to speed up the build process
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      # Install Go dependencies
+      - name: Install dependencies
+        run: go mod download
+
+      # Install systemd development headers
+      - name: Install systemd development headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsystemd-dev
+
+      # Build the Go project
+      - name: Build
+        run: go build -o ${{ env.BINARY_NAME }} .
+
+      # Archive the built binary as an artifact
+      - name: Archive production artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}
+          path: ${{ env.BINARY_NAME }}
