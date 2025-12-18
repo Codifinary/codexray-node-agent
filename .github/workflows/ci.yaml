@@ -1,12 +1,15 @@
 name: CI - Build, Test, Lint
 
 # -------------------------------------
-# Triggers: Run on pull requests to any branch
+# Triggers: Run on pull requests to any branch and push to main
 # -------------------------------------
 on:
   pull_request:
     branches:
       - '**'
+  push:
+    branches:
+      - main
 
 # -------------------------------------
 # Environment Variables (from GitHub Settings → Secrets and variables → Actions → Variables)
