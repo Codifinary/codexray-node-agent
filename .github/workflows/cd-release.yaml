@@ -21,9 +21,8 @@ env:
   BINARY_NAME: ${{ vars.BINARY_NAME }}
 
 permissions:
-  contents: read # Required for checking out the repository
+  contents: write # Required for checking out repository and creating releases
   packages: write # Required for pushing Docker images to GHCR
-  contents: write # Required for creating releases
   actions: read # Required for reading workflow runs
   statuses: read # Required for reading commit statuses
 
