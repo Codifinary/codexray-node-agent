@@ -1,12 +1,19 @@
 name: CD - Develop Branch (Commit Tag)
 
 # -------------------------------------
-# Triggers: Run on push to develop branch
+# Triggers: Run on push to develop branch or after CI workflow completes
 # -------------------------------------
 on:
   push:
     branches:
       - develop
+  workflow_run:
+    workflows: ["CI - Build, Test, Lint"]
+    types:
+      - completed
+    branches:
+      - develop
+  workflow_dispatch:
 
 # -------------------------------------
 # Environment Variables (from GitHub Settings → Secrets and variables → Actions → Variables)
@@ -19,9 +26,8 @@ env:
 permissions:
   contents: read # Required for checking out the repository
   packages: write # Required for pushing Docker images to GHCR
-  checks: read # Required for reading CI status
-  actions: read # Required for reading workflow runs
-  statuses: read # Required for reading commit statuses
+  actions: read # Required for checking workflow runs
+  statuses: read # Required for checking CI status
 
 # -------------------------------------
 # Jobs
@@ -40,11 +46,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ref: ${{ github.sha }}
-      
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-      
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
       - name: Get Commit SHA
         id: sha
         run: |
@@ -52,98 +55,48 @@ jobs:
           echo "short=$SHA" >> $GITHUB_OUTPUT
           echo "Full SHA: $(git rev-parse HEAD)"
           echo "Short SHA: $SHA"
-      
+
       - name: Check CI Status
         id: check
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          COMMIT_SHA=$(git rev-parse HEAD)
-          echo "Checking CI status for commit: ${COMMIT_SHA}"
-          
-          # Find PRs associated with this commit
-          echo "Finding PR associated with commit ${COMMIT_SHA}..."
-          
-          PRS=$(curl -s -w "\n%{http_code}" -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/commits/${COMMIT_SHA}/pulls")
-          
-          HTTP_CODE=$(echo "$PRS" | tail -n1)
-          PRS_BODY=$(echo "$PRS" | sed '$d')
-          
-          # Check if response is an array and extract PR number
-          if echo "$PRS_BODY" | jq -e 'type == "array" and length > 0' > /dev/null 2>&1; then
-            PR_NUMBER=$(echo "$PRS_BODY" | jq -r '.[0].number // empty')
-            echo "Found PR #${PR_NUMBER}"
-          else
-            PR_NUMBER=""
-            if [ "$HTTP_CODE" != "200" ]; then
-              echo "⚠️  API returned HTTP ${HTTP_CODE}. Response: ${PRS_BODY}"
-            fi
-          fi
-          
-          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" == "null" ]; then
-            echo "⚠️  No PR found for commit ${COMMIT_SHA}. This might be a direct push."
-            echo "Checking CI workflow runs on develop branch instead..."
-            
-            # Get CI workflow runs for develop branch
-            CI_RUNS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yaml/runs?branch=develop&status=completed&per_page=5")
-            
-            CI_CONCLUSION=$(echo "$CI_RUNS" | jq -r '.workflow_runs[0].conclusion // empty')
-            
-            if [ "$CI_CONCLUSION" == "success" ]; then
-              echo "✅ Found recent successful CI run on develop branch. Proceeding with deployment."
-              echo "should_deploy=true" >> $GITHUB_OUTPUT
-            else
-              echo "❌ No successful CI run found for develop branch. Skipping deployment."
-              echo "Please ensure CI passes before pushing to develop."
+          if [ "${{ github.event_name }}" == "workflow_run" ]; then
+            if [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
+              echo "❌ CI workflow did not succeed. Skipping deployment."
               echo "should_deploy=false" >> $GITHUB_OUTPUT
               exit 1
             fi
+            echo "✅ CI workflow succeeded. Proceeding with deployment."
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
           else
-            echo "Found PR #${PR_NUMBER}. Checking CI status for this PR..."
+            echo "Push event detected. Checking CI status for commit $COMMIT_SHA..."
             
-            # Get PR details
-            PR_DETAILS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            # Get the latest CI workflow run for this commit
+            WORKFLOW_RUNS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yaml/runs?head_sha=$COMMIT_SHA&per_page=1")
             
-            TARGET_BRANCH=$(echo "$PR_DETAILS" | jq -r '.base.ref // empty')
-            PR_HEAD_SHA=$(echo "$PR_DETAILS" | jq -r '.head.sha // empty')
+            CONCLUSION=$(echo "$WORKFLOW_RUNS" | jq -r '.workflow_runs[0].conclusion // "null"')
+            STATUS=$(echo "$WORKFLOW_RUNS" | jq -r '.workflow_runs[0].status // "null"')
             
-            echo "PR #${PR_NUMBER} targets ${TARGET_BRANCH}, head SHA: ${PR_HEAD_SHA}"
+            echo "Latest CI workflow run status: $STATUS, conclusion: $CONCLUSION"
             
-            # Get CI workflow runs for the PR head branch
-            echo "Checking CI status for PR head SHA: ${PR_HEAD_SHA}"
-            
-            CI_RUNS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yaml/runs?head_sha=${PR_HEAD_SHA}&per_page=1")
-            
-            CI_CONCLUSION=$(echo "$CI_RUNS" | jq -r '.workflow_runs[0].conclusion // empty')
-            CI_STATUS_VAL=$(echo "$CI_RUNS" | jq -r '.workflow_runs[0].status // empty')
-            
-            if [ "$CI_CONCLUSION" == "success" ]; then
-              echo "✅ CI passed for PR #${PR_NUMBER} (commit: ${PR_HEAD_SHA}). Proceeding with deployment."
+            if [ "$STATUS" == "null" ] || [ "$STATUS" == "" ]; then
+              echo "⚠️ No CI workflow run found for this commit. Proceeding with deployment."
               echo "should_deploy=true" >> $GITHUB_OUTPUT
-            elif [ "$CI_CONCLUSION" == "failure" ] || [ "$CI_CONCLUSION" == "cancelled" ]; then
-              echo "❌ CI failed for PR #${PR_NUMBER} (conclusion: ${CI_CONCLUSION}). Skipping deployment."
-              echo "Please ensure CI passes before merging to develop."
+            elif [ "$STATUS" != "completed" ]; then
+              echo "❌ CI workflow is still running or not completed. Status: $STATUS. Skipping deployment."
               echo "should_deploy=false" >> $GITHUB_OUTPUT
               exit 1
-            elif [ "$CI_STATUS_VAL" == "in_progress" ] || [ "$CI_STATUS_VAL" == "queued" ]; then
-              echo "⚠️  CI is still running for PR #${PR_NUMBER} (status: ${CI_STATUS_VAL})."
-              echo "Skipping deployment. Please wait for CI to complete."
+            elif [ "$CONCLUSION" != "success" ]; then
+              echo "❌ CI workflow did not succeed. Conclusion: $CONCLUSION. Skipping deployment."
               echo "should_deploy=false" >> $GITHUB_OUTPUT
               exit 1
             else
-              echo "⚠️  Could not determine CI status for PR #${PR_NUMBER}."
-              echo "CI status: ${CI_STATUS_VAL}, conclusion: ${CI_CONCLUSION}"
-              echo "Skipping deployment for safety."
-              echo "should_deploy=false" >> $GITHUB_OUTPUT
-              exit 1
+              echo "✅ CI workflow succeeded. Proceeding with deployment."
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
             fi
           fi
 
@@ -158,12 +111,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       # Set commit tag
       - name: Set commit tag
         run: |
-          SHA="${{ github.sha }}"
-          SHORT_SHA="${SHA:0:7}"
+          SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          SHORT_SHA=$(git rev-parse --short HEAD)
           echo "GHCR_REGISTRY=ghcr.io/${GITHUB_REPOSITORY,,}-dev" >> $GITHUB_ENV
           echo "IMAGE_TAG=${SHORT_SHA}" >> $GITHUB_ENV
           echo "BINARY_TAG=${SHORT_SHA}" >> $GITHUB_ENV
