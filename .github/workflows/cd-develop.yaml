@@ -1,28 +1,24 @@
-name: CD - Build and Push Docker Image
+name: CD - Develop Branch (Commit Tag)
 
 # -------------------------------------
-# Triggers: Run after CI workflow completes successfully on main branch
+# Triggers: Run on push to develop branch
 # -------------------------------------
 on:
-  workflow_run:
-    workflows: ["CI - Build, Test, Lint"]
-    types:
-      - completed
+  push:
     branches:
-      - main
+      - develop
 
 # -------------------------------------
 # Environment Variables (from GitHub Settings → Secrets and variables → Actions → Variables)
-# Required vars: GO_VERSION, VERSION, BINARY_NAME
+# Required vars: GO_VERSION, BINARY_NAME
 # -------------------------------------
 env:
   GO_VERSION: ${{ vars.GO_VERSION }}
-  VERSION: ${{ vars.VERSION }}
   BINARY_NAME: ${{ vars.BINARY_NAME }}
 
 permissions:
   packages: write # Required for pushing Docker images to GHCR
-  contents: write # Required for accessing repository contents and creating releases
+  checks: read # Required for reading CI status
 
 # -------------------------------------
 # Job: Build and Push Docker Image to GHCR
@@ -31,17 +27,49 @@ jobs:
   build-and-push:
     name: Build and Push Docker Image to GHCR
     runs-on: ubuntu-latest
-    # Only run if CI workflow was successful
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      - name: Set image name and short SHA
+      # Check last CI status for this commit
+      - name: Check CI status
+        id: check_ci
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: checks } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+            });
+            
+            // Find CI workflow check
+            const ciCheck = checks.check_runs.find(
+              check => check.name === 'CI - Build, Test, Lint'
+            );
+            
+            if (!ciCheck) {
+              core.setFailed('No CI check found for this commit. CI must run on PR first.');
+              return;
+            }
+            
+            if (ciCheck.conclusion !== 'success') {
+              core.setFailed(`CI check failed with status: ${ciCheck.conclusion}`);
+              return;
+            }
+            
+            core.info(`CI check passed: ${ciCheck.html_url}`);
+
+      # Set commit tag
+      - name: Set commit tag
         run: |
+          SHA="${{ github.sha }}"
+          SHORT_SHA="${SHA:0:7}"
           echo "GHCR_REGISTRY=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
-          echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${SHORT_SHA}" >> $GITHUB_ENV
+          echo "BINARY_TAG=${SHORT_SHA}" >> $GITHUB_ENV
+          echo "VERSION=${SHORT_SHA}" >> $GITHUB_ENV
 
       # Log in to GHCR
       - name: Log in to GHCR
@@ -66,6 +94,21 @@ jobs:
           go env -w GONOPROXY=github.com/${{ github.repository_owner }}/*
           go env -w GONOSUMDB=github.com/${{ github.repository_owner }}/*
 
+      # Cache Go modules to speed up the build process
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      # Install Go dependencies
+      - name: Install dependencies
+        run: go mod download
+
       # Install systemd development headers
       - name: Install systemd development headers
         run: |
@@ -82,35 +125,19 @@ jobs:
       - name: Build Docker Image
         run: |
           docker build --build-arg GHCR_PAT="${{ secrets.GHCR_PAT }}" --build-arg VERSION="${{ env.VERSION }}" \
-            -t ${{ env.GHCR_REGISTRY }}:${{ env.SHORT_SHA }} \
-            -t ${{ env.GHCR_REGISTRY }}:latest \
+            -t ${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG }} \
             -f Dockerfile .
 
       # Push Docker Image to GHCR
       - name: Push Docker Image to GHCR
         run: |
-          docker push ${{ env.GHCR_REGISTRY }}:${{ env.SHORT_SHA }}
-          docker push ${{ env.GHCR_REGISTRY }}:latest
+          docker push ${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG }}
 
-      # Create a GitHub Release
-      - name: Create GitHub Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Archive binary with commit tag
+      - name: Archive binary with commit tag
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: "v${{ env.VERSION }}-${{ github.run_id }}"
-          release_name: "Release v${{ env.VERSION }}-${{ github.run_id }}"
-          draft: false
-          prerelease: false
+          name: ${{ env.BINARY_NAME }}-${{ env.BINARY_TAG }}
+          path: ${{ env.BINARY_NAME }}
+          retention-days: 30
 
-      # Upload Binary as a Release Asset
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./${{ env.BINARY_NAME }}
-          asset_name: ${{ env.BINARY_NAME }}
-          asset_content_type: application/octet-stream
