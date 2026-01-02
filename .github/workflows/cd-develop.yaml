@@ -64,11 +64,23 @@ jobs:
           # Find PRs associated with this commit
           echo "Finding PR associated with commit ${COMMIT_SHA}..."
           
-          PRS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          PRS=$(curl -s -w "\n%{http_code}" -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ github.repository }}/commits/${COMMIT_SHA}/pulls")
           
-          PR_NUMBER=$(echo "$PRS" | jq -r '.[0].number // empty')
+          HTTP_CODE=$(echo "$PRS" | tail -n1)
+          PRS_BODY=$(echo "$PRS" | sed '$d')
+          
+          # Check if response is an array and extract PR number
+          if echo "$PRS_BODY" | jq -e 'type == "array" and length > 0' > /dev/null 2>&1; then
+            PR_NUMBER=$(echo "$PRS_BODY" | jq -r '.[0].number // empty')
+            echo "Found PR #${PR_NUMBER}"
+          else
+            PR_NUMBER=""
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "⚠️  API returned HTTP ${HTTP_CODE}. Response: ${PRS_BODY}"
+            fi
+          fi
           
           if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" == "null" ]; then
             echo "⚠️  No PR found for commit ${COMMIT_SHA}. This might be a direct push."
