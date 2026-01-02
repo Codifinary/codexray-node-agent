@@ -37,6 +37,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           ref: main # Always use main branch for releases
 
       # Check last CI status for the latest commit on main

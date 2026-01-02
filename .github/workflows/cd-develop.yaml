@@ -17,6 +17,7 @@ env:
   BINARY_NAME: ${{ vars.BINARY_NAME }}
 
 permissions:
+  contents: read # Required for checking out the repository
   packages: write # Required for pushing Docker images to GHCR
   checks: read # Required for reading CI status
 
@@ -31,6 +32,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       # Check last CI status for this commit
       - name: Check CI status

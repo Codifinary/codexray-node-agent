@@ -31,6 +31,8 @@ jobs:
       # Checkout the repository code
       - name: Checkout code
         uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       # Set up Go environment
       - name: Set up Go
