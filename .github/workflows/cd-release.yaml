@@ -1,0 +1,248 @@
+name: CD - Release (Main Branch)
+
+# -------------------------------------
+# Triggers: Manual workflow dispatch with version input
+# Run this workflow manually after pushing to main branch
+# -------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0 or v1.0.0)'
+        required: true
+        type: string
+
+# -------------------------------------
+# Environment Variables (from GitHub Settings → Secrets and variables → Actions → Variables)
+# Required vars: GO_VERSION, BINARY_NAME
+# -------------------------------------
+env:
+  GO_VERSION: ${{ vars.GO_VERSION }}
+  BINARY_NAME: ${{ vars.BINARY_NAME }}
+
+permissions:
+  contents: read # Required for checking out the repository
+  packages: write # Required for pushing Docker images to GHCR
+  contents: write # Required for creating releases
+  actions: read # Required for reading workflow runs
+  statuses: read # Required for reading commit statuses
+
+# -------------------------------------
+# Jobs
+# -------------------------------------
+jobs:
+  check-ci:
+    name: Check CI Status
+    runs-on: ubuntu-latest
+    
+    outputs:
+      commit_sha: ${{ steps.sha.outputs.short }}
+      full_sha: ${{ steps.sha.outputs.full }}
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main # Always use main branch for releases
+
+      - name: Get Commit SHA
+        id: sha
+        run: |
+          SHA=$(git rev-parse HEAD)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "short=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "full=$SHA" >> $GITHUB_OUTPUT
+          echo "Full SHA: $SHA"
+          echo "Short SHA: $SHORT_SHA"
+
+      - name: Check CI Status
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          echo "Checking CI status for commit on main branch..."
+          
+          # Get the latest CI workflow run for main branch
+          WORKFLOW_RUNS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yaml/runs?branch=main&status=completed&per_page=5")
+          
+          # Find the most recent successful CI run
+          SUCCESSFUL_RUN=$(echo "$WORKFLOW_RUNS" | jq -r '[.workflow_runs[] | select(.conclusion == "success")] | .[0] // empty')
+          
+          if [ -n "$SUCCESSFUL_RUN" ] && [ "$SUCCESSFUL_RUN" != "null" ]; then
+            CI_HEAD_SHA=$(echo "$SUCCESSFUL_RUN" | jq -r '.head_sha // empty')
+            CI_RUN_URL=$(echo "$SUCCESSFUL_RUN" | jq -r '.html_url // empty')
+            CURRENT_SHA=$(git rev-parse HEAD)
+            
+            echo "Found successful CI run: ${CI_RUN_URL}"
+            echo "CI run commit: ${CI_HEAD_SHA}"
+            echo "Current commit: ${CURRENT_SHA}"
+            
+            # Check if current commit is reachable from CI commit or vice versa
+            if [ "$CI_HEAD_SHA" == "$CURRENT_SHA" ] || \
+               git merge-base --is-ancestor "$CI_HEAD_SHA" "$CURRENT_SHA" 2>/dev/null || \
+               git merge-base --is-ancestor "$CURRENT_SHA" "$CI_HEAD_SHA" 2>/dev/null; then
+              echo "✅ CI workflow succeeded for this commit or related commit. Proceeding with deployment."
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️ CI run is for a different commit, but proceeding since there's a recent successful CI on main."
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "❌ No successful CI workflow run found for main branch. Skipping deployment."
+            echo "Please ensure CI passes before creating a release."
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+  build-and-push:
+    name: Build and Push Docker Image to GHCR
+    runs-on: ubuntu-latest
+    needs: check-ci
+    if: needs.check-ci.outputs.should_deploy == 'true'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main # Always use main branch for releases
+
+      # Set version and tags
+      - name: Set version and tags
+        run: |
+          # Get version from input
+          VERSION_INPUT="${{ github.event.inputs.version }}"
+          
+          # Remove 'v' prefix if present
+          VERSION=${VERSION_INPUT#v}
+          TAG_NAME="v${VERSION}"
+          
+          # Get commit SHA from check-ci job
+          SHORT_SHA="${{ needs.check-ci.outputs.commit_sha }}"
+          FULL_SHA="${{ needs.check-ci.outputs.full_sha }}"
+          
+          echo "GHCR_REGISTRY=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "TAG_NAME=${TAG_NAME}" >> $GITHUB_ENV
+          echo "SHORT_SHA=${SHORT_SHA}" >> $GITHUB_ENV
+          echo "COMMIT_SHA=${FULL_SHA}" >> $GITHUB_ENV
+          
+          # Image and binary tags: both version and commit SHA
+          echo "IMAGE_TAG_VERSION=${TAG_NAME}" >> $GITHUB_ENV
+          echo "IMAGE_TAG_COMMIT=${SHORT_SHA}" >> $GITHUB_ENV
+          echo "BINARY_TAG_VERSION=${TAG_NAME}" >> $GITHUB_ENV
+          echo "BINARY_TAG_COMMIT=${SHORT_SHA}" >> $GITHUB_ENV
+
+      # Log in to GHCR
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # Set up Go environment
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Configure Git for private repositories
+      - name: Configure Git for private modules
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${GHCR_PAT}@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+          git config --global url."https://x-access-token:${GHCR_PAT}@github.com/".insteadOf "https://github.com/"
+          go env -w GOPRIVATE=github.com/${{ github.repository_owner }}/*
+          go env -w GONOPROXY=github.com/${{ github.repository_owner }}/*
+          go env -w GONOSUMDB=github.com/${{ github.repository_owner }}/*
+
+      # Cache Go modules to speed up the build process
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      # Install Go dependencies
+      - name: Install dependencies
+        run: go mod download
+
+      # Install systemd development headers
+      - name: Install systemd development headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsystemd-dev
+
+      # Build the codexray-node-agent Binary
+      - name: Build ${{ env.BINARY_NAME }} Binary
+        run: |
+          GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -mod=readonly -ldflags "-X main.version=${{ env.VERSION }}" -o ${{ env.BINARY_NAME }} .
+          ls -la ${{ env.BINARY_NAME }}
+
+      # Build Docker Image with both version and commit tags
+      - name: Build Docker Image
+        run: |
+          docker build --build-arg GHCR_PAT="${{ secrets.GHCR_PAT }}" --build-arg VERSION="${{ env.VERSION }}" \
+            -t ${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG_VERSION }} \
+            -t ${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG_COMMIT }} \
+            -t ${{ env.GHCR_REGISTRY }}:latest \
+            -f Dockerfile .
+
+      # Push Docker Image to GHCR
+      - name: Push Docker Image to GHCR
+        run: |
+          docker push ${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG_VERSION }}
+          docker push ${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG_COMMIT }}
+          docker push ${{ env.GHCR_REGISTRY }}:latest
+
+      # Create GitHub Release
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          release_name: Release ${{ env.TAG_NAME }}
+          body: |
+            Release ${{ env.TAG_NAME }}
+            
+            **Version:** ${{ env.VERSION }}
+            **Commit:** ${{ env.COMMIT_SHA }} (${{ env.SHORT_SHA }})
+          draft: false
+          prerelease: false
+
+      # Upload Binary as a Release Asset
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./${{ env.BINARY_NAME }}
+          asset_name: ${{ env.BINARY_NAME }}
+          asset_content_type: application/octet-stream
+
+      # Archive binary with both version and commit tags
+      - name: Archive binary with version tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ env.BINARY_TAG_VERSION }}
+          path: ${{ env.BINARY_NAME }}
+          retention-days: 30
+
+      - name: Archive binary with commit tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ env.BINARY_TAG_COMMIT }}
+          path: ${{ env.BINARY_NAME }}
+          retention-days: 30

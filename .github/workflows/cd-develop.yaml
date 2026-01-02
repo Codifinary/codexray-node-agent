@@ -1,0 +1,194 @@
+name: CD - Develop Branch (Commit Tag)
+
+# -------------------------------------
+# Triggers: Run on push to develop branch or after CI workflow completes
+# -------------------------------------
+on:
+  push:
+    branches:
+      - develop
+  workflow_run:
+    workflows: ["CI - Build, Test, Lint"]
+    types:
+      - completed
+    branches:
+      - develop
+  workflow_dispatch:
+
+# -------------------------------------
+# Environment Variables (from GitHub Settings → Secrets and variables → Actions → Variables)
+# Required vars: GO_VERSION, BINARY_NAME
+# -------------------------------------
+env:
+  GO_VERSION: ${{ vars.GO_VERSION }}
+  BINARY_NAME: ${{ vars.BINARY_NAME }}
+
+permissions:
+  contents: read # Required for checking out the repository
+  packages: write # Required for pushing Docker images to GHCR
+  actions: read # Required for checking workflow runs
+  statuses: read # Required for checking CI status
+
+# -------------------------------------
+# Jobs
+# -------------------------------------
+jobs:
+  check-ci:
+    name: Check CI Status
+    runs-on: ubuntu-latest
+    
+    outputs:
+      commit_sha: ${{ steps.sha.outputs.short }}
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Get Commit SHA
+        id: sha
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          echo "short=$SHA" >> $GITHUB_OUTPUT
+          echo "Full SHA: $(git rev-parse HEAD)"
+          echo "Short SHA: $SHA"
+
+      - name: Check CI Status
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_run" ]; then
+            if [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
+              echo "❌ CI workflow did not succeed. Skipping deployment."
+              echo "should_deploy=false" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+            echo "✅ CI workflow succeeded. Proceeding with deployment."
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+          else
+            echo "Push event detected. Checking CI status for commit $COMMIT_SHA..."
+            
+            # Get the latest CI workflow run for this commit
+            WORKFLOW_RUNS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yaml/runs?head_sha=$COMMIT_SHA&per_page=1")
+            
+            CONCLUSION=$(echo "$WORKFLOW_RUNS" | jq -r '.workflow_runs[0].conclusion // "null"')
+            STATUS=$(echo "$WORKFLOW_RUNS" | jq -r '.workflow_runs[0].status // "null"')
+            
+            echo "Latest CI workflow run status: $STATUS, conclusion: $CONCLUSION"
+            
+            if [ "$STATUS" == "null" ] || [ "$STATUS" == "" ]; then
+              echo "⚠️ No CI workflow run found for this commit. Proceeding with deployment."
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+            elif [ "$STATUS" != "completed" ]; then
+              echo "❌ CI workflow is still running or not completed. Status: $STATUS. Skipping deployment."
+              echo "should_deploy=false" >> $GITHUB_OUTPUT
+              exit 1
+            elif [ "$CONCLUSION" != "success" ]; then
+              echo "❌ CI workflow did not succeed. Conclusion: $CONCLUSION. Skipping deployment."
+              echo "should_deploy=false" >> $GITHUB_OUTPUT
+              exit 1
+            else
+              echo "✅ CI workflow succeeded. Proceeding with deployment."
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  build-and-push:
+    name: Build and Push Docker Image to GHCR
+    runs-on: ubuntu-latest
+    needs: check-ci
+    if: needs.check-ci.outputs.should_deploy == 'true'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      # Set commit tag
+      - name: Set commit tag
+        run: |
+          SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "GHCR_REGISTRY=ghcr.io/${GITHUB_REPOSITORY,,}-dev" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${SHORT_SHA}" >> $GITHUB_ENV
+          echo "BINARY_TAG=${SHORT_SHA}" >> $GITHUB_ENV
+          echo "VERSION=${SHORT_SHA}" >> $GITHUB_ENV
+
+      # Log in to GHCR
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # Set up Go environment
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Configure Git for private repositories
+      - name: Configure Git for private modules
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${GHCR_PAT}@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+          git config --global url."https://x-access-token:${GHCR_PAT}@github.com/".insteadOf "https://github.com/"
+          go env -w GOPRIVATE=github.com/${{ github.repository_owner }}/*
+          go env -w GONOPROXY=github.com/${{ github.repository_owner }}/*
+          go env -w GONOSUMDB=github.com/${{ github.repository_owner }}/*
+
+      # Cache Go modules to speed up the build process
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      # Install Go dependencies
+      - name: Install dependencies
+        run: go mod download
+
+      # Install systemd development headers
+      - name: Install systemd development headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsystemd-dev
+
+      # Build the codexray-node-agent Binary
+      - name: Build ${{ env.BINARY_NAME }} Binary
+        run: |
+          GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -mod=readonly -ldflags "-X main.version=${{ env.VERSION }}" -o ${{ env.BINARY_NAME }} .
+          ls -la ${{ env.BINARY_NAME }}
+
+      # Build Docker Image
+      - name: Build Docker Image
+        run: |
+          docker build --build-arg GHCR_PAT="${{ secrets.GHCR_PAT }}" --build-arg VERSION="${{ env.VERSION }}" \
+            -t ${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG }} \
+            -f Dockerfile .
+
+      # Push Docker Image to GHCR
+      - name: Push Docker Image to GHCR
+        run: |
+          docker push ${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG }}
+
+      # Archive binary with commit tag
+      - name: Archive binary with commit tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ env.BINARY_TAG }}
+          path: ${{ env.BINARY_NAME }}
+          retention-days: 30
