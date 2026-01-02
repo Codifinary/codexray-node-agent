@@ -21,53 +21,168 @@ env:
   BINARY_NAME: ${{ vars.BINARY_NAME }}
 
 permissions:
+  contents: read # Required for checking out the repository
   packages: write # Required for pushing Docker images to GHCR
   contents: write # Required for creating releases
   checks: read # Required for reading CI status
+  actions: read # Required for reading workflow runs
+  statuses: read # Required for reading commit statuses
 
 # -------------------------------------
-# Job: Build and Push Docker Image to GHCR
+# Jobs
 # -------------------------------------
 jobs:
-  build-and-push:
-    name: Build and Push Docker Image to GHCR
+  check-ci:
+    name: Check CI Status
     runs-on: ubuntu-latest
-
+    
+    outputs:
+      commit_sha: ${{ steps.sha.outputs.short }}
+      full_sha: ${{ steps.sha.outputs.full }}
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+    
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: main # Always use main branch for releases
+      
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      
+      - name: Get Commit SHA
+        id: sha
+        run: |
+          SHA=$(git rev-parse HEAD)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "short=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "full=$SHA" >> $GITHUB_OUTPUT
+          echo "Full SHA: $SHA"
+          echo "Short SHA: $SHORT_SHA"
+      
+      - name: Check CI Status
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COMMIT_SHA=$(git rev-parse HEAD)
+          echo "Checking CI status for commit: ${COMMIT_SHA} on main branch"
+          
+          # Find PRs associated with this commit
+          echo "Finding PR associated with commit ${COMMIT_SHA}..."
+          
+          PRS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/commits/${COMMIT_SHA}/pulls")
+          
+          PR_NUMBER=$(echo "$PRS" | jq -r '.[0].number // empty')
+          
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" == "null" ]; then
+            echo "⚠️  No PR found for commit ${COMMIT_SHA}. This might be a direct push."
+            echo "Checking CI workflow runs on main branch instead..."
+            
+            # Get CI workflow runs for main branch
+            CI_RUNS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yaml/runs?branch=main&status=completed&per_page=5")
+            
+            CI_CONCLUSION=$(echo "$CI_RUNS" | jq -r '.workflow_runs[0].conclusion // empty')
+            CI_HEAD_SHA=$(echo "$CI_RUNS" | jq -r '.workflow_runs[0].head_sha // empty')
+            
+            if [ "$CI_CONCLUSION" == "success" ]; then
+              echo "✅ Found recent successful CI run on main branch (commit: ${CI_HEAD_SHA})."
+              if [ "$CI_HEAD_SHA" == "$COMMIT_SHA" ]; then
+                echo "CI run matches current commit. Proceeding with deployment."
+              else
+                echo "⚠️  CI run is for commit ${CI_HEAD_SHA}, current commit is ${COMMIT_SHA}."
+                echo "Proceeding with deployment based on recent successful CI."
+              fi
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+            else
+              echo "❌ No successful CI run found for main branch. Skipping deployment."
+              echo "Please ensure CI passes before creating a release."
+              echo "should_deploy=false" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          else
+            echo "Found PR #${PR_NUMBER}. Checking CI status for this PR..."
+            
+            # Get PR details
+            PR_DETAILS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
+            
+            TARGET_BRANCH=$(echo "$PR_DETAILS" | jq -r '.base.ref // empty')
+            PR_HEAD_SHA=$(echo "$PR_DETAILS" | jq -r '.head.sha // empty')
+            
+            echo "PR #${PR_NUMBER} targets ${TARGET_BRANCH}, head SHA: ${PR_HEAD_SHA}"
+            
+            if [ "$TARGET_BRANCH" != "main" ]; then
+              echo "⚠️  PR targets ${TARGET_BRANCH}, but we're releasing from main."
+              echo "Checking CI workflow runs on main branch instead..."
+              
+              # Fallback to checking main branch CI runs
+              CI_RUNS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yaml/runs?branch=main&status=completed&per_page=1")
+              
+              CI_CONCLUSION=$(echo "$CI_RUNS" | jq -r '.workflow_runs[0].conclusion // empty')
+              
+              if [ "$CI_CONCLUSION" == "success" ]; then
+                echo "✅ Found recent successful CI run on main branch. Proceeding with deployment."
+                echo "should_deploy=true" >> $GITHUB_OUTPUT
+              else
+                echo "❌ No successful CI run found for main branch. Skipping deployment."
+                echo "should_deploy=false" >> $GITHUB_OUTPUT
+                exit 1
+              fi
+            else
+              # Get CI workflow runs for the PR head branch
+              echo "Checking CI status for PR head SHA: ${PR_HEAD_SHA}"
+              
+              CI_RUNS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yaml/runs?head_sha=${PR_HEAD_SHA}&per_page=1")
+              
+              CI_CONCLUSION=$(echo "$CI_RUNS" | jq -r '.workflow_runs[0].conclusion // empty')
+              CI_STATUS_VAL=$(echo "$CI_RUNS" | jq -r '.workflow_runs[0].status // empty')
+              
+              if [ "$CI_CONCLUSION" == "success" ]; then
+                echo "✅ CI passed for PR #${PR_NUMBER} (commit: ${PR_HEAD_SHA}). Proceeding with deployment."
+                echo "should_deploy=true" >> $GITHUB_OUTPUT
+              elif [ "$CI_CONCLUSION" == "failure" ] || [ "$CI_CONCLUSION" == "cancelled" ]; then
+                echo "❌ CI failed for PR #${PR_NUMBER} (conclusion: ${CI_CONCLUSION}). Skipping deployment."
+                echo "Please ensure CI passes before merging to main."
+                echo "should_deploy=false" >> $GITHUB_OUTPUT
+                exit 1
+              elif [ "$CI_STATUS_VAL" == "in_progress" ] || [ "$CI_STATUS_VAL" == "queued" ]; then
+                echo "⚠️  CI is still running for PR #${PR_NUMBER} (status: ${CI_STATUS_VAL})."
+                echo "Skipping deployment. Please wait for CI to complete."
+                echo "should_deploy=false" >> $GITHUB_OUTPUT
+                exit 1
+              else
+                echo "⚠️  Could not determine CI status for PR #${PR_NUMBER}."
+                echo "CI status: ${CI_STATUS_VAL}, conclusion: ${CI_CONCLUSION}"
+                echo "Skipping deployment for safety."
+                echo "should_deploy=false" >> $GITHUB_OUTPUT
+                exit 1
+              fi
+            fi
+          fi
 
-      # Check last CI status for the latest commit on main
-      - name: Check CI status
-        id: check_ci
-        uses: actions/github-script@v7
+  build-and-push:
+    name: Build and Push Docker Image to GHCR
+    runs-on: ubuntu-latest
+    needs: check-ci
+    if: needs.check-ci.outputs.should_deploy == 'true'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
         with:
-          script: |
-            const { data: checks } = await github.rest.checks.listForRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: 'main',
-            });
-            
-            // Find CI workflow check
-            const ciCheck = checks.check_runs.find(
-              check => check.name === 'CI - Build, Test, Lint'
-            );
-            
-            if (!ciCheck) {
-              core.setFailed('No CI check found for main branch. CI must run on PR first.');
-              return;
-            }
-            
-            if (ciCheck.conclusion !== 'success') {
-              core.setFailed(`CI check failed with status: ${ciCheck.conclusion}`);
-              return;
-            }
-            
-            core.info(`CI check passed: ${ciCheck.html_url}`);
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main # Always use main branch for releases
 
       # Set version and tags
       - name: Set version and tags
@@ -79,15 +194,15 @@ jobs:
           VERSION=${VERSION_INPUT#v}
           TAG_NAME="v${VERSION}"
           
-          # Get commit SHA from main branch
-          SHA=$(git rev-parse HEAD)
-          SHORT_SHA="${SHA:0:7}"
+          # Get commit SHA from check-ci job
+          SHORT_SHA="${{ needs.check-ci.outputs.commit_sha }}"
+          FULL_SHA="${{ needs.check-ci.outputs.full_sha }}"
           
           echo "GHCR_REGISTRY=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
           echo "VERSION=${VERSION}" >> $GITHUB_ENV
           echo "TAG_NAME=${TAG_NAME}" >> $GITHUB_ENV
           echo "SHORT_SHA=${SHORT_SHA}" >> $GITHUB_ENV
-          echo "COMMIT_SHA=${SHA}" >> $GITHUB_ENV
+          echo "COMMIT_SHA=${FULL_SHA}" >> $GITHUB_ENV
           
           # Image and binary tags: both version and commit SHA
           echo "IMAGE_TAG_VERSION=${TAG_NAME}" >> $GITHUB_ENV
@@ -196,10 +311,10 @@ jobs:
           name: ${{ env.BINARY_NAME }}-${{ env.BINARY_TAG_VERSION }}
           path: ${{ env.BINARY_NAME }}
           retention-days: 30
+
       - name: Archive binary with commit tag
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BINARY_NAME }}-${{ env.BINARY_TAG_COMMIT }}
           path: ${{ env.BINARY_NAME }}
           retention-days: 30
-
