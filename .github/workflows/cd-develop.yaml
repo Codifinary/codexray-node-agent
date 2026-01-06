@@ -33,78 +33,9 @@ permissions:
 # Jobs
 # -------------------------------------
 jobs:
-  check-ci:
-    name: Check CI Status
-    runs-on: ubuntu-latest
-    
-    outputs:
-      commit_sha: ${{ steps.sha.outputs.short }}
-      should_deploy: ${{ steps.check.outputs.should_deploy }}
-    
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-
-      - name: Get Commit SHA
-        id: sha
-        run: |
-          SHA=$(git rev-parse --short HEAD)
-          echo "short=$SHA" >> $GITHUB_OUTPUT
-          echo "Full SHA: $(git rev-parse HEAD)"
-          echo "Short SHA: $SHA"
-
-      - name: Check CI Status
-        id: check
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COMMIT_SHA: ${{ github.sha }}
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_run" ]; then
-            if [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
-              echo "❌ CI workflow did not succeed. Skipping deployment."
-              echo "should_deploy=false" >> $GITHUB_OUTPUT
-              exit 1
-            fi
-            echo "✅ CI workflow succeeded. Proceeding with deployment."
-            echo "should_deploy=true" >> $GITHUB_OUTPUT
-          else
-            echo "Push event detected. Checking CI status for commit $COMMIT_SHA..."
-            
-            # Get the latest CI workflow run for this commit
-            WORKFLOW_RUNS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yaml/runs?head_sha=$COMMIT_SHA&per_page=1")
-            
-            CONCLUSION=$(echo "$WORKFLOW_RUNS" | jq -r '.workflow_runs[0].conclusion // "null"')
-            STATUS=$(echo "$WORKFLOW_RUNS" | jq -r '.workflow_runs[0].status // "null"')
-            
-            echo "Latest CI workflow run status: $STATUS, conclusion: $CONCLUSION"
-            
-            if [ "$STATUS" == "null" ] || [ "$STATUS" == "" ]; then
-              echo "⚠️ No CI workflow run found for this commit. Proceeding with deployment."
-              echo "should_deploy=true" >> $GITHUB_OUTPUT
-            elif [ "$STATUS" != "completed" ]; then
-              echo "❌ CI workflow is still running or not completed. Status: $STATUS. Skipping deployment."
-              echo "should_deploy=false" >> $GITHUB_OUTPUT
-              exit 1
-            elif [ "$CONCLUSION" != "success" ]; then
-              echo "❌ CI workflow did not succeed. Conclusion: $CONCLUSION. Skipping deployment."
-              echo "should_deploy=false" >> $GITHUB_OUTPUT
-              exit 1
-            else
-              echo "✅ CI workflow succeeded. Proceeding with deployment."
-              echo "should_deploy=true" >> $GITHUB_OUTPUT
-            fi
-          fi
-
   build-and-push:
     name: Build and Push Docker Image to GHCR
     runs-on: ubuntu-latest
-    needs: check-ci
-    if: needs.check-ci.outputs.should_deploy == 'true'
 
     steps:
       - name: Checkout Code
