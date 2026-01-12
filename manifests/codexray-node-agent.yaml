@@ -1,0 +1,161 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: codexray-agents
+
+---
+# ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: codexray-cluster-agent
+  namespace: codexray-agents
+
+---
+# ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: codexray-cluster-agent
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - nodes
+      - services
+      - endpoints
+      - namespaces
+      - configmaps
+      - secrets
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+      - daemonsets
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources:
+      - nodes
+      - pods
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources:
+      - nodes/proxy
+      - nodes/stats
+      - nodes/metrics
+    verbs: ["get"]
+
+---
+# ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: codexray-cluster-agent
+subjects:
+  - kind: ServiceAccount
+    name: codexray-cluster-agent
+    namespace: codexray-agents
+roleRef:
+  kind: ClusterRole
+  name: codexray-cluster-agent
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# =========================
+# Node Agent (DaemonSet) - WITHOUT GPU Support
+# =========================
+# Use this manifest if your cluster does NOT have NVIDIA GPUs
+# This uses the default Docker image built without GPU support
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: codexray-node-agent
+  namespace: codexray-agents
+spec:
+  selector:
+    matchLabels:
+      app: codexray-node-agent
+  template:
+    metadata:
+      labels:
+        app: codexray-node-agent
+    spec:
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: codexray-node-agent
+          image: ghcr.io/codifinary/codexray-node-agent:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/bin/codexray-node-agent
+          args:
+            - --listen=:10300
+            - --collector-endpoint=http://YOUR_CODEXRAY_IP:8080
+            - --cgroupfs-root=/host/sys/fs/cgroup
+            - --wal-dir=/data
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          ports:
+            - containerPort: 10300
+              hostPort: 10300
+              protocol: TCP
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              readOnly: true
+            - name: tracing
+              mountPath: /sys/kernel/tracing
+            - name: debug
+              mountPath: /sys/kernel/debug
+            - name: cgroup
+              mountPath: /host/sys/fs/cgroup
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: root
+          hostPath:
+            path: /
+        - name: tracing
+          hostPath:
+            path: /sys/kernel/tracing
+        - name: debug
+          hostPath:
+            path: /sys/kernel/debug
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+        - name: data
+          emptyDir: {}
+
+---
+# Node Agent Service (optional)
+apiVersion: v1
+kind: Service
+metadata:
+  name: codexray-node-agent
+  namespace: codexray-agents
+spec:
+  selector:
+    app: codexray-node-agent
+  ports:
+    - name: metrics
+      port: 10300
+      targetPort: 10300
+  type: ClusterIP

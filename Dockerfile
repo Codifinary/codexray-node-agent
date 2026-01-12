@@ -33,7 +33,13 @@ RUN if [ -n "$GHCR_PAT" ]; then \
 RUN go mod download
 COPY . .
 ARG VERSION=unknown
-RUN CGO_ENABLED=1 go build -mod=readonly -ldflags "-extldflags='-Wl,-z,lazy' -X 'github.com/codifinary/codexray-node-agent/flags.Version=${VERSION}'" -o codexray-node-agent .
+ARG BUILD_GPU=false
+# Build without GPU support by default (set BUILD_GPU=true to enable GPU support)
+RUN if [ "$BUILD_GPU" = "true" ]; then \
+        CGO_ENABLED=1 go build -mod=readonly -tags gpu -ldflags "-extldflags='-Wl,-z,lazy' -X 'github.com/codifinary/codexray-node-agent/flags.Version=${VERSION}'" -o codexray-node-agent .; \
+    else \
+        CGO_ENABLED=1 go build -mod=readonly -ldflags "-extldflags='-Wl,-z,lazy' -X 'github.com/codifinary/codexray-node-agent/flags.Version=${VERSION}'" -o codexray-node-agent .; \
+    fi
 
 FROM registry.access.redhat.com/ubi9/ubi
 
