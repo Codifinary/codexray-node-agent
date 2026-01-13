@@ -117,14 +117,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsystemd-dev
 
-      # Build the codexray-node-agent Binary
-      - name: Build ${{ env.BINARY_NAME }} Binary
+      # Build the codexray-node-agent Binary (without GPU)
+      - name: Build ${{ env.BINARY_NAME }} Binary (without GPU)
         run: |
           GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -mod=readonly -ldflags "-X main.version=${{ env.VERSION }}" -o ${{ env.BINARY_NAME }} .
           ls -la ${{ env.BINARY_NAME }}
 
-      # Build Docker Image with both version and commit tags
-      - name: Build Docker Image
+      # Build the codexray-node-agent Binary (with GPU)
+      - name: Build ${{ env.BINARY_NAME }} Binary (with GPU)
+        run: |
+          GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -mod=readonly -tags gpu -ldflags "-X main.version=${{ env.VERSION }}" -o ${{ env.BINARY_NAME }}-gpu .
+          ls -la ${{ env.BINARY_NAME }}-gpu
+
+      # Build Docker Image (without GPU) with both version and commit tags
+      - name: Build Docker Image (without GPU)
         run: |
           docker build --build-arg GHCR_PAT="${{ secrets.GHCR_PAT }}" --build-arg VERSION="${{ env.VERSION }}" \
             -t ${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG_VERSION }} \
@@ -132,12 +138,24 @@ jobs:
             -t ${{ env.GHCR_REGISTRY }}:latest \
             -f Dockerfile .
 
-      # Push Docker Image to GHCR
-      - name: Push Docker Image to GHCR
+      # Build Docker Image (with GPU) with both version and commit tags
+      - name: Build Docker Image (with GPU)
+        run: |
+          docker build --build-arg GHCR_PAT="${{ secrets.GHCR_PAT }}" --build-arg VERSION="${{ env.VERSION }}" --build-arg BUILD_GPU=true \
+            -t ${{ env.GHCR_REGISTRY }}-gpu:${{ env.IMAGE_TAG_VERSION }} \
+            -t ${{ env.GHCR_REGISTRY }}-gpu:${{ env.IMAGE_TAG_COMMIT }} \
+            -t ${{ env.GHCR_REGISTRY }}-gpu:latest \
+            -f Dockerfile .
+
+      # Push Docker Images to GHCR
+      - name: Push Docker Images to GHCR
         run: |
           docker push ${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG_VERSION }}
           docker push ${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG_COMMIT }}
           docker push ${{ env.GHCR_REGISTRY }}:latest
+          docker push ${{ env.GHCR_REGISTRY }}-gpu:${{ env.IMAGE_TAG_VERSION }}
+          docker push ${{ env.GHCR_REGISTRY }}-gpu:${{ env.IMAGE_TAG_COMMIT }}
+          docker push ${{ env.GHCR_REGISTRY }}-gpu:latest
 
       # Create GitHub Release with release notes
       - name: Create GitHub Release
@@ -151,27 +169,47 @@ jobs:
             **Version:** ${{ env.VERSION }}
             **Commit:** ${{ env.COMMIT_SHA }} (${{ env.SHORT_SHA }})
             
-            ## Docker Images
+            ## Docker Images (without GPU)
             - `${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG_VERSION }}`
             - `${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG_COMMIT }}`
             - `${{ env.GHCR_REGISTRY }}:latest`
+            
+            ## Docker Images (with GPU)
+            - `${{ env.GHCR_REGISTRY }}-gpu:${{ env.IMAGE_TAG_VERSION }}`
+            - `${{ env.GHCR_REGISTRY }}-gpu:${{ env.IMAGE_TAG_COMMIT }}`
+            - `${{ env.GHCR_REGISTRY }}-gpu:latest`
           files: |
             ${{ env.BINARY_NAME }}
+            ${{ env.BINARY_NAME }}-gpu
           draft: false
           prerelease: false
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Archive binary with both version and commit tags
-      - name: Archive binary with version tag
+      # Archive binaries with both version and commit tags
+      - name: Archive binary (without GPU) with version tag
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BINARY_NAME }}-${{ env.BINARY_TAG_VERSION }}
           path: ${{ env.BINARY_NAME }}
           retention-days: 30
 
-      - name: Archive binary with commit tag
+      - name: Archive binary (without GPU) with commit tag
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BINARY_NAME }}-${{ env.BINARY_TAG_COMMIT }}
           path: ${{ env.BINARY_NAME }}
+          retention-days: 30
+
+      - name: Archive binary (with GPU) with version tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-gpu-${{ env.BINARY_TAG_VERSION }}
+          path: ${{ env.BINARY_NAME }}-gpu
+          retention-days: 30
+
+      - name: Archive binary (with GPU) with commit tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-gpu-${{ env.BINARY_TAG_COMMIT }}
+          path: ${{ env.BINARY_NAME }}-gpu
           retention-days: 30
