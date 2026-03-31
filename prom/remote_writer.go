@@ -140,13 +140,27 @@ func (a *Agent) send(fPath string) error {
 	if err != nil {
 		return err
 	}
-	for k, v := range common.AuthHeaders() {
+
+	// Determine API key based on spool file name
+	var authHeaders map[string]string
+	var apiKeyType string
+	baseName := path.Base(fPath)
+	if strings.Contains(baseName, "-default") {
+		authHeaders = common.AuthHeadersForContainer("codexray")
+		apiKeyType = "DEFAULT"
+	} else {
+		authHeaders = common.AuthHeaders()
+		apiKeyType = "REGULAR"
+	}
+	for k, v := range authHeaders {
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("User-Agent", "codexray-node-agent")
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	req.Header.Set("Content-Encoding", "snappy")
 	req.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
+	apiKeyValue := authHeaders["X-Api-Key"]
+	klog.Infof("[type=metrics] sending to URL=%s spool_file=%s api_key_type=%s X-Api-Key=%s", a.url.String(), baseName, apiKeyType, apiKeyValue)
 	t := time.Now()
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
@@ -172,21 +186,66 @@ func (a *Agent) scrape() error {
 		mfsByName[mf.GetName()] = mf
 	}
 	wr := buildWriteRequest(mfs, timestamp, a.labels)
-	decompressed, err := wr.Marshal()
-	if err != nil {
-		return err
+
+	// Partition timeseries into regular and codexray (default) groups
+	var regularTS []prompb.TimeSeries
+	var defaultTS []prompb.TimeSeries
+	for _, ts := range wr.Timeseries {
+		if timeseriesHasCodexrayContainer(ts) {
+			defaultTS = append(defaultTS, ts)
+		} else {
+			regularTS = append(regularTS, ts)
+		}
 	}
 
-	compressed := snappy.Encode(nil, decompressed)
-	err = a.writeToSpool(timestamp, compressed)
-	return err
+	// Write regular timeseries spool file
+	if len(regularTS) > 0 {
+		regularWr := &prompb.WriteRequest{Timeseries: regularTS, Metadata: wr.Metadata}
+		decompressed, err := regularWr.Marshal()
+		if err != nil {
+			return err
+		}
+		compressed := snappy.Encode(nil, decompressed)
+		if err := a.writeToSpoolWithSuffix(timestamp, compressed, ""); err != nil {
+			return err
+		}
+	}
+
+	// Write codexray (default API key) timeseries spool file
+	if len(defaultTS) > 0 {
+		defaultWr := &prompb.WriteRequest{Timeseries: defaultTS, Metadata: wr.Metadata}
+		decompressed, err := defaultWr.Marshal()
+		if err != nil {
+			return err
+		}
+		compressed := snappy.Encode(nil, decompressed)
+		if err := a.writeToSpoolWithSuffix(timestamp, compressed, "-default"); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// timeseriesHasCodexrayContainer checks if a timeseries has a container_id label containing "codexray".
+func timeseriesHasCodexrayContainer(ts prompb.TimeSeries) bool {
+	for _, l := range ts.Labels {
+		if l.Name == "container_id" && strings.Contains(l.Value, "codexray") {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Agent) writeToSpool(timestamp int64, payload []byte) error {
+	return a.writeToSpoolWithSuffix(timestamp, payload, "")
+}
+
+func (a *Agent) writeToSpoolWithSuffix(timestamp int64, payload []byte, suffix string) error {
 	if err := a.truncateSpoolIfNeeded(); err != nil {
 		return err
 	}
-	fileName := fmt.Sprintf("spool-%d.done", timestamp)
+	fileName := fmt.Sprintf("spool-%d%s.done", timestamp, suffix)
 	f, err := os.CreateTemp(a.spoolDir, fileName)
 	if err != nil {
 		return err

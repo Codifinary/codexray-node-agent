@@ -153,12 +153,16 @@ func collect() {
 func upload(b *pprof.ProfileBuilder) error {
 	u := *endpointUrl
 	q := u.Query()
+	var serviceName string
+	var containerId string
 	for _, l := range b.Labels {
 		switch l.Name {
 		case "service_name":
 			l.Name = "service.name"
+			serviceName = l.Value
 		case "__container_id__":
 			l.Name = "container.id"
+			containerId = l.Value
 		default:
 			continue
 		}
@@ -181,9 +185,13 @@ func upload(b *pprof.ProfileBuilder) error {
 	if err != nil {
 		return err
 	}
-	for k, v := range common.AuthHeaders() {
+	authHeaders := common.AuthHeadersForServiceName(serviceName)
+	for k, v := range authHeaders {
 		req.Header.Set(k, v)
 	}
+	apiKeyType := common.ApiKeyTypeForServiceName(serviceName)
+	apiKeyValue := authHeaders["X-Api-Key"]
+	klog.Infof("[type=profiles] sending to URL=%s container_id=%s service_name=%s api_key_type=%s X-Api-Key=%s", u.String(), containerId, serviceName, apiKeyType, apiKeyValue)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err

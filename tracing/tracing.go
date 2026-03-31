@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/codifinary/codexray-node-agent/common"
@@ -27,6 +28,7 @@ const (
 
 var (
 	batcher             sdktrace.TracerProviderOption
+	batcherDefault      sdktrace.TracerProviderOption
 	commonResourceAttrs []attribute.KeyValue
 	agentVersion        string
 	initialized         bool
@@ -49,13 +51,15 @@ func Init(machineId, hostname, version string) {
 		klog.Infof("trace sampling rate set to %f", samplingRate)
 	}
 	klog.Infoln("OpenTelemetry traces collector endpoint:", endpointUrl.String())
-	path := endpointUrl.Path
-	if path == "" {
-		path = "/"
+	urlPath := endpointUrl.Path
+	if urlPath == "" {
+		urlPath = "/"
 	}
+
+	// Regular exporter (uses API_KEY)
 	opts := []otlptracehttp.Option{
 		otlptracehttp.WithEndpoint(endpointUrl.Host),
-		otlptracehttp.WithURLPath(path),
+		otlptracehttp.WithURLPath(urlPath),
 		otlptracehttp.WithHeaders(common.AuthHeaders()),
 		otlptracehttp.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify}),
 	}
@@ -67,8 +71,25 @@ func Init(machineId, hostname, version string) {
 	if err != nil {
 		klog.Exitln(err)
 	}
-
 	batcher = sdktrace.WithBatcher(exporter)
+
+	// Default exporter (uses DEFAULT_API_KEY for codexray containers)
+	defaultOpts := []otlptracehttp.Option{
+		otlptracehttp.WithEndpoint(endpointUrl.Host),
+		otlptracehttp.WithURLPath(urlPath),
+		otlptracehttp.WithHeaders(common.AuthHeadersForContainer("codexray")),
+		otlptracehttp.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify}),
+	}
+	if endpointUrl.Scheme != "https" {
+		defaultOpts = append(defaultOpts, otlptracehttp.WithInsecure())
+	}
+	defaultClient := otlptracehttp.NewClient(defaultOpts...)
+	defaultExporter, err := otlptrace.New(context.Background(), defaultClient)
+	if err != nil {
+		klog.Exitln(err)
+	}
+	batcherDefault = sdktrace.WithBatcher(defaultExporter)
+
 	commonResourceAttrs = []attribute.KeyValue{semconv.HostName(hostname), semconv.HostID(machineId)}
 	agentVersion = version
 	initialized = true
@@ -93,8 +114,20 @@ func GetContainerTracer(containerId string) *Tracer {
 	if !initialized {
 		return &Tracer{otel: nil}
 	}
+
+	// Choose the appropriate batcher based on service name
+	serviceName := common.ContainerIdToOtelServiceName(containerId)
+	selectedBatcher := batcher
+	apiKeyType := "REGULAR"
+	if strings.Contains(serviceName, "codexray") && batcherDefault != nil {
+		selectedBatcher = batcherDefault
+		apiKeyType = "DEFAULT"
+	}
+	tracesApiKey := common.AuthHeadersForServiceName(serviceName)["X-Api-Key"]
+	klog.Infof("[type=traces] tracer created for container_id=%s service_name=%s api_key_type=%s X-Api-Key=%s", containerId, serviceName, apiKeyType, tracesApiKey)
+
 	provider := sdktrace.NewTracerProvider(
-		batcher,
+		selectedBatcher,
 		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
 			append(
