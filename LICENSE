@@ -186,7 +186,12 @@
       same "printed page" as the copyright notice for easier
       identification within third-party archives.
 
-   Copyright 2020-present Codexray, Inc.
+   Copyright 2020-present Coroot, Inc.
+   Copyright 2024-present Codexray, Inc.
+
+   This product is a derivative of coroot/coroot-node-agent
+   (https://github.com/coroot/coroot-node-agent), licensed under the
+   Apache License, Version 2.0. See the NOTICE file for attribution.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
