@@ -9,7 +9,7 @@ RUN for i in 1 2 3; do \
         break || sleep 5; \
     done
 
-ARG GO_VERSION=1.24.9
+ARG GO_VERSION=1.25.10
 RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz -o go.tar.gz && \
     tar -C /usr/local -xzf go.tar.gz && rm go.tar.gz
 ENV PATH="/usr/local/go/bin:${PATH}"
@@ -17,6 +17,10 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 WORKDIR /tmp/src
 COPY go.mod .
 COPY go.sum .
+# internal/ contains local replace targets (e.g., internal/prom shim that supplies
+# prometheus/prometheus/{model/labels,prompb} without pulling the full module)
+# — must be present before `go mod download` because go.mod references it.
+COPY internal/ ./internal/
 
 # Configure Git for private repositories
 ARG GHCR_PAT
@@ -41,7 +45,7 @@ RUN if [ "$BUILD_GPU" = "true" ]; then \
         CGO_ENABLED=1 go build -mod=readonly -ldflags "-extldflags='-Wl,-z,lazy' -X 'github.com/codifinary/codexray-node-agent/flags.Version=${VERSION}'" -o codexray-node-agent .; \
     fi
 
-FROM registry.access.redhat.com/ubi9/ubi
+FROM registry.access.redhat.com/ubi9/ubi-minimal
 
 ARG VERSION=unknown
 LABEL name="codexray-node-agent" \
@@ -51,6 +55,25 @@ LABEL name="codexray-node-agent" \
       release="1" \
       summary="Codexray Node Agent." \
       description="Codexray Node Agent container image."
+
+# Smaller attack surface: ubi9-minimal ships ~110 packages vs ~250 on full UBI9,
+# already has systemd-libs (the only runtime dep), and no python/gdb/vim.
+# Apply OS security updates and drop gnutls (not used by the Go binary — Go has
+# its own crypto/tls; nothing else on the image requires it).
+RUN microdnf upgrade -y && \
+    microdnf clean all
+
+# Force-remove packages not needed by the Go agent. The Go binary uses Go's own
+# crypto/tls, not gnutls; removing gnutls/gnupg2/glib2 and friends eliminates a
+# large CVE surface. ubi9-minimal doesn't need them after the upgrade is done.
+RUN for pkg in \
+        gnutls gnupg2 glib2 json-glib libksba npth pinentry \
+        curl-minimal libcurl-minimal libxml2 libarchive openldap libtasn1 \
+        libsolv libsmartcols sqlite-libs \
+        ; do \
+        rpm -q "$pkg" >/dev/null 2>&1 && rpm -e --nodeps "$pkg" || true; \
+    done && \
+    rm -rf /var/cache/yum /var/cache/dnf /var/lib/rpm/__db.* /var/lib/dnf
 
 COPY LICENSE /licenses/LICENSE
 

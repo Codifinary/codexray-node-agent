@@ -57,9 +57,10 @@ func Init(machineId, hostname, version string) {
 		otlptracehttp.WithEndpoint(endpointUrl.Host),
 		otlptracehttp.WithURLPath(path),
 		otlptracehttp.WithHeaders(common.AuthHeaders()),
-		otlptracehttp.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify}),
 	}
-	if endpointUrl.Scheme != "https" {
+	if endpointUrl.Scheme == "https" {
+		opts = append(opts, otlptracehttp.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify}))
+	} else {
 		opts = append(opts, otlptracehttp.WithInsecure())
 	}
 	client := otlptracehttp.NewClient(opts...)
