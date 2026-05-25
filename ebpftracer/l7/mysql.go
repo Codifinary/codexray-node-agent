@@ -27,6 +27,13 @@ func NewMysqlParser() *MysqlParser {
 	return &MysqlParser{preparedStatements: map[string]string{}}
 }
 
+func (p *MysqlParser) PreparedStatementsLen() int {
+	if p == nil {
+		return 0
+	}
+	return len(p.preparedStatements)
+}
+
 func (p *MysqlParser) Parse(payload []byte, statementId uint32) string {
 	payloadSize := len(payload)
 	if payloadSize < mysqlMsgHeaderSize+5 {
@@ -64,6 +71,12 @@ func (p *MysqlParser) Parse(payload []byte, statementId uint32) string {
 	case MysqlComStmtPrepare:
 		query := readQuery()
 		statementIdStr := strconv.FormatUint(uint64(statementId), 10)
+		if _, exists := p.preparedStatements[statementIdStr]; !exists && len(p.preparedStatements) >= maxPreparedStatements {
+			for k := range p.preparedStatements {
+				delete(p.preparedStatements, k)
+				break
+			}
+		}
 		p.preparedStatements[statementIdStr] = query
 		return fmt.Sprintf("PREPARE %s FROM %s", statementIdStr, query)
 	case MysqlComStmtClose:

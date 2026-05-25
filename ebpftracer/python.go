@@ -6,6 +6,7 @@ package ebpftracer
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -19,7 +20,14 @@ import (
 var (
 	libcRegexp = regexp.MustCompile(`libc[\.-]`)
 	muslRegexp = regexp.MustCompile(`ld-musl[\.-]`)
+
+	// pythonSymCache: parsed addresses + ret offsets for each pthread-providing
+	// library (libc / musl / libpthread). Same rationale as goTlsSymCache —
+	// avoid the ~5-15 MB debug/elf transient on every Python uprobe attach.
+	pythonSymCache = newBinarySymCache(128)
 )
+
+const pythonLockSymbol = "pthread_cond_timedwait"
 
 func (t *Tracer) AttachPythonThreadLockProbes(pid uint32) []link.Link {
 	log := func(libPath, msg string, err error) {
@@ -55,32 +63,46 @@ func (t *Tracer) AttachPythonThreadLockProbes(pid uint32) []link.Link {
 }
 
 func (t *Tracer) attachPythonUprobes(libPath string, pid uint32) ([]link.Link, error) {
+	// Cache the pthread_cond_timedwait address + RET offsets per (libPath,
+	// mtime, size). libc / musl / libpthread are typically shared across many
+	// processes on a node, so the first attach pays the parse cost and every
+	// subsequent attach is a map lookup.
+	key, err := makeSymCacheKey(libPath)
+	if err != nil {
+		return nil, err
+	}
+	syms, cached := pythonSymCache.get(key)
+	if !cached {
+		syms, err = parseSymInfo(libPath, map[string]bool{pythonLockSymbol: true}, pythonLockSymbol)
+		if err != nil {
+			return nil, err
+		}
+		pythonSymCache.put(key, syms)
+	}
+	info, ok := syms[pythonLockSymbol]
+	if !ok || info.address == 0 {
+		return nil, fmt.Errorf("%s not found in %s", pythonLockSymbol, libPath)
+	}
+
 	exe, err := link.OpenExecutable(libPath)
 	if err != nil {
 		return nil, err
 	}
-	ef, err := OpenELFFile(libPath)
-	if err != nil {
-		return nil, err
-	}
-	defer ef.Close()
 
-	s, err := ef.GetSymbol("pthread_cond_timedwait")
-	if err != nil {
-		return nil, err
-	}
-	l, err := s.AttachUprobe(exe, t.uprobes["pthread_cond_timedwait_enter"], pid)
+	l, err := exe.Uprobe(pythonLockSymbol, t.uprobes["pthread_cond_timedwait_enter"], &link.UprobeOptions{Address: info.address, PID: int(pid)})
 	if err != nil {
 		return nil, err
 	}
 	links := []link.Link{l}
-	ls, err := s.AttachUretprobes(exe, t.uprobes["pthread_cond_timedwait_exit"], pid)
-	links = append(links, ls...)
-	if err != nil {
-		for _, l := range links {
-			_ = l.Close()
+	for _, off := range info.returnOffsets {
+		l, err := exe.Uprobe(pythonLockSymbol, t.uprobes["pthread_cond_timedwait_exit"], &link.UprobeOptions{Address: info.address, Offset: uint64(off), PID: int(pid)})
+		if err != nil {
+			for _, l := range links {
+				_ = l.Close()
+			}
+			return nil, err
 		}
-		return nil, err
+		links = append(links, l)
 	}
 	return links, nil
 }

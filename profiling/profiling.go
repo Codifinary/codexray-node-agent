@@ -53,6 +53,10 @@ var (
 )
 
 func Init(hostId, hostName string) chan<- containers.ProcessInfo {
+	if *flags.DisableProfiling {
+		klog.Infoln("eBPF profiling disabled via --disable-profiling")
+		return nil
+	}
 	endpointUrl = *flags.ProfilesEndpoint
 	if endpointUrl == nil {
 		klog.Infoln("no profiles endpoint configured")
