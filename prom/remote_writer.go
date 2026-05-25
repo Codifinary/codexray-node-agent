@@ -22,6 +22,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
+	"github.com/prometheus/prometheus/util/fmtutil"
 	"k8s.io/klog/v2"
 )
 
@@ -309,10 +310,11 @@ func buildWriteRequest(mfs []*dto.MetricFamily, timestamp int64, extraLabels map
 		if len(mf.Metric) == 0 {
 			continue
 		}
+		mtype := fmtutil.MetricMetadataTypeValue[mf.Type.String()]
 		mName := mf.GetName()
 		metadata := prompb.MetricMetadata{
 			MetricFamilyName: mName,
-			Type:             metricMetadataType(mf.GetType()),
+			Type:             prompb.MetricMetadata_MetricType(mtype),
 			Help:             mf.GetHelp(),
 		}
 		wr.Metadata = append(wr.Metadata, metadata)
@@ -361,24 +363,5 @@ func addTimeseries(wr *prompb.WriteRequest, m *dto.Metric, labels map[string]str
 			Samples: []prompb.Sample{{Timestamp: timestamp, Value: float64(m.GetHistogram().GetSampleCount())}},
 			Labels:  makeLabels(labels, "_count", ""),
 		})
-	}
-}
-
-func metricMetadataType(t dto.MetricType) prompb.MetricMetadata_MetricType {
-	switch t {
-	case dto.MetricType_COUNTER:
-		return prompb.MetricMetadata_COUNTER
-	case dto.MetricType_GAUGE:
-		return prompb.MetricMetadata_GAUGE
-	case dto.MetricType_HISTOGRAM:
-		return prompb.MetricMetadata_HISTOGRAM
-	case dto.MetricType_GAUGE_HISTOGRAM:
-		return prompb.MetricMetadata_GAUGEHISTOGRAM
-	case dto.MetricType_SUMMARY:
-		return prompb.MetricMetadata_SUMMARY
-	case dto.MetricType_UNTYPED:
-		return prompb.MetricMetadata_UNKNOWN
-	default:
-		return prompb.MetricMetadata_UNKNOWN
 	}
 }
