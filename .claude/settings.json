@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import sys, json, base64; d=json.load\\(sys.stdin\\); print\\(base64.b64decode\\(d['content']\\).decode\\(\\)\\)\")",
+      "Bash(python3 /tmp/add_license_headers.py)",
+      "Bash(go version *)",
+      "Bash(go install *)",
+      "Bash(grep -rEn \"\\(password|secret|token|api[_-]?key|aws[_-]?\\(access|secret\\)|private[_-]?key\\)\\\\s*[:=]\\\\s*[\\\\\"'][^\\\\\"']{6,}\" --include=\"*.go\" --include=\"*.sh\" --include=\"*.yaml\" --include=\"*.yml\" --include=\"*.env\" --include=\"Dockerfile*\" --exclude-dir=.git --exclude-dir=vendor)",
+      "Bash(grep -viE \"\\(test|example|_test\\\\.go|//|description|\\\\\".+\\\\\":\\\\s*\\\\\"\\\\$\\)\")",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}
