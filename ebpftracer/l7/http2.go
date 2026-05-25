@@ -53,13 +53,6 @@ func NewHttp2Parser() *Http2Parser {
 	}
 }
 
-func (p *Http2Parser) ActiveRequestsLen() int {
-	if p == nil {
-		return 0
-	}
-	return len(p.activeRequests)
-}
-
 func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []Http2Request {
 	if method == MethodHttp2ClientFrames {
 		l := len(http2.ClientPreface)

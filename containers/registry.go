@@ -137,8 +137,6 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 		return nil, err
 	}
 
-	r.startMemDiag()
-
 	return r, nil
 }
 

@@ -133,9 +133,8 @@ type Container struct {
 	activeConnections        map[ConnectionKey]*ActiveConnection
 	connectionsByPidFd       map[PidFd]*ActiveConnection
 
-	l7Stats   L7Stats
-	dnsStats  *L7Metrics
-	seenFQDNs map[string]struct{}
+	l7Stats  L7Stats
+	dnsStats *L7Metrics
 
 	gpuStats map[string]*GpuUsage
 
@@ -188,7 +187,6 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
 		l7Stats:                  L7Stats{},
 		dnsStats:                 &L7Metrics{},
-		seenFQDNs:                map[string]struct{}{},
 
 		gpuStats: map[string]*GpuUsage{},
 
@@ -242,19 +240,6 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 
 	c.lock.Lock()
 	defer c.lock.Unlock()
-
-	if minAge := *flags.MinContainerAge; minAge > 0 {
-		if c.startedAt.IsZero() {
-			return
-		}
-		end := time.Now()
-		if !c.zombieAt.IsZero() && c.zombieAt.Before(end) {
-			end = c.zombieAt
-		}
-		if end.Sub(c.startedAt) < minAge {
-			return
-		}
-	}
 
 	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
 		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemdTriggeredBy)
@@ -685,8 +670,6 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 	ac.BytesReceived = received
 }
 
-const fqdnOverflowLabel = "~other"
-
 func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]*common.Domain {
 	status := r.Status.DNS()
 	if status == "" {
@@ -712,19 +695,7 @@ func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]*common.Domai
 			[]string{"request_type", "domain", "status"},
 		)
 	}
-	metricFQDN := fqdn
-	if fqdn != "" {
-		if max := *flags.MaxFqdnsPerContainer; max > 0 {
-			if _, ok := c.seenFQDNs[fqdn]; !ok {
-				if len(c.seenFQDNs) < max {
-					c.seenFQDNs[fqdn] = struct{}{}
-				} else {
-					metricFQDN = fqdnOverflowLabel
-				}
-			}
-		}
-	}
-	if m, _ := c.dnsStats.Requests.GetMetricWithLabelValues(t, metricFQDN, status); m != nil {
+	if m, _ := c.dnsStats.Requests.GetMetricWithLabelValues(t, fqdn, status); m != nil {
 		m.Inc()
 	}
 	if r.Duration != 0 {

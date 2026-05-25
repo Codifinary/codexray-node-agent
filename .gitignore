@@ -1,14 +1,2 @@
 .idea
 .vagrant
-
-# Editor / IDE
-.claude/
-
-# pprof / debug artifacts that occasionally end up in the repo root during
-# investigations — never commit these.
-*.pb.gz
-*.pprof
-
-# JMeter / load-test artifacts
-*.jmx
-jmeter.log

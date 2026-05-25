@@ -110,28 +110,6 @@ func main() {
 	klog.LogToStderr(false)
 	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
 
-	// Optionally raise heap-profile fidelity for leak hunting. Must be set
-	// before any allocation we care about — main() entry is the earliest
-	// practical point.
-	if *flags.MemProfileRate > 0 {
-		runtime.MemProfileRate = *flags.MemProfileRate
-		klog.Infof("runtime.MemProfileRate=%d (bytes between samples)", runtime.MemProfileRate)
-	}
-
-	// Dedicated pprof endpoint. The blank import `net/http/pprof` (above) has
-	// already registered /debug/pprof/* on http.DefaultServeMux; we just spin
-	// up another listener on the requested address. Failure to bind is
-	// non-fatal — the agent keeps running, only debug access is lost.
-	if addr := *flags.PprofListen; addr != "" {
-		go func() {
-			klog.Infof("pprof: listening on %s", addr)
-			server := &http.Server{Addr: addr, Handler: http.DefaultServeMux}
-			if err := server.ListenAndServe(); err != nil {
-				klog.Errorf("pprof listener exited: %v", err)
-			}
-		}()
-	}
-
 	klog.Infoln("agent version:", version)
 
 	hostname, kv, err := uname()

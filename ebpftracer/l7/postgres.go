@@ -14,11 +14,6 @@ const (
 	PostgresFrameBind  byte = 'B'
 	PostgresFrameParse byte = 'P'
 	PostgresFrameClose byte = 'C'
-
-	// Cap on prepared statements retained per connection. Some clients
-	// (ORMs, pgbouncer session pooling) never CLOSE statements, so the map
-	// would otherwise grow for the lifetime of the connection.
-	maxPreparedStatements = 1024
 )
 
 type PostgresParser struct {
@@ -27,13 +22,6 @@ type PostgresParser struct {
 
 func NewPostgresParser() *PostgresParser {
 	return &PostgresParser{preparedStatements: map[string]string{}}
-}
-
-func (p *PostgresParser) PreparedStatementsLen() int {
-	if p == nil {
-		return 0
-	}
-	return len(p.preparedStatements)
 }
 
 func (p *PostgresParser) Parse(payload []byte) string {
@@ -79,12 +67,6 @@ func (p *PostgresParser) Parse(payload []byte) string {
 			query = string(q) + "..."
 		}
 		preparedStatementNameStr := string(preparedStatementName)
-		if _, exists := p.preparedStatements[preparedStatementNameStr]; !exists && len(p.preparedStatements) >= maxPreparedStatements {
-			for k := range p.preparedStatements {
-				delete(p.preparedStatements, k)
-				break
-			}
-		}
 		p.preparedStatements[preparedStatementNameStr] = query
 		return fmt.Sprintf("PREPARE %s AS %s", preparedStatementNameStr, query)
 	case PostgresFrameClose:
