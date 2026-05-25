@@ -1,6 +1,10 @@
 //go:build !gpu
 // +build !gpu
 
+// Copyright Codexray
+// Derived from coroot/coroot-node-agent (https://github.com/coroot/coroot-node-agent).
+// SPDX-License-Identifier: Apache-2.0
+
 package gpu
 
 import (

@@ -1,13 +1,13 @@
 # Codexray-node-agent
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/coroot/coroot-node-agent)](https://goreportcard.com/report/github.com/coroot/coroot-node-agent)
+[![Go Report Card](https://goreportcard.com/badge/github.com/codifinary/codexray-node-agent)](https://goreportcard.com/report/github.com/codifinary/codexray-node-agent)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
+> This project is a derivative of [coroot/coroot-node-agent](https://github.com/coroot/coroot-node-agent), licensed under the Apache License 2.0. See [NOTICE](NOTICE) and [LICENSING.md](LICENSING.md) for attribution and dual-licensing details.
 
 The agent gathers metrics related to a node and the containers running on it, and it exposes them in the Prometheus format.
 
 It uses eBPF to track container related events such as TCP connects, so the minimum supported Linux kernel version is 4.16.
-
-<img src="https://coroot.com/static/img/blog/ebpf.svg" width="800" />
 
 ## Features
 
@@ -20,10 +20,6 @@ Exported metrics are useful for:
 * Detecting connections errors from one service to another.
 * Measuring network latency between containers, nodes and availability zones.
 
-Related blog posts:
- * [Building a service map using eBPF](https://coroot.com/blog/building-a-service-map-using-ebpf)
- * [How ping measures network round-trip time accurately using SO_TIMESTAMPING](https://coroot.com/blog/how-to-ping)
- * [The current state of eBPF portability](https://coroot.com/blog/ebpf-portability)
 ### Log patterns extraction
 
 Log management is usually quite expensive. In most cases, you do not need to analyze each event individually.
@@ -39,27 +35,18 @@ At the moment the following sources are supported:
 * Dockerd (JSON file driver)
 * Containerd (CRI logs)
 
-To learn more about automated log clustering, check out the blog post "[Mining metrics from unstructured logs](https://coroot.com/blog/mining-logs-from-unstructured-logs)".
-
 ### Delay accounting
 
 [Delay accounting](https://www.kernel.org/doc/html/latest/accounting/delay-accounting.html) allows engineers to accurately
 identify situations where a container is experiencing a lack of CPU time or waiting for I/O.
 
 The agent gathers per-process counters through [Netlink](https://man7.org/linux/man-pages/man7/netlink.7.html) and aggregates them into per-container metrics:
-* [container_resources_cpu_delay_seconds_total](https://coroot.com/docs/metrics/node-agent#container_resources_cpu_delay_seconds_total)
-* [container_resources_disk_delay_seconds_total](https://coroot.com/docs/metrics/node-agent#container_resources_disk_delay_seconds_total)
-
-
-<img src="https://coroot.com/static/img/blog/delay_accounting_aggregation.svg" width="800" />
-
-Related blog posts:
-* [Delay accounting: an underrated feature of the Linux kernel](https://coroot.com/blog/linux-delay-accounting)
-
+* `container_resources_cpu_delay_seconds_total`
+* `container_resources_disk_delay_seconds_total`
 
 ### Out-of-memory events tracing
 
-The [container_oom_kills_total](https://coroot.com/docs/metrics/node-agent#container_oom_kills_total) metric shows that a container has been terminated by the OOM killer.
+The `container_oom_kills_total` metric shows that a container has been terminated by the OOM killer.
 
 ### Instance meta information
 
@@ -77,28 +64,11 @@ Collected info:
 * LifeCycle: on-demand/spot (AWS and GCP only)
 * Private & Public IP addresses
 
-Related blog posts:
-* [Gathering cloud instance metadata in AWS, GCP and Azure](https://coroot.com/blog/cloud-metadata)
-
-## Installation
-
-The documentation is available at [coroot.com/docs/metric-exporters/node-agent](https://coroot.com/docs/metric-exporters/node-agent/installation).
-
-## Metrics
-
-The collected metrics are described [here](https://coroot.com/docs/metrics/node-agent).
-
-## Coroot
-
-The best way to turn metrics to answers about app issues is to use [Coroot](https://github.com/coroot/coroot) - a zero-instrumentation observability tool for microservice architectures. 
-
-A live demo of Coroot is available at [community-demo.coroot.com](https://community-demo.coroot.com)
-
 ## Contributing
-To start contributing, check out our [Contributing Guide](https://github.com/coroot/coroot-node-agent/blob/main/CONTRIBUTING.md).
+To start contributing, check out our [Contributing Guide](CONTRIBUTING.md).
 
 ## License
 
-codexray-node-agent is licensed under the [Apache License, Version 2.0](https://github.com/codexray/codexray-node-agent/blob/main/LICENSE).
+codexray-node-agent is licensed under the [Apache License, Version 2.0](LICENSE).
 
-The BPF code is licensed under the General Public License, Version 2.0.
+The eBPF programs under `ebpftracer/ebpf/` are licensed under the GNU General Public License, Version 2.0. See [LICENSING.md](LICENSING.md) for details on how the Apache-2.0 user-space code and GPL-2.0 eBPF programs are distributed together, and [NOTICE](NOTICE) for upstream attribution.
