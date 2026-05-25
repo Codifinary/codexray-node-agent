@@ -3,6 +3,7 @@ package logs
 import (
 	"context"
 	"crypto/tls"
+	"strings"
 	"time"
 
 	otel "github.com/agoda-com/opentelemetry-logs-go"
@@ -19,7 +20,10 @@ import (
 	"k8s.io/klog/v2"
 )
 
-var otelLogger otelLogs.Logger
+var (
+	otelLogger        otelLogs.Logger
+	otelLoggerDefault otelLogs.Logger
+)
 
 func Init(machineId, hostname, version string) {
 	endpointUrl := *flags.LogsEndpoint
@@ -28,14 +32,22 @@ func Init(machineId, hostname, version string) {
 		return
 	}
 	klog.Infoln("OpenTelemetry logs collector endpoint:", endpointUrl.String())
-	path := endpointUrl.Path
-	if path == "" {
-		path = "/"
+	urlPath := endpointUrl.Path
+	if urlPath == "" {
+		urlPath = "/"
 	}
 
+	resourceAttrs := resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceName("codexray-node-agent"),
+		semconv.HostName(hostname),
+		semconv.HostID(machineId),
+	)
+
+	// Regular logger provider (uses API_KEY)
 	opts := []otlplogshttp.Option{
 		otlplogshttp.WithEndpoint(endpointUrl.Host),
-		otlplogshttp.WithURLPath(path),
+		otlplogshttp.WithURLPath(urlPath),
 		otlplogshttp.WithHeaders(common.AuthHeaders()),
 		otlplogshttp.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify}),
 	}
@@ -47,23 +59,47 @@ func Init(machineId, hostname, version string) {
 
 	loggerProvider := sdk.NewLoggerProvider(
 		sdk.WithBatcher(exporter),
-		sdk.WithResource(
-			resource.NewWithAttributes(
-				semconv.SchemaURL,
-				semconv.ServiceName("codexray-node-agent"),
-				semconv.HostName(hostname),
-				semconv.HostID(machineId),
-			),
-		),
+		sdk.WithResource(resourceAttrs),
 	)
 	otel.SetLoggerProvider(loggerProvider)
 	otelLogger = loggerProvider.Logger("codexray-node-agent", otelLogs.WithInstrumentationVersion(version))
+
+	// Default logger provider (uses DEFAULT_API_KEY for codexray containers)
+	defaultOpts := []otlplogshttp.Option{
+		otlplogshttp.WithEndpoint(endpointUrl.Host),
+		otlplogshttp.WithURLPath(urlPath),
+		otlplogshttp.WithHeaders(common.AuthHeadersForContainer("codexray")),
+		otlplogshttp.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify}),
+	}
+	if endpointUrl.Scheme != "https" {
+		defaultOpts = append(defaultOpts, otlplogshttp.WithInsecure())
+	}
+	defaultClient := otlplogshttp.NewClient(defaultOpts...)
+	defaultExporter, _ := otlplogs.NewExporter(context.Background(), otlplogs.WithClient(defaultClient))
+
+	defaultLoggerProvider := sdk.NewLoggerProvider(
+		sdk.WithBatcher(defaultExporter),
+		sdk.WithResource(resourceAttrs),
+	)
+	otelLoggerDefault = defaultLoggerProvider.Logger("codexray-node-agent", otelLogs.WithInstrumentationVersion(version))
 }
 
 func OtelLogEmitter(containerId string) logparser.OnMsgCallbackF {
 	if otelLogger == nil {
 		return nil
 	}
+
+	// Choose the appropriate logger based on service name
+	serviceName := common.ContainerIdToOtelServiceName(containerId)
+	logger := otelLogger
+	apiKeyType := "REGULAR"
+	if strings.Contains(serviceName, "codexray") && otelLoggerDefault != nil {
+		logger = otelLoggerDefault
+		apiKeyType = "DEFAULT"
+	}
+	logsApiKey := common.AuthHeadersForServiceName(serviceName)["X-Api-Key"]
+	klog.Infof("[type=logs] emitter created for container_id=%s service_name=%s api_key_type=%s X-Api-Key=%s", containerId, serviceName, apiKeyType, logsApiKey)
+
 	return func(ts time.Time, level logparser.Level, patternHash string, msg string) {
 		severityText := level.String()
 		severityNumber := otelLogs.UNSPECIFIED
@@ -80,7 +116,7 @@ func OtelLogEmitter(containerId string) logparser.OnMsgCallbackF {
 			severityNumber = otelLogs.DEBUG
 		}
 
-		otelLogger.Emit(
+		logger.Emit(
 			otelLogs.NewLogRecord(otelLogs.LogRecordConfig{
 				ObservedTimestamp: ts,
 				SeverityText:      &severityText,
