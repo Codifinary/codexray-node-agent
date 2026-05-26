@@ -1,3 +1,7 @@
+// Copyright Codexray
+// Derived from coroot/coroot-node-agent (https://github.com/coroot/coroot-node-agent).
+// SPDX-License-Identifier: Apache-2.0
+
 package containers
 
 import (
@@ -7,28 +11,26 @@ import (
 	"time"
 
 	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/internal/dockerclient"
 	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/codifinary/logparser"
-	"github.com/docker/docker/client"
 	"inet.af/netaddr"
 )
 
 const dockerdTimeout = 30 * time.Second
 
 var (
-	dockerdClient *client.Client
+	dockerdClient *dockerclient.Client
 )
 
 func DockerdInit() error {
-	c, err := client.NewClientWithOpts(
-		client.WithHost("unix://" + proc.HostPath("/run/docker.sock")),
-	)
+	c, err := dockerclient.NewClient(proc.HostPath("/run/docker.sock"))
 	if err != nil {
 		return err
 	}
 	ctx, cancelFn := context.WithTimeout(context.Background(), dockerdTimeout)
 	defer cancelFn()
-	if _, err := c.Ping(ctx); err != nil {
+	if err := c.Ping(ctx); err != nil {
 		return err
 	}
 	c.NegotiateAPIVersion(ctx)

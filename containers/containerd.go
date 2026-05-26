@@ -1,3 +1,7 @@
+// Copyright Codexray
+// Derived from coroot/coroot-node-agent (https://github.com/coroot/coroot-node-agent).
+// SPDX-License-Identifier: Apache-2.0
+
 package containers
 
 import (
@@ -68,7 +72,7 @@ func ContainerdInspect(containerID string) (*ContainerMetadata, error) {
 	}
 
 	var spec oci.Spec
-	if err := json.Unmarshal(c.Spec.Value, &spec); err != nil {
+	if err := json.Unmarshal(c.Spec.GetValue(), &spec); err != nil {
 		klog.Warningln(err)
 	} else {
 		for _, m := range spec.Mounts {
@@ -82,7 +86,7 @@ func ContainerdInspect(containerID string) (*ContainerMetadata, error) {
 				LogPath string
 			}
 		}{}
-		if err := json.Unmarshal(data.Value, &md); err != nil {
+		if err := json.Unmarshal(data.GetValue(), &md); err != nil {
 			klog.Warningln(err)
 		} else {
 			res.logPath = md.Metadata.LogPath
