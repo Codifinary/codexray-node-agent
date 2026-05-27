@@ -36,19 +36,6 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      # Configure Git for private repositories
-      - name: Configure Git for private modules
-        env:
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}
-        run: |
-          git config --global credential.helper store
-          echo "https://x-access-token:${GHCR_PAT}@github.com" > ~/.git-credentials
-          chmod 600 ~/.git-credentials
-          git config --global url."https://x-access-token:${GHCR_PAT}@github.com/".insteadOf "https://github.com/"
-          go env -w GOPRIVATE=github.com/${{ github.repository_owner }}/*
-          go env -w GONOPROXY=github.com/${{ github.repository_owner }}/*
-          go env -w GONOSUMDB=github.com/${{ github.repository_owner }}/*
-
       # Cache Go modules to speed up the build process
       - name: Cache Go modules
         uses: actions/cache@v3

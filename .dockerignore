@@ -1,2 +1,12 @@
 **/.git/
 **/.idea/
+**/.vscode/
+**/.vagrant/
+
+.env
+.env.*
+*.log
+.DS_Store
+
+MEMORY_LEAK_INVESTIGATION.md
+SECURITY-NOTES.md

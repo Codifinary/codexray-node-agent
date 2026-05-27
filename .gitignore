@@ -1,3 +1,27 @@
-.idea
-.vagrant
+.idea/
+.vscode/
+.vagrant/
+.claude/
 SECURITY-NOTES.md
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+/codexray-node-agent
+*.exe
+*.test
+*.out
+coverage.txt
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local investigation / scratch
+MEMORY_LEAK_INVESTIGATION.md
