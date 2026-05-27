@@ -54,7 +54,9 @@ LABEL name="codexray-node-agent" \
       version=${VERSION} \
       release="1" \
       summary="Codexray Node Agent." \
-      description="Codexray Node Agent container image."
+      description="Codexray Node Agent container image." \
+      license="AGPL-3.0" \
+      org.opencontainers.image.licenses="AGPL-3.0"
 
 # Smaller attack surface: ubi9-minimal ships ~110 packages vs ~250 on full UBI9,
 # already has systemd-libs (the only runtime dep), and no python/gdb/vim.

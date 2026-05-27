@@ -1,9 +1,9 @@
 # Codexray-node-agent
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/codifinary/codexray-node-agent)](https://goreportcard.com/report/github.com/codifinary/codexray-node-agent)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-> This project is a derivative of [coroot/coroot-node-agent](https://github.com/coroot/coroot-node-agent), licensed under the Apache License 2.0. See [NOTICE](NOTICE) and [LICENSING.md](LICENSING.md) for attribution and dual-licensing details.
+> Licensed under **AGPL-3.0** (see [LICENSE](LICENSE)). Incorporates [coroot/coroot-node-agent](https://github.com/coroot/coroot-node-agent) under Apache-2.0 (see [LICENSE.APACHE-2.0](LICENSE.APACHE-2.0)) and eBPF programs under GPL-2.0. See [NOTICE](NOTICE) and [LICENSING.md](LICENSING.md) for attribution and licensing details.
 
 The agent gathers metrics related to a node and the containers running on it, and it exposes them in the Prometheus format.
 
