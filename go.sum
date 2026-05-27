@@ -66,8 +66,6 @@ github.com/codifinary/dotnetdiag v1.0.0 h1:tJsp8al+oJWxW2MPJ1Slhzr3nb5BZRwdvi+pK
 github.com/codifinary/dotnetdiag v1.0.0/go.mod h1:veXCMlFzm1yNl7wwJb/ZLxO4WbzhDBoy1VG1XtkH2ls=
 github.com/codifinary/logparser v1.0.0 h1:P/f9Izkf8WAqTCd47aRcXXIEgGOzcgad8oCErpx1AAk=
 github.com/codifinary/logparser v1.0.0/go.mod h1:XJg2ITuLpD1ox6gYnXIAcDB1gsg04bc99xZ4Z3riNsY=
-github.com/codifinary/pyroscope/ebpf v0.0.0-20251209170205-2abb363402ec h1:OoIX0rPQRvyJqik8BndKGNrMBz60eF55szI4aF1NvIE=
-github.com/codifinary/pyroscope/ebpf v0.0.0-20251209170205-2abb363402ec/go.mod h1:IepHM9FJ0n3n3k+ZV23Y7vNAfvWI7LDuLqWPO4rB6sQ=
 github.com/containerd/cgroups v1.1.0 h1:v8rEWFl6EoqHB+swVNjVoCJE8o3jX7e8nqBGPLaDFBM=
 github.com/containerd/cgroups v1.1.0/go.mod h1:6ppBcbh/NOOUU+dMKrykgaBnK9lCIBxHqJDGwsa1mIw=
 github.com/containerd/containerd v1.7.32 h1:S54xuVcPxeLaYgaRABtpJ2VyVUVsy0IGf7qHBs+sbY8=

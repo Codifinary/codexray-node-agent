@@ -83,19 +83,6 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      # Configure Git for private repositories
-      - name: Configure Git for private modules
-        env:
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}
-        run: |
-          git config --global credential.helper store
-          echo "https://x-access-token:${GHCR_PAT}@github.com" > ~/.git-credentials
-          chmod 600 ~/.git-credentials
-          git config --global url."https://x-access-token:${GHCR_PAT}@github.com/".insteadOf "https://github.com/"
-          go env -w GOPRIVATE=github.com/${{ github.repository_owner }}/*
-          go env -w GONOPROXY=github.com/${{ github.repository_owner }}/*
-          go env -w GONOSUMDB=github.com/${{ github.repository_owner }}/*
-
       # Cache Go modules to speed up the build process
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -132,7 +119,7 @@ jobs:
       # Build Docker Image (without GPU) with both version and commit tags
       - name: Build Docker Image (without GPU)
         run: |
-          docker build --build-arg GHCR_PAT="${{ secrets.GHCR_PAT }}" --build-arg VERSION="${{ env.VERSION }}" \
+          docker build --build-arg VERSION="${{ env.VERSION }}" \
             -t ${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG_VERSION }} \
             -t ${{ env.GHCR_REGISTRY }}:${{ env.IMAGE_TAG_COMMIT }} \
             -t ${{ env.GHCR_REGISTRY }}:latest \
@@ -141,7 +128,7 @@ jobs:
       # Build Docker Image (with GPU) with both version and commit tags
       - name: Build Docker Image (with GPU)
         run: |
-          docker build --build-arg GHCR_PAT="${{ secrets.GHCR_PAT }}" --build-arg VERSION="${{ env.VERSION }}" --build-arg BUILD_GPU=true \
+          docker build --build-arg VERSION="${{ env.VERSION }}" --build-arg BUILD_GPU=true \
             -t ${{ env.GHCR_REGISTRY }}-gpu:${{ env.IMAGE_TAG_VERSION }} \
             -t ${{ env.GHCR_REGISTRY }}-gpu:${{ env.IMAGE_TAG_COMMIT }} \
             -t ${{ env.GHCR_REGISTRY }}-gpu:latest \
