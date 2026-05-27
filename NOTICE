@@ -1,6 +1,12 @@
 codexray-node-agent
 Copyright 2024-present Codexray
 
+This combined work is licensed under the GNU Affero General Public License,
+Version 3.0 (AGPL-3.0). A copy of the AGPL is included in the LICENSE file
+at the root of this distribution.
+
+---
+
 This product includes software originally developed as:
 
     coroot-node-agent
@@ -8,12 +14,15 @@ This product includes software originally developed as:
     https://github.com/coroot/coroot-node-agent
 
 The original software is licensed under the Apache License, Version 2.0.
-A copy of the Apache License is included in the LICENSE file at the root
-of this distribution.
+A copy of the Apache License is preserved at LICENSE.APACHE-2.0 in this
+distribution, in accordance with Apache 2.0 Section 4.
 
 Modifications made by Codexray include (but are not limited to):
-rebranding, additional GPU support, packaging and deployment changes, and
-integration with the Codexray observability platform.
+rebranding, additional GPU support, packaging and deployment changes,
+integration with the Codexray observability platform, and addition of
+eBPF-based continuous profiling via github.com/grafana/pyroscope/ebpf
+(AGPL-3.0) — the latter is the reason this combined work is now
+distributed under AGPL-3.0 rather than the upstream's Apache-2.0.
 
 ---
 
@@ -21,5 +30,5 @@ This product also contains eBPF programs (under ebpftracer/ebpf/) which
 are licensed under the GNU General Public License, Version 2.0 (GPL-2.0),
 as required by the Linux kernel's eBPF verifier for programs that use
 GPL-only kernel helpers. See LICENSING.md for details on how the
-Apache-2.0 user-space code and GPL-2.0 eBPF programs are distributed
+AGPL-3.0 user-space code and GPL-2.0 eBPF programs are distributed
 together.
