@@ -32,3 +32,32 @@ as required by the Linux kernel's eBPF verifier for programs that use
 GPL-only kernel helpers. See LICENSING.md for details on how the
 AGPL-3.0 user-space code and GPL-2.0 eBPF programs are distributed
 together.
+
+---
+
+This product includes code copied from:
+
+    Prometheus
+    Copyright 2012-present The Prometheus Authors
+    https://github.com/prometheus/prometheus
+
+A trimmed subset of model/labels, prompb, and util/fmtutil is vendored
+under internal/prom/ as a build-time shim (see internal/prom/go.mod for
+rationale). The Prometheus code is licensed under the Apache License,
+Version 2.0; its LICENSE and NOTICE files are preserved at
+internal/prom/LICENSE and internal/prom/NOTICE in accordance with
+Apache 2.0 Section 4.
+
+---
+
+This product also includes the eBPF profiling library from:
+
+    Grafana Pyroscope (ebpf subdirectory)
+    Copyright 2021-present Grafana Labs
+    https://github.com/grafana/pyroscope
+
+The ebpf/ subdirectory of grafana/pyroscope is licensed under the Apache
+License, Version 2.0 (separately from the AGPL-3.0-licensed parent
+project) and is vendored under internal/pyroscope-ebpf/. Its LICENSE
+file is preserved at internal/pyroscope-ebpf/LICENSE in accordance with
+Apache 2.0 Section 4.

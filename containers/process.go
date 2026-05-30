@@ -12,6 +12,7 @@ import (
 
 	"github.com/cilium/ebpf/link"
 	"github.com/codifinary/codexray-node-agent/ebpftracer"
+	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/codifinary/codexray-node-agent/gpu"
 	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/jpillora/backoff"
@@ -78,6 +79,15 @@ func (p *Process) isHostNs() bool {
 }
 
 func (p *Process) instrument(tracer *ebpftracer.Tracer) {
+	if delay := *flags.InstrumentationDelay; delay > 0 && !p.StartedAt.IsZero() {
+		if wait := delay - time.Since(p.StartedAt); wait > 0 {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+		}
+	}
 	b := backoff.Backoff{Factor: 2, Min: time.Second, Max: time.Minute}
 	for {
 		select {

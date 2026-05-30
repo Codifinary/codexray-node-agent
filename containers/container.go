@@ -241,6 +241,26 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
+	if minAge := *flags.MinContainerAge; minAge > 0 {
+		// Fall back to cgroup mtime when taskstats hasn't populated startedAt
+		// (PID-vs-TGID races, restricted netlink caps, missing CONFIG_TASKSTATS_NETLINK).
+		// Without this, every container whose first taskstats lookup failed would be
+		// permanently filtered, dropping all of its metrics — not just for ~30s.
+		started := c.startedAt
+		if started.IsZero() {
+			started = c.cgroup.CreatedAt()
+		}
+		if !started.IsZero() {
+			end := time.Now()
+			if !c.zombieAt.IsZero() && c.zombieAt.Before(end) {
+				end = c.zombieAt
+			}
+			if end.Sub(started) < minAge {
+				return
+			}
+		}
+	}
+
 	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
 		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemdTriggeredBy)
 	}

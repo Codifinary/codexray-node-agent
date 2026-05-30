@@ -216,4 +216,4 @@ replace (
 
 replace github.com/prometheus/prometheus => ./internal/prom
 
-replace github.com/grafana/pyroscope/ebpf => github.com/codifinary/pyroscope/ebpf v0.0.0-20251209170205-2abb363402ec
+replace github.com/grafana/pyroscope/ebpf => ./internal/pyroscope-ebpf
