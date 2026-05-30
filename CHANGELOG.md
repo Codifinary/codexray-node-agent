@@ -4,6 +4,27 @@ All notable changes to the Codexray Node Agent are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] — 2026-05-30
+
+### Added
+- `--min-container-age` / `MIN_CONTAINER_AGE` (default `30s`): suppresses metric emission for containers younger than the configured threshold, reducing high-cardinality series from short-lived job/cronjob pods. Ported from upstream coroot-node-agent; the gate falls back to the cgroup directory mtime when taskstats hasn't populated `startedAt`, so containers whose initial taskstats lookup failed (PID-vs-TGID races, restricted netlink caps, missing `CONFIG_TASKSTATS_NETLINK`) still emit metrics instead of being permanently filtered.
+- `--instrumentation-delay` / `INSTRUMENTATION_DELAY` (default `30s`): delays attaching language-runtime probes (Python GIL, Node.js event loop, etc.) to newly started processes, avoiding probe churn on processes that exit during startup. Ported from upstream coroot-node-agent.
+
+### Upgrade notes
+- The `30s` defaults change behavior for existing deployments: containers younger than 30s will be suppressed from metric output, and language-runtime probes attach 30s after process start. Set either flag (or env var) to `0` to restore pre-1.2.1 behavior.
+
+## [1.2.0] — 2026-05-28
+
+### Added
+- Integrated eBPF-based Python profiling engine and symbolication utilities ([eead3e7](https://github.com/Codifinary/codexray-node-agent/commit/eead3e7)).
+
+### Changed
+- Relicensed to **AGPL-3.0** while preserving the upstream Apache-2.0 attribution from `coroot-node-agent` ([#36](https://github.com/Codifinary/codexray-node-agent/pull/36), [#35](https://github.com/Codifinary/codexray-node-agent/pull/35)).
+- Added AGPL-3.0 license metadata labels to the Docker image.
+
+### Security
+- Additional CVE remediation pass on top of v1.1.0 ([#33](https://github.com/Codifinary/codexray-node-agent/pull/33)).
+
 ## [1.1.0] — 2026-05-25
 
 ### Added
