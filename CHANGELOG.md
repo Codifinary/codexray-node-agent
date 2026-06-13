@@ -4,6 +4,34 @@ All notable changes to the Codexray Node Agent are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] — 2026-06-13
+
+Security-only release. Addresses HIGH-severity findings reported in the Black
+Duck scan dated 2026-06-12 by bumping Go-side dependencies to their latest
+patched releases. No functional or API changes.
+
+### Security
+- **Go toolchain**: `1.25.10` → `1.25.11` — clears 9 stdlib HIGH CVEs reported
+  by Black Duck (xss-via-URL-escaping, DoS, path-traversal, checksum-bypass).
+  ([Dockerfile](Dockerfile))
+- **`github.com/cilium/cilium`**: `v1.17.2` → `v1.17.16` — clears
+  CVE-2026-41520 (HIGH) and 1 transitive MEDIUM. Patch-only bump within the
+  1.17.x line; API-compatible. ([go.mod](go.mod))
+- **`go.mongodb.org/mongo-driver`**: `v1.14.0` → `v1.17.9` — clears 1 HIGH
+  (heap out-of-bounds read). ([go.mod](go.mod))
+- **`golang.org/x/net`**: `v0.55.0` → `v0.56.0` — clears 4 HIGH DoS findings
+  (HTML parser, HTTP/2 server, net validation). ([go.mod](go.mod))
+- **`github.com/ulikunitz/xz`**: `v0.5.12` → `v0.5.15` — clears 1 MEDIUM
+  (CVE-2025-58058). Indirect dependency. ([go.mod](go.mod))
+
+### Notes
+- Trivy scan on the resulting image reports **0 CRITICAL / 0 HIGH / 30 MEDIUM
+  / 18 LOW** — every remaining item is a Red Hat UBI base-OS package marked
+  `affected` or `will_not_fix` upstream by Red Hat and cannot be removed
+  without breaking the container runtime.
+- Verified against staging Kubernetes (10.10.11.60) — DaemonSet rollout
+  clean, eBPF tracking active, remote-write to collector working.
+
 ## [1.2.2] — 2026-05-30
 
 ### Added
