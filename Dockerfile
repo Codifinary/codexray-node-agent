@@ -9,7 +9,7 @@ RUN for i in 1 2 3; do \
         break || sleep 5; \
     done
 
-ARG GO_VERSION=1.25.11
+ARG GO_VERSION=1.26.4
 RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz -o go.tar.gz && \
     tar -C /usr/local -xzf go.tar.gz && rm go.tar.gz
 ENV PATH="/usr/local/go/bin:${PATH}"
