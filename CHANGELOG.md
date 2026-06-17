@@ -4,6 +4,28 @@ All notable changes to the Codexray Node Agent are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4] — 2026-06-16
+
+Security-only release. Bumps the Go toolchain to its latest stable major to
+clear the HIGH-severity Go stdlib CVEs flagged in the client's 2026-06-12
+Black Duck review. No functional or API changes.
+
+### Security
+- **Go toolchain**: `1.25.11` → `1.26.4` — clears the remaining Go stdlib
+  HIGH CVEs (HTML/URL handling, HTTP/2 DoS, path-traversal, checksum-bypass).
+  Go 1.26.4 was released June 2026 and is the current stable major.
+  ([Dockerfile](Dockerfile))
+
+### Notes
+- The other 3 HIGH-severity items the client requested (glibc 2.34 → 2.39,
+  libcap 2.48 → 2.69, XZ Utils 5.2.5 → 5.6.2) are shipped exclusively by
+  Red Hat as part of UBI 9. Upgrading them requires switching the base image
+  to UBI 10 (`ubi10-minimal`), which raises the CPU baseline from x86-64-v2
+  to x86-64-v3. After internal review of the trade-offs (customer hardware
+  compatibility, CGO library re-validation, deployment risk), we have
+  elected to stay on UBI 9 for this release and rely on Red Hat upstream
+  patches for those three packages.
+
 ## [1.2.3] — 2026-06-13
 
 Security-only release. Addresses HIGH-severity findings reported in the Black
