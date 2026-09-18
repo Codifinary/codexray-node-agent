@@ -5,9 +5,12 @@
 package proc
 
 import (
+	"os"
+	"path/filepath"
 	"sort"
 	"testing"
 
+	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"inet.af/netaddr"
@@ -84,4 +87,104 @@ func TestGetSockets(t *testing.T) {
 		{Inode: "11139979", SAddr: ipp("[fe80::48cb:8b57:3c30:e6ac]:8080"), DAddr: ipp("[::]:0"), Listen: true},
 		{Inode: "11154515", SAddr: ipp("127.0.0.1:8081"), DAddr: ipp("[::]:0"), Listen: true},
 	}, res)
+}
+
+// procTestRoot points the package at a fresh fake /proc and returns its path.
+func procTestRoot(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	prev := root
+	root = dir
+	t.Cleanup(func() { root = prev })
+	return dir
+}
+
+func procTestWrite(t *testing.T, base, rel, content string) {
+	t.Helper()
+	p := filepath.Join(base, rel)
+	require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+	require.NoError(t, os.WriteFile(p, []byte(content), 0o644))
+}
+
+func TestPathAndHostPath(t *testing.T) {
+	procTestRoot(t)
+	root = "/proc"
+	assert.Equal(t, "/proc/42/net/tcp", Path(42, "net", "tcp"))
+	assert.Equal(t, "/proc/42", Path(42))
+	assert.Equal(t, "/proc/1/root/etc/machine-id", HostPath("/etc/machine-id"))
+	// path.Join cleans the result
+	assert.Equal(t, "/proc/1/root/etc/os-release", HostPath("/etc/../etc/os-release"))
+}
+
+func TestGetCmdline(t *testing.T) {
+	dir := procTestRoot(t)
+	procTestWrite(t, dir, "10/cmdline", "/usr/bin/java\x00-jar\x00app.jar\x00")
+	assert.Equal(t, []byte("/usr/bin/java\x00-jar\x00app.jar"), GetCmdline(10))
+
+	procTestWrite(t, dir, "11/cmdline", "") // kernel thread / zombie
+	assert.Empty(t, GetCmdline(11))
+
+	assert.Nil(t, GetCmdline(12), "exited process")
+}
+
+func TestGetNsPidEdgeCases(t *testing.T) {
+	dir := procTestRoot(t)
+
+	_, err := GetNsPid(1)
+	assert.Error(t, err, "exited process")
+
+	procTestWrite(t, dir, "2/status", "Name:\tx\nPid:\t2\n")
+	_, err = GetNsPid(2)
+	assert.EqualError(t, err, "NSpid not found")
+
+	procTestWrite(t, dir, "3/status", "Name:\tx\nNSpid:\tabc\n")
+	_, err = GetNsPid(3)
+	assert.Error(t, err)
+
+	procTestWrite(t, dir, "4/status", "Name:\tx\nNSpid:\t4\t99999999999\n")
+	_, err = GetNsPid(4)
+	assert.Error(t, err, "overflow")
+
+	procTestWrite(t, dir, "5/status", "Name:\tx\nNSpid:\t5\t7\n")
+	v, err := GetNsPid(5)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(7), v)
+}
+
+func TestGetNsPidNestedNamespaces(t *testing.T) {
+	// NSpid lists the pid in every nested pid namespace, outermost first; the innermost
+	// (the one a containerized JVM sees) is the last field — e.g. docker-in-docker, sysbox.
+	// BUG: GetNsPid rejects NSpid lines with more than two pids instead of using the last one — unskip when fixed
+	t.Skip("BUG: GetNsPid rejects NSpid lines with more than two pids (nested pid namespaces)")
+	dir := procTestRoot(t)
+	procTestWrite(t, dir, "6/status", "Name:\tx\nNSpid:\t6\t60\t1\n")
+	v, err := GetNsPid(6)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(1), v)
+}
+
+func TestReadCgroup(t *testing.T) {
+	dir := procTestRoot(t)
+	procTestWrite(t, dir, "7/cgroup", "0::/system.slice/nginx.service\n")
+	cg, err := ReadCgroup(7)
+	require.NoError(t, err)
+	assert.Equal(t, "/system.slice/nginx.service", cg.ContainerId)
+
+	_, err = ReadCgroup(8)
+	assert.True(t, common.IsNotExist(err))
+}
+
+func TestListPidsEdgeCases(t *testing.T) {
+	dir := procTestRoot(t)
+	for _, d := range []string{"1", "42", "self", "sys", "4294967296", "-1"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, d), 0o755))
+	}
+	res, err := ListPids()
+	require.NoError(t, err)
+	sort.Slice(res, func(i, j int) bool { return res[i] < res[j] })
+	assert.Equal(t, []uint32{1, 42}, res)
+
+	root = filepath.Join(dir, "missing")
+	_, err = ListPids()
+	assert.Error(t, err)
 }

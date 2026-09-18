@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCgroup_MemoryStat(t *testing.T) {
@@ -48,4 +49,40 @@ func TestCgroup_MemoryStat(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Nil(t, stat)
 
+}
+
+func TestCgroupMemoryStatEdgeCases(t *testing.T) {
+	root := t.TempDir()
+	cgroupTestSetRoots(t, root, root)
+
+	v2 := &Cgroup{subsystems: map[string]string{"": "/app"}}
+	assert.Nil(t, v2.MemoryStat(), "missing memory.stat is tolerated")
+
+	cgroupTestWriteFile(t, root, "app/memory.stat", "anon 100\nfile 50\nfile_mapped 7\n")
+	// memory.max absent or "max" -> no limit
+	s := v2.MemoryStat()
+	require.NotNil(t, s)
+	assert.Equal(t, MemoryStat{RSS: 107, Cache: 50, Limit: 0}, *s)
+	cgroupTestWriteFile(t, root, "app/memory.max", "max\n")
+	assert.Equal(t, uint64(0), v2.MemoryStat().Limit)
+	cgroupTestWriteFile(t, root, "app/memory.max", "1073741824\n")
+	assert.Equal(t, uint64(1073741824), v2.MemoryStat().Limit)
+
+	st, err := (&Cgroup{subsystems: map[string]string{}}).memoryStatV2()
+	assert.NoError(t, err)
+	assert.Nil(t, st)
+
+	v1 := &Cgroup{subsystems: map[string]string{"memory": "/app"}}
+	assert.Nil(t, v1.MemoryStat())
+	cgroupTestWriteFile(t, root, "memory/app/memory.stat", "total_rss 10\ntotal_mapped_file 5\ntotal_cache 3\nrss 999\n")
+	assert.Nil(t, v1.MemoryStat(), "missing limit file is tolerated")
+	// the kernel reports "unlimited" as PAGE_COUNTER_MAX * PAGE_SIZE
+	cgroupTestWriteFile(t, root, "memory/app/memory.limit_in_bytes", "9223372036854771712\n")
+	s = v1.MemoryStat()
+	require.NotNil(t, s)
+	assert.Equal(t, MemoryStat{RSS: 15, Cache: 3, Limit: 0}, *s)
+	cgroupTestWriteFile(t, root, "memory/app/memory.limit_in_bytes", "536870912\n")
+	assert.Equal(t, uint64(536870912), v1.MemoryStat().Limit)
+	cgroupTestWriteFile(t, root, "memory/app/memory.limit_in_bytes", "junk\n")
+	assert.Nil(t, v1.MemoryStat())
 }
