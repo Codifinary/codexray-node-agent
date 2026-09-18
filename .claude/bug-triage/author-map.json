@@ -1,0 +1,19 @@
+{
+  "_comment": "Node agent (codexray-node-agent) — independent of the backend/frontend maps. Canonicalize git-blame author emails -> ClickUp member email. Departed contributors (vyas — author of the upstream import commit 67c8d5f and most early commits) are deliberately LEFT OUT so they route through `fallback` and get FLAGGED (matched:false) in the dry-run. `fallback` = the repo owner of record (Aishwarya, same as the backend map). Keep in sync with `git shortlog -sne HEAD` + the ClickUp roster.",
+  "fallback": "aishwarya@codexray.io",
+  "map": {
+    "aishwarya@codexray.io": "aishwarya@codexray.io",
+    "aishwarya@vizares.com": "aishwarya@codexray.io",
+    "imran@codexray.io": "imran@codexray.io",
+    "imrankh8602@gmail.com": "imran@codexray.io",
+    "100588766+binary-amigo@users.noreply.github.com": "imran@codexray.io",
+    "shibani@codexray.io": "shibani@codexray.io",
+    "shiibs@Shibanis-MacBook-Air.local": "shibani@codexray.io",
+    "160155736+shiibs@users.noreply.github.com": "shibani@codexray.io",
+    "sahashibani57@gmail.com": "shibani@codexray.io",
+    "aryan@codexray.io": "aryan@codexray.io",
+    "aryan@vizares.com": "aryan@codexray.io",
+    "aryanjuneja@codexray.io": "aryanjuneja@codexray.io",
+    "payalm.lenka@gmail.com": "payal@codexray.io"
+  }
+}

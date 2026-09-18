@@ -1,0 +1,7 @@
+{
+  "enableAllProjectMcpServers": false,
+  "permissions": {
+    "additionalDirectories": ["/tmp"],
+    "allow": []
+  }
+}
