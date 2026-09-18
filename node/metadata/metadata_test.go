@@ -231,3 +231,27 @@ func TestProvidersBodyReadError(t *testing.T) {
 	assert.Nil(t, getHetznerMetadata())
 	assert.Nil(t, getOracleMetadata())
 }
+
+func TestGetInstanceMetadataDispatch(t *testing.T) {
+	// Every metadata request is served by the in-memory fake (404 everywhere),
+	// so this is safe and offline on any host, cloud or not. Which branch runs
+	// depends on the host's /sys DMI files, so only invariants are asserted.
+	tr := metadataTestInstall(t, http.NotFoundHandler())
+
+	p := getCloudProvider()
+	assert.Equal(t, p, getCloudProvider(), "provider detection must be deterministic")
+
+	var md *CloudMetadata
+	require.NotPanics(t, func() { md = GetInstanceMetadata() })
+	if p == CloudProviderUnknown {
+		assert.Nil(t, md, "unknown provider: no metadata")
+		assert.Empty(t, tr.urls(), "unknown provider: the metadata service must not be queried")
+		return
+	}
+	if md != nil {
+		assert.Equal(t, p, md.Provider, "metadata must be attributed to the detected provider")
+	}
+	for _, b := range tr.bodies {
+		assert.True(t, b.isClosed(), "every metadata response body must be closed")
+	}
+}

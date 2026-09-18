@@ -5,6 +5,8 @@
 package prom
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"io"
 	"math"
@@ -27,6 +29,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/klog/v2"
 )
 
 // remoteWriterExtraLabels mirrors what StartAgent attaches to every series.
@@ -611,4 +614,230 @@ func TestStartAgentNoEndpoint(t *testing.T) {
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
 	assert.Empty(t, mfs, "no metrics endpoint: nothing registered, no goroutines started")
+}
+
+// remoteWriterLogSink captures klog output. Writes happen under klog's mutex
+// from the logging goroutine and are guarded by mu here, so a test that sees a
+// line logged by sendLoop/scrapeLoop has a happens-before edge from everything
+// that loop did before logging it.
+type remoteWriterLogSink struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (s *remoteWriterLogSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	s.lines = append(s.lines, string(p))
+	s.mu.Unlock()
+	return len(p), nil
+}
+
+func (s *remoteWriterLogSink) mark() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.lines)
+}
+
+func (s *remoteWriterLogSink) since(i int, match func(string) bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, l := range s.lines[i:] {
+		if match(l) {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	remoteWriterLogOnce sync.Once
+	remoteWriterLog     = &remoteWriterLogSink{}
+)
+
+// remoteWriterInstallLogSink redirects klog (process-wide, for the rest of the
+// test binary) into remoteWriterLog. It is never restored: the agent loops
+// started by TestStartAgentLoops outlive the test and would otherwise spam
+// stderr with "failed to scrape metrics" every tick.
+func remoteWriterInstallLogSink() *remoteWriterLogSink {
+	remoteWriterLogOnce.Do(func() {
+		klog.LogToStderr(false)
+		klog.SetOutput(remoteWriterLog)
+	})
+	return remoteWriterLog
+}
+
+// TestStartAgentLoops starts the real agent (StartAgent + scrapeLoop + sendLoop)
+// against a fake remote-write collector.
+//
+// The two loops never exit, so the goroutines leak for the life of the test
+// binary. To keep that leak inert and race-free the test ends by removing the
+// WAL dir and waiting until both loops have logged a failure that can only
+// happen after the removal: from then on sendLoop only ever fails ReadDir and
+// sleeps (it never again reads flags.ApiKey via common.AuthHeaders, which other
+// tests write), and scrapeLoop has long since read flags.ScrapeInterval. Only
+// then are the flag values restored.
+func TestStartAgentLoops(t *testing.T) {
+	sink := remoteWriterInstallLogSink()
+
+	// Not t.TempDir(): the loops outlive the test; the dir is removed explicitly below.
+	walDir, err := os.MkdirTemp("", "remote-writer-wal-")
+	require.NoError(t, err)
+	spoolDir := filepath.Join(walDir, "spool")
+	require.NoError(t, os.Mkdir(spoolDir, 0750))
+
+	// A spool file left over from a previous run (e.g. collector was down):
+	// it must be delivered first and deleted after the 2xx.
+	seedGauge := prometheus.NewGauge(prometheus.GaugeOpts{Name: "seeded", Help: "seeded"})
+	seedGauge.Set(42)
+	seedReg := prometheus.NewRegistry()
+	seedReg.MustRegister(seedGauge)
+	seedMfs, err := seedReg.Gather()
+	require.NoError(t, err)
+	seedRaw, err := buildWriteRequest(seedMfs, 1, map[string]string{"instance": "old", "job": "codexray-node-agent"}).Marshal()
+	require.NoError(t, err)
+	seedBody := snappy.Encode(nil, seedRaw)
+	seedPath := filepath.Join(spoolDir, "spool-1.done")
+	require.NoError(t, os.WriteFile(seedPath, seedBody, 0640))
+
+	type post struct {
+		path, encoding, contentType, version string
+		raw                                  []byte
+		wr                                   prompb.WriteRequest
+		decodeErr                            error
+	}
+	var mu sync.Mutex
+	var posts []post
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		p := post{
+			path: r.URL.Path, encoding: r.Header.Get("Content-Encoding"),
+			contentType: r.Header.Get("Content-Type"), version: r.Header.Get("X-Prometheus-Remote-Write-Version"),
+			raw: body,
+		}
+		if decoded, err := snappy.Decode(nil, body); err != nil {
+			p.decodeErr = err
+		} else {
+			p.decodeErr = p.wr.Unmarshal(decoded)
+		}
+		mu.Lock()
+		posts = append(posts, p)
+		mu.Unlock()
+		// Answer slower than the scrape interval so the spool never drains:
+		// an empty spool makes sendLoop sleep 5s, which this test must not wait for.
+		time.Sleep(150 * time.Millisecond)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	endpoint, err := url.Parse(srv.URL + "/v1/metrics")
+	require.NoError(t, err)
+
+	oldEndpoint, oldWal, oldInterval, oldSpool := *flags.MetricsEndpoint, *flags.WalDir, *flags.ScrapeInterval, *flags.MaxSpoolSize
+	*flags.MetricsEndpoint = endpoint
+	*flags.WalDir = walDir
+	*flags.ScrapeInterval = 50 * time.Millisecond
+	*flags.MaxSpoolSize = 1 << 20
+
+	machineID, systemUUID := "0f1e2d3c4b5a69788796a5b4c3d2e1f0", "4c4c4544-0042-3510-8052-b4c04f4d4e31"
+	h := md5.Sum([]byte(machineID + strings.ReplaceAll(systemUUID, "-", "")))
+	wantInstance := hex.EncodeToString(h[:])
+
+	reg := prometheus.NewRegistry()
+	require.NoError(t, StartAgent(reg, machineID, systemUUID))
+
+	// "up" is registered synchronously.
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	require.Len(t, mfs, 1)
+	assert.Equal(t, "up", mfs[0].GetName())
+	assert.Equal(t, 1.0, mfs[0].Metric[0].GetGauge().GetValue())
+
+	snapshot := func() []post {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]post(nil), posts...)
+	}
+	isScraped := func(p post) bool {
+		for _, ts := range p.wr.Timeseries {
+			if remoteWriterLabelsMap(ts.Labels)["__name__"] == "up" {
+				return true
+			}
+		}
+		return false
+	}
+	require.Eventually(t, func() bool {
+		ps := snapshot()
+		if len(ps) < 2 {
+			return false
+		}
+		_, statErr := os.Stat(seedPath)
+		return os.IsNotExist(statErr) && isScraped(ps[len(ps)-1])
+	}, 2*time.Second, 10*time.Millisecond, "expected the seeded spool file and a scraped one to be delivered")
+
+	ps := snapshot()
+	// Oldest spool file first.
+	assert.Equal(t, seedBody, ps[0].raw, "the pre-existing spool file must be sent first, byte for byte")
+	for i, p := range ps {
+		require.NoError(t, p.decodeErr, "post %d is not a valid snappy remote-write request", i)
+		assert.Equal(t, "/v1/metrics", p.path)
+		assert.Equal(t, "snappy", p.encoding)
+		assert.Equal(t, "application/x-protobuf", p.contentType)
+		assert.Equal(t, "0.1.0", p.version)
+	}
+	var scraped *prompb.WriteRequest
+	for i := range ps {
+		if isScraped(ps[i]) {
+			scraped = &ps[i].wr
+			break
+		}
+	}
+	require.NotNil(t, scraped)
+	require.Len(t, scraped.Timeseries, 1)
+	assert.Equal(t, map[string]string{
+		"__name__": "up",
+		"instance": wantInstance, // md5(machine-id + system-uuid without dashes)
+		"job":      "codexray-node-agent",
+	}, remoteWriterLabelsMap(scraped.Timeseries[0].Labels))
+	assert.Equal(t, 1.0, scraped.Timeseries[0].Samples[0].Value)
+
+	// Quiesce the leaked loops (see the doc comment).
+	mark := sink.mark()
+	require.NoError(t, os.RemoveAll(walDir))
+	require.Eventually(t, func() bool {
+		sendStopped := sink.since(mark, func(l string) bool {
+			return strings.Contains(l, "failed to send metrics to "+srv.URL) ||
+				(strings.Contains(l, "failed to get oldest spool file") && strings.Contains(l, walDir))
+		})
+		scrapeFailed := sink.since(mark, func(l string) bool {
+			return strings.Contains(l, "failed to scrape metrics") && strings.Contains(l, walDir)
+		})
+		return sendStopped && scrapeFailed
+	}, 2*time.Second, 10*time.Millisecond, "agent loops did not observe the removed WAL dir")
+
+	*flags.MetricsEndpoint, *flags.WalDir, *flags.ScrapeInterval, *flags.MaxSpoolSize = oldEndpoint, oldWal, oldInterval, oldSpool
+}
+
+func TestStartAgentWalDirErrors(t *testing.T) {
+	endpoint, err := url.Parse("http://127.0.0.1:1/v1/metrics")
+	require.NoError(t, err)
+	oldEndpoint, oldWal := *flags.MetricsEndpoint, *flags.WalDir
+	t.Cleanup(func() { *flags.MetricsEndpoint, *flags.WalDir = oldEndpoint, oldWal })
+	*flags.MetricsEndpoint = endpoint
+
+	t.Run("missing parent", func(t *testing.T) {
+		*flags.WalDir = filepath.Join(t.TempDir(), "absent", "wal")
+		assert.Error(t, StartAgent(prometheus.NewRegistry(), "m", ""))
+	})
+
+	t.Run("unwritable wal dir", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root ignores directory permissions; StartAgent would succeed and start loops")
+		}
+		wal := t.TempDir()
+		require.NoError(t, os.Chmod(wal, 0500))
+		t.Cleanup(func() { _ = os.Chmod(wal, 0700) })
+		*flags.WalDir = wal
+		assert.Error(t, StartAgent(prometheus.NewRegistry(), "m", ""))
+		_, statErr := os.Stat(filepath.Join(wal, "spool"))
+		assert.True(t, os.IsNotExist(statErr))
+	})
 }
