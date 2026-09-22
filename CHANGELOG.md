@@ -4,6 +4,84 @@ All notable changes to the Codexray Node Agent are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] — 2026-09-23
+
+Fixes the release mismatch between the Helm chart's StatsD configuration and
+the node-agent image. The agent now uses StatsD names as the canonical
+configuration interface while continuing to accept the previous DogStatsD
+names for backward compatibility.
+
+### Fixed
+- Register `--statsd-*` flags and `STATSD_*` environment variables so the
+  Helm chart can start the receiver successfully.
+- Preserve compatibility with `--dogstatsd-*` flags and `DOGSTATSD_*`
+  environment variables. Canonical StatsD environment variables take
+  precedence when both are provided.
+- Update the Docker Compose example and release documentation to use the
+  canonical StatsD names.
+
+## [1.3.0] — 2026-09-22
+
+Adds an optional node-local DogStatsD/StatsD UDP receiver for application
+metrics ([#42](https://github.com/Codifinary/codexray-node-agent/pull/42),
+[#44](https://github.com/Codifinary/codexray-node-agent/pull/44),
+[#45](https://github.com/Codifinary/codexray-node-agent/pull/45)).
+
+### Added
+- **StatsD/DogStatsD receiver** (`--statsd-enabled` / `STATSD_ENABLED`,
+  disabled by default; listens on `--statsd-listen`, default
+  `0.0.0.0:8125/udp`). Applications send UDP metrics to the node agent, which
+  aggregates them into Prometheus remote-write series and ships them with the
+  agent's own credentials, so applications never need the CodeXRay API key.
+  ([dogstatsd/](dogstatsd/))
+  - Supports counters (`c`), absolute and relative gauges (`g`), timers
+    (`ms`), histograms (`h`), bounded sets (`s`), sample rates for
+    counters/timers/histograms, DogStatsD tags, and newline-separated
+    datagrams. Events, service checks, and distributions are not supported.
+  - Every accepted series carries `is_custom="true"`. Application tags cannot
+    override agent identity labels (`instance`, `job`, `machine_id`,
+    `system_uuid`); a `statsd_type` tag is discarded.
+  - Independent custom-metric spool (default `$WAL_DIR/custom-metrics-spool`,
+    `250MB`, `24h` max age) with its own retry loop, so custom traffic cannot
+    evict the node-telemetry spool. `401`/`403` responses keep payloads spooled
+    for replay after key rotation; other permanent `4xx` payloads are
+    quarantined; `408`/`429`/`5xx` retry with bounded exponential backoff.
+  - Safeguards: source-CIDR allowlist (private ranges and loopback by default),
+    per-node byte and event rate limits, packet queue caps, tag count and length
+    limits, a tag-key blocklist (`user_id,request_id,session_id,trace_id`),
+    per-metric and global active-series caps with TTL, and an aggregation memory
+    cap.
+  - All limits are configurable via `--statsd-*` flags or matching
+    `STATSD_*` environment variables. Legacy `--dogstatsd-*` flags and
+    `DOGSTATSD_*` variables remain compatible. See the README for the full list.
+- **`/healthz` and `/readyz` endpoints.** `/readyz` returns `503` when the
+  DogStatsD receiver or pipeline is unhealthy, including sustained queue/spool
+  saturation (≥ `STATSD_SATURATION_THRESHOLD`, default `0.8`, for
+  `STATSD_SATURATION_DURATION`, default `5m`).
+- **Graceful shutdown** on `SIGINT`/`SIGTERM`: the HTTP server shuts down, UDP
+  intake stops, queued packets drain for up to
+  `STATSD_SHUTDOWN_DRAIN_TIMEOUT` (default `10s`), then the custom spool is
+  flushed to disk.
+- [`docker-compose.statsd.yml`](docker-compose.statsd.yml) for running a
+  StatsD-enabled test image on a Linux host.
+
+### Changed
+- **Build image**: the Dockerfile builder stage moved from `debian:bullseye` to
+  `registry.access.redhat.com/ubi9/ubi` and downloads the Go toolchain for
+  `TARGETARCH`, so multi-arch builds require BuildKit/buildx. The runtime image
+  now declares `EXPOSE 10300/tcp` and `EXPOSE 8125/udp`. ([Dockerfile](Dockerfile))
+- An explicit `--listen` / `LISTEN` is now respected when a collector endpoint
+  is configured; previously it was always forced to `127.0.0.1:10300`.
+  ([flags/flags.go](flags/flags.go))
+
+### Upgrade notes
+- No behavior change unless `--statsd-enabled` is set. When enabled, the
+  agent requires `--collector-endpoint` or `--metrics-endpoint`, and pods must
+  expose UDP `8125` (for example via `status.hostIP`). `STATSD_ADDR` is a UDP
+  `host:port`, not an HTTP URL.
+- Deployments that set `LISTEN` alongside a collector endpoint will now bind to
+  that address instead of `127.0.0.1:10300`.
+
 ## [1.2.4] — 2026-06-16
 
 Security-only release. Bumps the Go toolchain to its latest stable major to
