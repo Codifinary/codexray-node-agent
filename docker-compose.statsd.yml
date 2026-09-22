@@ -1,0 +1,43 @@
+name: codexray-node-agent-statsd
+
+services:
+  node-agent:
+    image: ghcr.io/codifinary/codexray-node-agent-statsd:dogstatsd-test-1
+    pull_policy: always
+    restart: always
+    privileged: true
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+      - /sys/kernel/tracing:/sys/kernel/tracing
+      - /sys/kernel/debug:/sys/kernel/debug
+      - /sys/fs/cgroup:/host/sys/fs/cgroup:ro
+      - node_agent_data:/data
+    ports:
+      # Host applications send to 127.0.0.1:8125. Containers on
+      # codexray-network can send to node-agent:8125.
+      - "127.0.0.1:8125:8125/udp"
+    command:
+      - "--collector-endpoint=http://labs.codexray.io:8182/ingest"
+      - "--cgroupfs-root=/host/sys/fs/cgroup"
+      - "--wal-dir=/data"
+      - "--api-key=API_KEY"
+      - "--dogstatsd-enabled"
+      - "--dogstatsd-listen=0.0.0.0:8125"
+    networks:
+      - codexray-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  node_agent_data: {}
+
+networks:
+  codexray-network:
+    name: codexray-network
+    external: true
