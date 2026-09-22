@@ -9,6 +9,56 @@ The agent gathers metrics related to a node and the containers running on it, an
 
 It uses eBPF to track container related events such as TCP connects, so the minimum supported Linux kernel version is 4.16.
 
+## DogStatsD/StatsD application metrics
+
+The node agent can optionally receive StatsD and DogStatsD metrics over UDP, aggregate them into Prometheus remote-write series, and deliver them through an independent custom-metric spool and retry loop. Backend authentication remains in the node agent; applications do not need the CodeXRay API key, and custom traffic cannot evict the node-telemetry spool.
+
+Enable the receiver with:
+
+```sh
+API_KEY="$CODEXRAY_API_KEY" \
+codexray-node-agent \
+  --collector-endpoint=http://COLLECTOR/ingest \
+  --dogstatsd-enabled \
+  --dogstatsd-listen=0.0.0.0:8125
+```
+
+Configure applications to send UDP metrics to the node-local address:
+
+```text
+STATSD_ADDR=<node-ip>:8125
+```
+
+`STATSD_ADDR` is a UDP `host:port`, not an HTTP URL, so do not include `http://` or a path. Use `127.0.0.1:8125` for an application running directly on the node, or the node IP (for example Kubernetes `status.hostIP`) from a pod.
+
+Environment-specific Kubernetes resources, API-key Secrets, DogStatsD enablement, and network policy are maintained in the deployment repository rather than this agent source repository.
+
+Every accepted StatsD series receives the agent-owned label `is_custom="true"`. Metric type is represented by the generated metric-name suffix, so no separate `statsd_type` label is emitted. Application tags cannot override billing, project, or node identity labels, and an application-provided `statsd_type` tag is discarded. The production path supports counters (`c`), absolute and relative gauges (`g`), timers (`ms`), histograms (`h`), bounded sets (`s`), sampling for counters/timers/histograms, DogStatsD tags, and newline-separated datagrams. Sampled gauges and sets are rejected. Events, service checks, and distributions are not supported.
+
+Gauge values beginning with `+` or `-` are relative updates, matching the StatsD wire convention; unsigned values are absolute. To set an absolute negative value, send an absolute zero followed by the negative delta in the same datagram, for example `temperature:0|g\ntemperature:-5|g`. Duplicate tag keys, keys that collide after Prometheus normalization, repeated `@` sampling sections, and repeated `#` tag sections are rejected instead of being resolved by order. Unknown extension sections are ignored for forward compatibility.
+
+The receiver is disabled by default. Its queues, packet size, tag sizes, aggregation memory, per-metric/global active-series counts, active-series TTL, encoded batch size, and independent spool are configurable with the `DOGSTATSD_*` environment variables or matching command-line flags.
+
+Readiness tolerates short traffic bursts. Packet-queue or custom-spool utilization must remain at or above `DOGSTATSD_SATURATION_THRESHOLD` (default `0.8`) for `DOGSTATSD_SATURATION_DURATION` (default `5m`) before `/readyz` reports sustained saturation. The `packet_queue_utilization_ratio`, `packet_queue_saturated`, `spool_utilization_ratio`, and `spool_saturated` metrics expose this state.
+
+Collector `401` and `403` responses fail the authentication readiness component but keep the affected payload in the custom spool. Rotate the Kubernetes Secret and restart the node-agent pod so it reads the new key; startup recovery reopens the persistent spool and resumes replay. Other permanent `4xx` payload errors remain quarantined, while `408`, `429`, and `5xx` responses use bounded exponential backoff.
+
+During termination, UDP intake stops first and parser workers receive up to `DOGSTATSD_SHUTDOWN_DRAIN_TIMEOUT` (default `10s`) to drain accepted packets into aggregation. The pipeline then performs a final durable spool flush. `shutdown_pending_packets` records the queue present at shutdown, and `shutdown_dropped_packets_total` accounts for packets left when the drain deadline expires.
+
+### Docker Compose test deployment
+
+The repository includes [`docker-compose.statsd.yml`](docker-compose.statsd.yml) for running the StatsD-enabled test image on a Linux host. Before starting it, replace `REPLACE_WITH_NEW_API_KEY` in your local copy with a newly generated API key. Do not commit the populated file.
+
+```sh
+docker network inspect codexray-network >/dev/null 2>&1 || \
+  docker network create codexray-network
+
+docker compose -f docker-compose.statsd.yml up -d
+docker compose -f docker-compose.statsd.yml logs -f node-agent
+```
+
+Applications running directly on the host send StatsD UDP traffic to `127.0.0.1:8125`. Application containers attached to `codexray-network` send to `node-agent:8125`. Do not include `http://` in a StatsD address.
+
 ## Features
 
 ### TCP connection tracing
