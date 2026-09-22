@@ -1,16 +1,13 @@
-FROM debian:bullseye AS builder
-# Using Debian instead of the official Golang image because it’s based on newer OS versions
-# with newer glibc, which causes compatibility issues.
+FROM registry.access.redhat.com/ubi9/ubi AS builder
+RUN dnf install -y \
+        ca-certificates curl-minimal git gcc gcc-c++ make \
+        pkgconf-pkg-config systemd-devel tar gzip && \
+    dnf clean all
 
-RUN for i in 1 2 3; do \
-        apt-get update && \
-        apt-get install -y --fix-missing \
-        curl git build-essential pkg-config libsystemd-dev && \
-        break || sleep 5; \
-    done
-
-ARG GO_VERSION=1.25.10
-RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz -o go.tar.gz && \
+ARG TARGETARCH
+ARG GO_VERSION=1.26.4
+RUN test -n "$TARGETARCH" && \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" -o go.tar.gz && \
     tar -C /usr/local -xzf go.tar.gz && rm go.tar.gz
 ENV PATH="/usr/local/go/bin:${PATH}"
 
@@ -69,4 +66,6 @@ RUN for pkg in \
 COPY LICENSE /licenses/LICENSE
 
 COPY --from=builder /tmp/src/codexray-node-agent /usr/bin/codexray-node-agent
+EXPOSE 10300/tcp
+EXPOSE 8125/udp
 ENTRYPOINT ["codexray-node-agent"]
