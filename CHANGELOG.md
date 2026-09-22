@@ -4,6 +4,22 @@ All notable changes to the Codexray Node Agent are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] — 2026-09-23
+
+Fixes the release mismatch between the Helm chart's StatsD configuration and
+the node-agent image. The agent now uses StatsD names as the canonical
+configuration interface while continuing to accept the previous DogStatsD
+names for backward compatibility.
+
+### Fixed
+- Register `--statsd-*` flags and `STATSD_*` environment variables so the
+  Helm chart can start the receiver successfully.
+- Preserve compatibility with `--dogstatsd-*` flags and `DOGSTATSD_*`
+  environment variables. Canonical StatsD environment variables take
+  precedence when both are provided.
+- Update the Docker Compose example and release documentation to use the
+  canonical StatsD names.
+
 ## [1.3.0] — 2026-09-22
 
 Adds an optional node-local DogStatsD/StatsD UDP receiver for application
@@ -12,8 +28,8 @@ metrics ([#42](https://github.com/Codifinary/codexray-node-agent/pull/42),
 [#45](https://github.com/Codifinary/codexray-node-agent/pull/45)).
 
 ### Added
-- **DogStatsD/StatsD receiver** (`--dogstatsd-enabled` / `DOGSTATSD_ENABLED`,
-  disabled by default; listens on `--dogstatsd-listen`, default
+- **StatsD/DogStatsD receiver** (`--statsd-enabled` / `STATSD_ENABLED`,
+  disabled by default; listens on `--statsd-listen`, default
   `0.0.0.0:8125/udp`). Applications send UDP metrics to the node agent, which
   aggregates them into Prometheus remote-write series and ships them with the
   agent's own credentials, so applications never need the CodeXRay API key.
@@ -35,15 +51,16 @@ metrics ([#42](https://github.com/Codifinary/codexray-node-agent/pull/42),
     limits, a tag-key blocklist (`user_id,request_id,session_id,trace_id`),
     per-metric and global active-series caps with TTL, and an aggregation memory
     cap.
-  - All limits are configurable via `--dogstatsd-*` flags or matching
-    `DOGSTATSD_*` environment variables. See the README for the full list.
+  - All limits are configurable via `--statsd-*` flags or matching
+    `STATSD_*` environment variables. Legacy `--dogstatsd-*` flags and
+    `DOGSTATSD_*` variables remain compatible. See the README for the full list.
 - **`/healthz` and `/readyz` endpoints.** `/readyz` returns `503` when the
   DogStatsD receiver or pipeline is unhealthy, including sustained queue/spool
-  saturation (≥ `DOGSTATSD_SATURATION_THRESHOLD`, default `0.8`, for
-  `DOGSTATSD_SATURATION_DURATION`, default `5m`).
+  saturation (≥ `STATSD_SATURATION_THRESHOLD`, default `0.8`, for
+  `STATSD_SATURATION_DURATION`, default `5m`).
 - **Graceful shutdown** on `SIGINT`/`SIGTERM`: the HTTP server shuts down, UDP
   intake stops, queued packets drain for up to
-  `DOGSTATSD_SHUTDOWN_DRAIN_TIMEOUT` (default `10s`), then the custom spool is
+  `STATSD_SHUTDOWN_DRAIN_TIMEOUT` (default `10s`), then the custom spool is
   flushed to disk.
 - [`docker-compose.statsd.yml`](docker-compose.statsd.yml) for running a
   StatsD-enabled test image on a Linux host.
@@ -58,7 +75,7 @@ metrics ([#42](https://github.com/Codifinary/codexray-node-agent/pull/42),
   ([flags/flags.go](flags/flags.go))
 
 ### Upgrade notes
-- No behavior change unless `--dogstatsd-enabled` is set. When enabled, the
+- No behavior change unless `--statsd-enabled` is set. When enabled, the
   agent requires `--collector-endpoint` or `--metrics-endpoint`, and pods must
   expose UDP `8125` (for example via `status.hostIP`). `STATSD_ADDR` is a UDP
   `host:port`, not an HTTP URL.
