@@ -182,93 +182,93 @@ func main() {
 	defer profiling.Stop()
 
 	var seriesSources []prom.SeriesSource
-	var dogStatsDPipeline *dogstatsd.Pipeline
-	var dogStatsDReceiver *dogstatsd.Receiver
-	if *flags.DogStatsDEnabled {
+	var statsDPipeline *dogstatsd.Pipeline
+	var statsDReceiver *dogstatsd.Receiver
+	if *flags.StatsDEnabled {
 		if *flags.MetricsEndpoint == nil {
-			klog.Exitln("DogStatsD requires --collector-endpoint or --metrics-endpoint")
+			klog.Exitln("StatsD requires --collector-endpoint or --metrics-endpoint")
 		}
-		timerBuckets, parseErr := dogstatsd.ParseBuckets(*flags.DogStatsDTimerBucketsMS)
+		timerBuckets, parseErr := dogstatsd.ParseBuckets(*flags.StatsDTimerBucketsMS)
 		if parseErr != nil {
-			klog.Exitln("failed to parse DogStatsD timer buckets:", parseErr)
+			klog.Exitln("failed to parse StatsD timer buckets:", parseErr)
 		}
-		histogramBuckets, parseErr := dogstatsd.ParseBuckets(*flags.DogStatsDHistogramBuckets)
+		histogramBuckets, parseErr := dogstatsd.ParseBuckets(*flags.StatsDHistogramBuckets)
 		if parseErr != nil {
-			klog.Exitln("failed to parse DogStatsD histogram buckets:", parseErr)
+			klog.Exitln("failed to parse StatsD histogram buckets:", parseErr)
 		}
 		aggregator, aggregatorErr := dogstatsd.NewAggregator(dogstatsd.AggregationConfig{
 			TimerBucketsMS:        timerBuckets,
 			HistogramBuckets:      histogramBuckets,
-			MaxSetValuesPerSeries: *flags.DogStatsDSetMaxValuesPerSeries,
-			MaxBytes:              int64(*flags.DogStatsDAggregationMaxBytes),
-			GaugeTTL:              *flags.DogStatsDActiveSeriesTTL,
+			MaxSetValuesPerSeries: *flags.StatsDSetMaxValuesPerSeries,
+			MaxBytes:              int64(*flags.StatsDAggregationMaxBytes),
+			GaugeTTL:              *flags.StatsDActiveSeriesTTL,
 		})
 		if aggregatorErr != nil {
-			klog.Exitln("failed to configure DogStatsD aggregation:", aggregatorErr)
+			klog.Exitln("failed to configure StatsD aggregation:", aggregatorErr)
 		}
-		customSpoolDir := *flags.DogStatsDCustomSpoolDir
+		customSpoolDir := *flags.StatsDCustomSpoolDir
 		if customSpoolDir == "" {
 			customSpoolDir = filepath.Join(*flags.WalDir, "custom-metrics-spool")
 		}
-		customSpool, spoolErr := dogstatsd.OpenCustomSpoolWithPolicy(customSpoolDir, int64(*flags.DogStatsDCustomSpoolMaxBytes), *flags.DogStatsDCustomSpoolMaxAge, int64(*flags.DogStatsDQuarantineMaxBytes))
+		customSpool, spoolErr := dogstatsd.OpenCustomSpoolWithPolicy(customSpoolDir, int64(*flags.StatsDCustomSpoolMaxBytes), *flags.StatsDCustomSpoolMaxAge, int64(*flags.StatsDQuarantineMaxBytes))
 		if spoolErr != nil {
-			klog.Exitln("failed to configure DogStatsD custom spool:", spoolErr)
+			klog.Exitln("failed to configure StatsD custom spool:", spoolErr)
 		}
 		customSender, senderErr := dogstatsd.NewCustomSender(&http.Client{
 			Timeout:   30 * time.Second,
 			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify}},
 		}, (*flags.MetricsEndpoint).String(), common.AuthHeaders())
 		if senderErr != nil {
-			klog.Exitln("failed to configure DogStatsD custom sender:", senderErr)
+			klog.Exitln("failed to configure StatsD custom sender:", senderErr)
 		}
 		pipeline, pipelineErr := dogstatsd.NewPipeline(dogstatsd.PipelineConfig{
-			FlushInterval:       *flags.DogStatsDFlushInterval,
-			MaxBatchBytes:       int(*flags.DogStatsDMaxBatchBytes),
+			FlushInterval:       *flags.StatsDFlushInterval,
+			MaxBatchBytes:       int(*flags.StatsDMaxBatchBytes),
 			ExternalLabels:      prom.SourceLabels(machineId, systemUuid),
 			RetryMin:            5 * time.Second,
 			RetryMax:            time.Minute,
-			SaturationThreshold: *flags.DogStatsDSaturationThreshold,
-			SaturationDuration:  *flags.DogStatsDSaturationDuration,
+			SaturationThreshold: *flags.StatsDSaturationThreshold,
+			SaturationDuration:  *flags.StatsDSaturationDuration,
 			Registerer:          registerer,
 		}, aggregator, customSpool, customSender)
 		if pipelineErr != nil {
-			klog.Exitln("failed to configure DogStatsD custom pipeline:", pipelineErr)
+			klog.Exitln("failed to configure StatsD custom pipeline:", pipelineErr)
 		}
 		pipeline.Start()
 		defer pipeline.Close()
-		dogStatsDPipeline = pipeline
+		statsDPipeline = pipeline
 
 		receiver, receiverErr := dogstatsd.NewProduction(dogstatsd.Config{
-			ListenAddr:               *flags.DogStatsDListen,
-			MaxPacketBytes:           *flags.DogStatsDMaxPacketBytes,
-			PacketQueueSize:          *flags.DogStatsDPacketQueueSize,
-			PacketQueueMaxBytes:      int64(*flags.DogStatsDPacketQueueMaxBytes),
-			ParseWorkers:             *flags.DogStatsDParseWorkers,
-			BufferMaxEvents:          *flags.DogStatsDBufferMaxEvents,
-			BatchMaxSeries:           *flags.DogStatsDBatchMaxSeries,
-			MaxMetricNameLength:      *flags.DogStatsDMaxMetricNameLength,
-			MaxTagsPerMetric:         *flags.DogStatsDMaxTagsPerMetric,
-			MaxTagKeyLength:          *flags.DogStatsDMaxTagKeyLength,
-			MaxTagValueLength:        *flags.DogStatsDMaxTagValueLength,
-			ActiveSeriesPerMetricCap: *flags.DogStatsDActiveSeriesPerMetricCap,
-			ActiveSeriesGlobalCap:    *flags.DogStatsDActiveSeriesGlobalCap,
-			ActiveSeriesTTL:          *flags.DogStatsDActiveSeriesTTL,
-			TagKeyBlocklist:          *flags.DogStatsDTagKeyBlocklist,
-			AllowedSourceCIDRs:       *flags.DogStatsDAllowedSourceCIDRs,
-			MaxBytesPerSecond:        *flags.DogStatsDMaxBytesPerSecond,
-			MaxEventsPerSecond:       *flags.DogStatsDMaxEventsPerSecond,
-			SaturationThreshold:      *flags.DogStatsDSaturationThreshold,
-			SaturationDuration:       *flags.DogStatsDSaturationDuration,
-			ShutdownDrainTimeout:     *flags.DogStatsDShutdownDrainTimeout,
+			ListenAddr:               *flags.StatsDListen,
+			MaxPacketBytes:           *flags.StatsDMaxPacketBytes,
+			PacketQueueSize:          *flags.StatsDPacketQueueSize,
+			PacketQueueMaxBytes:      int64(*flags.StatsDPacketQueueMaxBytes),
+			ParseWorkers:             *flags.StatsDParseWorkers,
+			BufferMaxEvents:          *flags.StatsDBufferMaxEvents,
+			BatchMaxSeries:           *flags.StatsDBatchMaxSeries,
+			MaxMetricNameLength:      *flags.StatsDMaxMetricNameLength,
+			MaxTagsPerMetric:         *flags.StatsDMaxTagsPerMetric,
+			MaxTagKeyLength:          *flags.StatsDMaxTagKeyLength,
+			MaxTagValueLength:        *flags.StatsDMaxTagValueLength,
+			ActiveSeriesPerMetricCap: *flags.StatsDActiveSeriesPerMetricCap,
+			ActiveSeriesGlobalCap:    *flags.StatsDActiveSeriesGlobalCap,
+			ActiveSeriesTTL:          *flags.StatsDActiveSeriesTTL,
+			TagKeyBlocklist:          *flags.StatsDTagKeyBlocklist,
+			AllowedSourceCIDRs:       *flags.StatsDAllowedSourceCIDRs,
+			MaxBytesPerSecond:        *flags.StatsDMaxBytesPerSecond,
+			MaxEventsPerSecond:       *flags.StatsDMaxEventsPerSecond,
+			SaturationThreshold:      *flags.StatsDSaturationThreshold,
+			SaturationDuration:       *flags.StatsDSaturationDuration,
+			ShutdownDrainTimeout:     *flags.StatsDShutdownDrainTimeout,
 		}, registerer, aggregator)
 		if receiverErr != nil {
-			klog.Exitln("failed to configure DogStatsD receiver:", receiverErr)
+			klog.Exitln("failed to configure StatsD receiver:", receiverErr)
 		}
 		if receiverErr = receiver.Start(); receiverErr != nil {
-			klog.Exitln("failed to start DogStatsD receiver:", receiverErr)
+			klog.Exitln("failed to start StatsD receiver:", receiverErr)
 		}
 		defer receiver.Close()
-		dogStatsDReceiver = receiver
+		statsDReceiver = receiver
 	}
 
 	if err := prom.StartAgent(registry, machineId, systemUuid, seriesSources...); err != nil {
@@ -281,8 +281,8 @@ func main() {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	http.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if *flags.DogStatsDEnabled && (dogStatsDReceiver == nil || !dogStatsDReceiver.Ready() || dogStatsDPipeline == nil || !dogStatsDPipeline.Healthy()) {
-			http.Error(w, "dogstatsd pipeline not ready", http.StatusServiceUnavailable)
+		if *flags.StatsDEnabled && (statsDReceiver == nil || !statsDReceiver.Ready() || statsDPipeline == nil || !statsDPipeline.Healthy()) {
+			http.Error(w, "statsd pipeline not ready", http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -315,14 +315,14 @@ func main() {
 			klog.Errorln("HTTP server failed:", err)
 		}
 	}
-	if dogStatsDReceiver != nil {
-		if err := dogStatsDReceiver.Close(); err != nil {
-			klog.Warningln("DogStatsD receiver shutdown did not drain cleanly:", err)
+	if statsDReceiver != nil {
+		if err := statsDReceiver.Close(); err != nil {
+			klog.Warningln("StatsD receiver shutdown did not drain cleanly:", err)
 		}
 	}
-	if dogStatsDPipeline != nil {
-		if err := dogStatsDPipeline.Close(); err != nil {
-			klog.Warningln("DogStatsD final spool flush failed:", err)
+	if statsDPipeline != nil {
+		if err := statsDPipeline.Close(); err != nil {
+			klog.Warningln("StatsD final spool flush failed:", err)
 		}
 	}
 }

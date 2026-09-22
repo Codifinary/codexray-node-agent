@@ -57,38 +57,38 @@ var (
 	WalDir         = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/Codexray-node-agent").Envar("WAL_DIR").String()
 	MaxSpoolSize   = kingpin.Flag("max-spool-size", "Maximum size of the on-disk spool used to buffer data when it cannot be sent to collector. Supports size suffixes like KB, MB, or GB.").Default("500MB").Envar("MAX_SPOOL_SIZE").Bytes()
 
-	DogStatsDEnabled                  = kingpin.Flag("dogstatsd-enabled", "Enable the node-local DogStatsD/StatsD UDP receiver").Default("false").Envar("DOGSTATSD_ENABLED").Bool()
-	DogStatsDListen                   = kingpin.Flag("dogstatsd-listen", "DogStatsD UDP listen address").Default("0.0.0.0:8125").Envar("DOGSTATSD_LISTEN").String()
-	DogStatsDMaxPacketBytes           = kingpin.Flag("dogstatsd-max-packet-bytes", "Maximum accepted DogStatsD UDP packet size").Default("8192").Envar("DOGSTATSD_MAX_PACKET_BYTES").Int()
-	DogStatsDPacketQueueSize          = kingpin.Flag("dogstatsd-packet-queue-size", "Maximum number of UDP packets waiting for parsing").Default("4096").Envar("DOGSTATSD_PACKET_QUEUE_SIZE").Int()
-	DogStatsDPacketQueueMaxBytes      = kingpin.Flag("dogstatsd-packet-queue-max-bytes", "Maximum UDP payload bytes waiting for parsing").Default("16MB").Envar("DOGSTATSD_PACKET_QUEUE_MAX_BYTES").Bytes()
-	DogStatsDParseWorkers             = kingpin.Flag("dogstatsd-parse-workers", "Number of DogStatsD parser workers").Default("2").Envar("DOGSTATSD_PARSE_WORKERS").Int()
-	DogStatsDBufferMaxEvents          = kingpin.Flag("dogstatsd-buffer-max-events", "Maximum converted DogStatsD events buffered in memory").Default("100000").Envar("DOGSTATSD_BUFFER_MAX_EVENTS").Int()
-	DogStatsDBatchMaxSeries           = kingpin.Flag("dogstatsd-batch-max-series", "Maximum buffered DogStatsD series included in one node-agent scrape").Default("10000").Envar("DOGSTATSD_BATCH_MAX_SERIES").Int()
-	DogStatsDMaxMetricNameLength      = kingpin.Flag("dogstatsd-max-metric-name-length", "Maximum DogStatsD metric name length").Default("255").Envar("DOGSTATSD_MAX_METRIC_NAME_LENGTH").Int()
-	DogStatsDMaxTagsPerMetric         = kingpin.Flag("dogstatsd-max-tags-per-metric", "Maximum retained DogStatsD tags per metric").Default("20").Envar("DOGSTATSD_MAX_TAGS_PER_METRIC").Int()
-	DogStatsDMaxTagKeyLength          = kingpin.Flag("dogstatsd-max-tag-key-length", "Maximum DogStatsD tag key length").Default("64").Envar("DOGSTATSD_MAX_TAG_KEY_LENGTH").Int()
-	DogStatsDMaxTagValueLength        = kingpin.Flag("dogstatsd-max-tag-value-length", "Maximum DogStatsD tag value length").Default("128").Envar("DOGSTATSD_MAX_TAG_VALUE_LENGTH").Int()
-	DogStatsDActiveSeriesPerMetricCap = kingpin.Flag("dogstatsd-active-series-per-metric-cap", "Maximum active DogStatsD series per metric name").Default("5000").Envar("DOGSTATSD_ACTIVE_SERIES_PER_METRIC_CAP").Int()
-	DogStatsDActiveSeriesGlobalCap    = kingpin.Flag("dogstatsd-active-series-global-cap", "Maximum active DogStatsD series across all metric names").Default("100000").Envar("DOGSTATSD_ACTIVE_SERIES_GLOBAL_CAP").Int()
-	DogStatsDActiveSeriesTTL          = kingpin.Flag("dogstatsd-active-series-ttl", "How long an inactive DogStatsD series consumes a cardinality slot").Default("1h").Envar("DOGSTATSD_ACTIVE_SERIES_TTL").Duration()
-	DogStatsDTagKeyBlocklist          = kingpin.Flag("dogstatsd-tag-key-blocklist", "Comma-separated DogStatsD tag keys to discard").Default("user_id,request_id,session_id,trace_id").Envar("DOGSTATSD_TAG_KEY_BLOCKLIST").String()
-	DogStatsDFlushInterval            = kingpin.Flag("dogstatsd-flush-interval", "Production DogStatsD aggregation flush interval").Default("10s").Envar("DOGSTATSD_FLUSH_INTERVAL").Duration()
-	DogStatsDMaxBatchBytes            = kingpin.Flag("dogstatsd-max-batch-bytes", "Maximum compressed custom-metric remote-write batch size").Default("4MB").Envar("DOGSTATSD_MAX_BATCH_BYTES").Bytes()
-	DogStatsDCustomSpoolDir           = kingpin.Flag("dogstatsd-custom-spool-dir", "Independent custom-metric spool directory; defaults below WAL_DIR").Envar("DOGSTATSD_CUSTOM_SPOOL_DIR").String()
-	DogStatsDCustomSpoolMaxBytes      = kingpin.Flag("dogstatsd-custom-spool-max-bytes", "Maximum independent custom-metric spool size").Default("250MB").Envar("DOGSTATSD_CUSTOM_SPOOL_MAX_BYTES").Bytes()
-	DogStatsDCustomSpoolMaxAge        = kingpin.Flag("dogstatsd-custom-spool-max-age", "Maximum age of an undelivered custom-metric batch").Default("24h").Envar("DOGSTATSD_CUSTOM_SPOOL_MAX_AGE").Duration()
-	DogStatsDQuarantineMaxBytes       = kingpin.Flag("dogstatsd-quarantine-max-bytes", "Maximum disk bytes retained for permanently rejected/corrupt custom batches").Default("25MB").Envar("DOGSTATSD_QUARANTINE_MAX_BYTES").Bytes()
-	DogStatsDTimerBucketsMS           = kingpin.Flag("dogstatsd-timer-buckets-ms", "Comma-separated production timer bucket upper bounds in milliseconds").Default("5,10,25,50,100,250,500,1000,2500,5000").Envar("DOGSTATSD_TIMER_BUCKETS_MS").String()
-	DogStatsDHistogramBuckets         = kingpin.Flag("dogstatsd-histogram-buckets", "Comma-separated production histogram bucket upper bounds").Default("0.1,0.5,1,2.5,5,10,25,50,100,250,500,1000").Envar("DOGSTATSD_HISTOGRAM_BUCKETS").String()
-	DogStatsDSetMaxValuesPerSeries    = kingpin.Flag("dogstatsd-set-max-values-per-series", "Maximum unique set values retained per series and flush window").Default("10000").Envar("DOGSTATSD_SET_MAX_VALUES_PER_SERIES").Int()
-	DogStatsDAggregationMaxBytes      = kingpin.Flag("dogstatsd-aggregation-max-bytes", "Maximum estimated bytes retained in active and in-flight aggregation windows").Default("128MB").Envar("DOGSTATSD_AGGREGATION_MAX_BYTES").Bytes()
-	DogStatsDAllowedSourceCIDRs       = kingpin.Flag("dogstatsd-allowed-source-cidrs", "Comma-separated CIDRs allowed to send UDP metrics").Default("127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7").Envar("DOGSTATSD_ALLOWED_SOURCE_CIDRS").String()
-	DogStatsDMaxBytesPerSecond        = kingpin.Flag("dogstatsd-max-bytes-per-second", "Maximum accepted DogStatsD UDP bytes per second per node").Default("10485760").Envar("DOGSTATSD_MAX_BYTES_PER_SECOND").Int()
-	DogStatsDMaxEventsPerSecond       = kingpin.Flag("dogstatsd-max-events-per-second", "Maximum accepted DogStatsD metric lines per second per node").Default("10000").Envar("DOGSTATSD_MAX_EVENTS_PER_SECOND").Int()
-	DogStatsDSaturationThreshold      = kingpin.Flag("dogstatsd-saturation-threshold", "Queue or spool utilization that begins the sustained-saturation readiness timer").Default("0.8").Envar("DOGSTATSD_SATURATION_THRESHOLD").Float64()
-	DogStatsDSaturationDuration       = kingpin.Flag("dogstatsd-saturation-duration", "How long DogStatsD queue or spool pressure must remain high before readiness fails").Default("5m").Envar("DOGSTATSD_SATURATION_DURATION").Duration()
-	DogStatsDShutdownDrainTimeout     = kingpin.Flag("dogstatsd-shutdown-drain-timeout", "Maximum time to drain queued DogStatsD packets before shutdown continues").Default("10s").Envar("DOGSTATSD_SHUTDOWN_DRAIN_TIMEOUT").Duration()
+	StatsDEnabled                  = kingpin.Flag("statsd-enabled", "Enable the node-local StatsD/DogStatsD UDP receiver").Default("false").Envar("STATSD_ENABLED").Bool()
+	StatsDListen                   = kingpin.Flag("statsd-listen", "StatsD UDP listen address").Default("0.0.0.0:8125").Envar("STATSD_LISTEN").String()
+	StatsDMaxPacketBytes           = kingpin.Flag("statsd-max-packet-bytes", "Maximum accepted StatsD UDP packet size").Default("8192").Envar("STATSD_MAX_PACKET_BYTES").Int()
+	StatsDPacketQueueSize          = kingpin.Flag("statsd-packet-queue-size", "Maximum number of UDP packets waiting for parsing").Default("4096").Envar("STATSD_PACKET_QUEUE_SIZE").Int()
+	StatsDPacketQueueMaxBytes      = kingpin.Flag("statsd-packet-queue-max-bytes", "Maximum UDP payload bytes waiting for parsing").Default("16MB").Envar("STATSD_PACKET_QUEUE_MAX_BYTES").Bytes()
+	StatsDParseWorkers             = kingpin.Flag("statsd-parse-workers", "Number of StatsD parser workers").Default("2").Envar("STATSD_PARSE_WORKERS").Int()
+	StatsDBufferMaxEvents          = kingpin.Flag("statsd-buffer-max-events", "Maximum converted StatsD events buffered in memory").Default("100000").Envar("STATSD_BUFFER_MAX_EVENTS").Int()
+	StatsDBatchMaxSeries           = kingpin.Flag("statsd-batch-max-series", "Maximum buffered StatsD series included in one node-agent scrape").Default("10000").Envar("STATSD_BATCH_MAX_SERIES").Int()
+	StatsDMaxMetricNameLength      = kingpin.Flag("statsd-max-metric-name-length", "Maximum StatsD metric name length").Default("255").Envar("STATSD_MAX_METRIC_NAME_LENGTH").Int()
+	StatsDMaxTagsPerMetric         = kingpin.Flag("statsd-max-tags-per-metric", "Maximum retained StatsD tags per metric").Default("20").Envar("STATSD_MAX_TAGS_PER_METRIC").Int()
+	StatsDMaxTagKeyLength          = kingpin.Flag("statsd-max-tag-key-length", "Maximum StatsD tag key length").Default("64").Envar("STATSD_MAX_TAG_KEY_LENGTH").Int()
+	StatsDMaxTagValueLength        = kingpin.Flag("statsd-max-tag-value-length", "Maximum StatsD tag value length").Default("128").Envar("STATSD_MAX_TAG_VALUE_LENGTH").Int()
+	StatsDActiveSeriesPerMetricCap = kingpin.Flag("statsd-active-series-per-metric-cap", "Maximum active StatsD series per metric name").Default("5000").Envar("STATSD_ACTIVE_SERIES_PER_METRIC_CAP").Int()
+	StatsDActiveSeriesGlobalCap    = kingpin.Flag("statsd-active-series-global-cap", "Maximum active StatsD series across all metric names").Default("100000").Envar("STATSD_ACTIVE_SERIES_GLOBAL_CAP").Int()
+	StatsDActiveSeriesTTL          = kingpin.Flag("statsd-active-series-ttl", "How long an inactive StatsD series consumes a cardinality slot").Default("1h").Envar("STATSD_ACTIVE_SERIES_TTL").Duration()
+	StatsDTagKeyBlocklist          = kingpin.Flag("statsd-tag-key-blocklist", "Comma-separated StatsD tag keys to discard").Default("user_id,request_id,session_id,trace_id").Envar("STATSD_TAG_KEY_BLOCKLIST").String()
+	StatsDFlushInterval            = kingpin.Flag("statsd-flush-interval", "Production StatsD aggregation flush interval").Default("10s").Envar("STATSD_FLUSH_INTERVAL").Duration()
+	StatsDMaxBatchBytes            = kingpin.Flag("statsd-max-batch-bytes", "Maximum compressed custom-metric remote-write batch size").Default("4MB").Envar("STATSD_MAX_BATCH_BYTES").Bytes()
+	StatsDCustomSpoolDir           = kingpin.Flag("statsd-custom-spool-dir", "Independent custom-metric spool directory; defaults below WAL_DIR").Envar("STATSD_CUSTOM_SPOOL_DIR").String()
+	StatsDCustomSpoolMaxBytes      = kingpin.Flag("statsd-custom-spool-max-bytes", "Maximum independent custom-metric spool size").Default("250MB").Envar("STATSD_CUSTOM_SPOOL_MAX_BYTES").Bytes()
+	StatsDCustomSpoolMaxAge        = kingpin.Flag("statsd-custom-spool-max-age", "Maximum age of an undelivered custom-metric batch").Default("24h").Envar("STATSD_CUSTOM_SPOOL_MAX_AGE").Duration()
+	StatsDQuarantineMaxBytes       = kingpin.Flag("statsd-quarantine-max-bytes", "Maximum disk bytes retained for permanently rejected/corrupt custom batches").Default("25MB").Envar("STATSD_QUARANTINE_MAX_BYTES").Bytes()
+	StatsDTimerBucketsMS           = kingpin.Flag("statsd-timer-buckets-ms", "Comma-separated production timer bucket upper bounds in milliseconds").Default("5,10,25,50,100,250,500,1000,2500,5000").Envar("STATSD_TIMER_BUCKETS_MS").String()
+	StatsDHistogramBuckets         = kingpin.Flag("statsd-histogram-buckets", "Comma-separated production histogram bucket upper bounds").Default("0.1,0.5,1,2.5,5,10,25,50,100,250,500,1000").Envar("STATSD_HISTOGRAM_BUCKETS").String()
+	StatsDSetMaxValuesPerSeries    = kingpin.Flag("statsd-set-max-values-per-series", "Maximum unique set values retained per series and flush window").Default("10000").Envar("STATSD_SET_MAX_VALUES_PER_SERIES").Int()
+	StatsDAggregationMaxBytes      = kingpin.Flag("statsd-aggregation-max-bytes", "Maximum estimated bytes retained in active and in-flight aggregation windows").Default("128MB").Envar("STATSD_AGGREGATION_MAX_BYTES").Bytes()
+	StatsDAllowedSourceCIDRs       = kingpin.Flag("statsd-allowed-source-cidrs", "Comma-separated CIDRs allowed to send UDP metrics").Default("127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7").Envar("STATSD_ALLOWED_SOURCE_CIDRS").String()
+	StatsDMaxBytesPerSecond        = kingpin.Flag("statsd-max-bytes-per-second", "Maximum accepted StatsD UDP bytes per second per node").Default("10485760").Envar("STATSD_MAX_BYTES_PER_SECOND").Int()
+	StatsDMaxEventsPerSecond       = kingpin.Flag("statsd-max-events-per-second", "Maximum accepted StatsD metric lines per second per node").Default("10000").Envar("STATSD_MAX_EVENTS_PER_SECOND").Int()
+	StatsDSaturationThreshold      = kingpin.Flag("statsd-saturation-threshold", "Queue or spool utilization that begins the sustained-saturation readiness timer").Default("0.8").Envar("STATSD_SATURATION_THRESHOLD").Float64()
+	StatsDSaturationDuration       = kingpin.Flag("statsd-saturation-duration", "How long StatsD queue or spool pressure must remain high before readiness fails").Default("5m").Envar("STATSD_SATURATION_DURATION").Duration()
+	StatsDShutdownDrainTimeout     = kingpin.Flag("statsd-shutdown-drain-timeout", "Maximum time to drain queued StatsD packets before shutdown continues").Default("10s").Envar("STATSD_SHUTDOWN_DRAIN_TIMEOUT").Duration()
 
 	agentVersion = kingpin.Flag("version", "Print version and exit").Default("false").Bool()
 	Version      = "unknown"
@@ -106,6 +106,7 @@ func init() {
 		return
 	}
 
+	normalizeLegacyStatsDConfig()
 	kingpin.HelpFlag.Short('h').Hidden()
 	kingpin.Parse()
 
@@ -132,6 +133,30 @@ func init() {
 
 	if *MetricsEndpoint != nil && !listenExplicitlyConfigured() {
 		*ListenAddress = "127.0.0.1:10300"
+	}
+}
+
+// normalizeLegacyStatsDConfig keeps the original DogStatsD-prefixed public
+// configuration working while StatsD-prefixed flags and environment variables
+// become canonical. Explicit STATSD_* values take precedence over legacy
+// DOGSTATSD_* values.
+func normalizeLegacyStatsDConfig() {
+	for i, arg := range os.Args[1:] {
+		const legacyPrefix = "--dogstatsd-"
+		if strings.HasPrefix(arg, legacyPrefix) {
+			os.Args[i+1] = "--statsd-" + strings.TrimPrefix(arg, legacyPrefix)
+		}
+	}
+
+	for _, entry := range os.Environ() {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok || !strings.HasPrefix(name, "DOGSTATSD_") {
+			continue
+		}
+		canonical := "STATSD_" + strings.TrimPrefix(name, "DOGSTATSD_")
+		if _, exists := os.LookupEnv(canonical); !exists {
+			_ = os.Setenv(canonical, value)
+		}
 	}
 }
 
