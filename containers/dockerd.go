@@ -12,7 +12,6 @@ import (
 
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/internal/dockerclient"
-	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/codifinary/logparser"
 	"inet.af/netaddr"
 )
@@ -24,7 +23,7 @@ var (
 )
 
 func DockerdInit() error {
-	c, err := dockerclient.NewClient(proc.HostPath("/run/docker.sock"))
+	c, err := dockerclient.NewClient(hostPath("/run/docker.sock"))
 	if err != nil {
 		return err
 	}

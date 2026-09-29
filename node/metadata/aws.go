@@ -16,11 +16,11 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const awsInstanceMetadataURL = "http://169.254.169.254/latest"
+var awsInstanceMetadataURL = "http://169.254.169.254/latest"
 
 func getAwsToken() (string, error) {
 	// a token must be retrieved using the host net NS because the metadata service sets IP TTL to 1 on all response packets
-	hostNetNs, err := proc.GetHostNetNs()
+	hostNetNs, err := getHostNetNs()
 	if err != nil {
 		return "", err
 	}

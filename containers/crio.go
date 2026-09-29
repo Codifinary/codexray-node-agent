@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/codifinary/codexray-node-agent/common"
-	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/codifinary/logparser"
 	"k8s.io/klog/v2"
 )
@@ -48,7 +47,7 @@ func CrioInit() error {
 	var crioSocket string
 	var err error
 	for _, socket := range sockets {
-		socketHostPath := proc.HostPath(socket)
+		socketHostPath := hostPath(socket)
 		if _, err := os.Stat(socketHostPath); err == nil {
 			crioSocket = socketHostPath
 			break

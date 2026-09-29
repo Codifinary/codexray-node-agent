@@ -30,13 +30,27 @@ type NetDeviceInfo struct {
 	TxPackets  float64
 }
 
-func NetDevices() ([]NetDeviceInfo, error) {
+type netlinkHandle interface {
+	LinkList() ([]netlink.Link, error)
+	AddrList(link netlink.Link, family int) ([]netlink.Addr, error)
+	Delete()
+}
+
+var newHostNetlinkHandle = func() (netlinkHandle, error) {
 	hostNs, err := proc.GetHostNetNs()
 	if err != nil {
 		return nil, err
 	}
 	defer hostNs.Close()
 	h, err := netlink.NewHandleAt(hostNs)
+	if err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+func NetDevices() ([]NetDeviceInfo, error) {
+	h, err := newHostNetlinkHandle()
 	if err != nil {
 		return nil, err
 	}

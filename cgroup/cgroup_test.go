@@ -5,8 +5,14 @@
 package cgroup
 
 import (
+	"os"
 	"path"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/codifinary/codexray-node-agent/common"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -199,4 +205,207 @@ func TestContainerByCgroup(t *testing.T) {
 	as.Equal(ContainerTypeStandaloneProcess, typ)
 	as.Equal("", id)
 	as.Nil(err)
+}
+
+func cgroupTestWriteFile(t *testing.T, root, rel, content string) string {
+	t.Helper()
+	p := filepath.Join(root, rel)
+	require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+	require.NoError(t, os.WriteFile(p, []byte(content), 0o644))
+	return p
+}
+
+func cgroupTestSetRoots(t *testing.T, v1, v2 string) {
+	t.Helper()
+	prevV1, prevV2, prevBase := cgRoot, cg2Root, baseCgroupPath
+	cgRoot, cg2Root, baseCgroupPath = v1, v2, ""
+	t.Cleanup(func() { cgRoot, cg2Root, baseCgroupPath = prevV1, prevV2, prevBase })
+}
+
+func TestContainerByCgroupRuntimes(t *testing.T) {
+	const id64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	cases := []struct {
+		name    string
+		path    string
+		typ     ContainerType
+		id      string
+		wantErr bool
+	}{
+		{"docker v1", "/docker/" + id64, ContainerTypeDocker, id64, false},
+		{"docker systemd scope", "/system.slice/docker-" + id64 + ".scope", ContainerTypeDocker, id64, false},
+		{"docker invalid id", "/docker/short", ContainerTypeUnknown, "", true},
+		{"docker uppercase id is not a docker id", "/docker/" + strings.ToUpper(id64), ContainerTypeUnknown, "", true},
+		{"crio kubepods cgroupfs", "/kubepods/besteffort/pod1/crio-" + id64, ContainerTypeCrio, id64, false},
+		{"crio conmon ignored", "/kubepods.slice/kubepods-pod1.slice/crio-conmon-" + id64 + ".scope", ContainerTypeUnknown, "", false},
+		{"containerd dash", "/kubepods.slice/kubepods-pod1.slice/cri-containerd-" + id64 + ".scope", ContainerTypeContainerd, id64, false},
+		{"containerd colon", "/system.slice/containerd.service/kubepods-pod1.slice:cri-containerd:" + id64, ContainerTypeContainerd, id64, false},
+		{"kubepods sandbox pod level", "/kubepods/burstable/pod6a4ce4a0-ba47-11ea-b2a7-0cc47ac5979e", ContainerTypeSandbox, "", false},
+		{"kubepods root", "/kubepods.slice", ContainerTypeSandbox, "", false},
+		{"kubepods docker", "/kubepods/pod1/" + id64, ContainerTypeDocker, id64, false},
+		{"lxc", "/lxc/web01", ContainerTypeLxc, "web01", false},
+		{"lxc nested", "/lxc/web01/init.scope", ContainerTypeLxc, "web01", false},
+		{"lxc without name", "/lxc", ContainerTypeUnknown, "", true},
+		{"lxc payload", "/lxc.payload.web01", ContainerTypeLxc, "/lxc/web01", false},
+		{"lxc payload nested", "/lxc.payload.web01/system.slice/x.service", ContainerTypeLxc, "/lxc/web01", false},
+		{"lxc monitor", "/lxc.monitor.web01", ContainerTypeStandaloneProcess, "", false},
+		{"system slice service", "/system.slice/nginx.service", ContainerTypeSystemdService, "/system.slice/nginx.service", false},
+		{"system slice escaped", "/system.slice/system-foo\\x2dbar.slice/a.service", ContainerTypeSystemdService, "/system.slice/system-foo-bar.slice", false},
+		{"runtime slice", "/runtime.slice/containerd.service", ContainerTypeSystemdService, "/runtime.slice/containerd.service", false},
+		{"reserved slice", "/reserved.slice/kubelet.service", ContainerTypeSystemdService, "/reserved.slice/kubelet.service", false},
+		{"bare system.slice", "/system.slice", ContainerTypeUnknown, "", true},
+		{"talos system", "/system/apid", ContainerTypeTalosRuntime, "/talos/apid", false},
+		{"talos podruntime", "/podruntime/etcd", ContainerTypeTalosRuntime, "/talos/etcd", false},
+		{"talos init", "/init", ContainerTypeTalosRuntime, "/talos/init", false},
+		{"talos bare system", "/system", ContainerTypeUnknown, "", true},
+		{"user slice", "/user.slice/user-1000.slice/session-1.scope", ContainerTypeStandaloneProcess, "", false},
+		{"init scope", "/init.scope", ContainerTypeStandaloneProcess, "", false},
+		{"root", "/", ContainerTypeStandaloneProcess, "", false},
+		{"empty", "", ContainerTypeStandaloneProcess, "", false},
+		{"single unknown level", "/something", ContainerTypeStandaloneProcess, "", false},
+		{"unknown nested", "/foo/bar", ContainerTypeUnknown, "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			typ, id, err := containerByCgroup(c.path)
+			if c.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, c.typ, typ)
+			assert.Equal(t, c.id, id)
+		})
+	}
+}
+
+func TestNewFromProcessCgroupFileEdgeCases(t *testing.T) {
+	cgroupTestSetRoots(t, cgRoot, cg2Root)
+	dir := t.TempDir()
+	const id64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	t.Run("process exited", func(t *testing.T) {
+		_, err := NewFromProcessCgroupFile(filepath.Join(dir, "missing", "cgroup"))
+		require.Error(t, err)
+		assert.True(t, common.IsNotExist(err))
+	})
+
+	t.Run("empty and malformed lines", func(t *testing.T) {
+		p := cgroupTestWriteFile(t, dir, "malformed/cgroup", "\ngarbage\n1:cpu\n0::/\n")
+		cg, err := NewFromProcessCgroupFile(p)
+		require.NoError(t, err)
+		assert.Equal(t, "", cg.Id)
+		assert.Equal(t, ContainerTypeStandaloneProcess, cg.ContainerType)
+		assert.Empty(t, cg.subsystems)
+	})
+
+	t.Run("only name=systemd set", func(t *testing.T) {
+		p := cgroupTestWriteFile(t, dir, "systemd/cgroup", "5:cpu,cpuacct:/\n1:name=systemd:/system.slice/cron.service\n")
+		cg, err := NewFromProcessCgroupFile(p)
+		require.NoError(t, err)
+		assert.Equal(t, "/system.slice/cron.service", cg.Id)
+		assert.Equal(t, ContainerTypeSystemdService, cg.ContainerType)
+	})
+
+	t.Run("hybrid prefers v1 kubepods over v2 path", func(t *testing.T) {
+		p := cgroupTestWriteFile(t, dir, "hybrid/cgroup",
+			"6:memory:/kubepods/besteffort/pod1/"+id64+"\n"+
+				"4:cpu,cpuacct:/\n"+
+				"0::/system.slice/containerd.service\n")
+		cg, err := NewFromProcessCgroupFile(p)
+		require.NoError(t, err)
+		assert.Equal(t, "/kubepods/besteffort/pod1/"+id64, cg.Id)
+		assert.Equal(t, ContainerTypeDocker, cg.ContainerType)
+		assert.Equal(t, id64, cg.ContainerId)
+	})
+
+	t.Run("v1 memory used when cpu missing", func(t *testing.T) {
+		p := cgroupTestWriteFile(t, dir, "memonly/cgroup", "6:memory:/docker/"+id64+"\n")
+		cg, err := NewFromProcessCgroupFile(p)
+		require.NoError(t, err)
+		assert.Equal(t, "/docker/"+id64, cg.Id)
+		assert.Equal(t, ContainerTypeDocker, cg.ContainerType)
+	})
+
+	t.Run("init.scope is ignored", func(t *testing.T) {
+		p := cgroupTestWriteFile(t, dir, "initscope/cgroup", "0::/init.scope\n")
+		cg, err := NewFromProcessCgroupFile(p)
+		require.NoError(t, err)
+		assert.Equal(t, "", cg.Id)
+		assert.Equal(t, ContainerTypeStandaloneProcess, cg.ContainerType)
+	})
+
+	t.Run("lxc payload without sub path", func(t *testing.T) {
+		p := cgroupTestWriteFile(t, dir, "lxc/cgroup", "0::/lxc.payload.c1\n")
+		cg, err := NewFromProcessCgroupFile(p)
+		require.NoError(t, err)
+		assert.Equal(t, "/lxc.payload.c1", cg.Id)
+		assert.Equal(t, "/lxc/c1", cg.ContainerId)
+		assert.Equal(t, ContainerTypeLxc, cg.ContainerType)
+	})
+
+	t.Run("lxc payload v1 nested controllers collapse", func(t *testing.T) {
+		p := cgroupTestWriteFile(t, dir, "lxc1/cgroup",
+			"4:cpu,cpuacct:/lxc.payload.c2/init.scope\n6:memory:/lxc.payload.c2/system.slice/a.service\n")
+		cg, err := NewFromProcessCgroupFile(p)
+		require.NoError(t, err)
+		assert.Equal(t, "/lxc.payload.c2", cg.subsystems["cpu"])
+		assert.Equal(t, "/lxc.payload.c2", cg.subsystems["memory"])
+		assert.Equal(t, "/lxc/c2", cg.ContainerId)
+	})
+
+	t.Run("unknown runtime returns error", func(t *testing.T) {
+		p := cgroupTestWriteFile(t, dir, "unknown/cgroup", "0::/foo/bar\n")
+		_, err := NewFromProcessCgroupFile(p)
+		assert.Error(t, err)
+	})
+
+	t.Run("talos init via file", func(t *testing.T) {
+		p := cgroupTestWriteFile(t, dir, "talos/cgroup", "0::/init\n")
+		cg, err := NewFromProcessCgroupFile(p)
+		require.NoError(t, err)
+		assert.Equal(t, ContainerTypeTalosRuntime, cg.ContainerType)
+		assert.Equal(t, "/talos/init", cg.ContainerId)
+	})
+}
+
+func TestCgroupCreatedAt(t *testing.T) {
+	root := t.TempDir()
+	cgroupTestSetRoots(t, root, filepath.Join(root, "unified"))
+
+	mtime := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	mk := func(rel string) {
+		p := filepath.Join(root, rel)
+		require.NoError(t, os.MkdirAll(p, 0o755))
+		require.NoError(t, os.Chtimes(p, mtime, mtime))
+	}
+	mk("unified/system.slice/a.service")
+	mk("cpu/system.slice/b.service")
+	mk("memory/system.slice/c.service")
+
+	cg := &Cgroup{subsystems: map[string]string{"": "/system.slice/a.service"}}
+	assert.True(t, mtime.Equal(cg.CreatedAt()))
+
+	cg = &Cgroup{subsystems: map[string]string{"cpu": "/system.slice/b.service"}}
+	assert.True(t, mtime.Equal(cg.CreatedAt()))
+
+	cg = &Cgroup{subsystems: map[string]string{"memory": "/system.slice/c.service"}}
+	assert.True(t, mtime.Equal(cg.CreatedAt()))
+
+	// cgroup already removed (container exited) -> zero time, no panic
+	cg = &Cgroup{subsystems: map[string]string{"": "/system.slice/gone.service"}}
+	assert.True(t, cg.CreatedAt().IsZero())
+
+	// no usable controller
+	cg = &Cgroup{subsystems: map[string]string{"pids": "/x"}}
+	assert.True(t, cg.CreatedAt().IsZero())
+}
+
+func TestContainerTypeString(t *testing.T) {
+	assert.Equal(t, "standalone", ContainerTypeStandaloneProcess.String())
+	assert.Equal(t, "docker", ContainerTypeDocker.String())
+	assert.Equal(t, "crio", ContainerTypeCrio.String())
+	assert.Equal(t, "cri-containerd", ContainerTypeContainerd.String())
+	assert.Equal(t, "lxc", ContainerTypeLxc.String())
+	assert.Equal(t, "systemd", ContainerTypeSystemdService.String())
+	assert.Equal(t, "unknown", ContainerTypeUnknown.String())
 }

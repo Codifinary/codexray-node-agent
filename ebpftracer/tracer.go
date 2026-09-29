@@ -88,7 +88,7 @@ type Tracer struct {
 	selfNetNs        netns.NsHandle
 
 	collection *ebpf.Collection
-	readers    map[string]*perf.Reader
+	readers    map[string]perfReader
 	links      []link.Link
 	uprobes    map[string]*ebpf.Program
 }
@@ -102,7 +102,7 @@ func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Trac
 		hostNetNs:        hostNetNs,
 		selfNetNs:        selfNetNs,
 
-		readers: map[string]*perf.Reader{},
+		readers: map[string]perfReader{},
 		uprobes: map[string]*ebpf.Program{},
 	}
 }
@@ -165,6 +165,22 @@ type Connection struct {
 	BytesReceived uint64
 }
 
+type perfReader interface {
+	Read() (perf.Record, error)
+	SetDeadline(time.Time)
+	Close() error
+}
+
+var (
+	traceFsPaths   = []string{"/sys/kernel/debug/tracing", "/sys/kernel/tracing"}
+	newCollection  = ebpf.NewCollectionWithOptions
+	linkTracepoint = link.Tracepoint
+	linkKprobe     = link.Kprobe
+	newPerfReader  = func(array *ebpf.Map, perCPUBuffer int, opts perf.ReaderOptions) (perfReader, error) {
+		return perf.NewReaderWithOptions(array, perCPUBuffer, opts)
+	}
+)
+
 type perfMap struct {
 	name                  string
 	perCPUBufferSizePages int
@@ -178,7 +194,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 
 	var traceFsPath string
-	for _, p := range []string{"/sys/kernel/debug/tracing", "/sys/kernel/tracing"} {
+	for _, p := range traceFsPaths {
 		if _, err := os.Stat(p); err == nil {
 			traceFsPath = p
 			break
@@ -222,7 +238,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		return fmt.Errorf("failed to load collection spec: %w", err)
 	}
 	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
-	c, err := ebpf.NewCollectionWithOptions(collectionSpec, ebpf.CollectionOptions{
+	c, err := newCollection(collectionSpec, ebpf.CollectionOptions{
 		//Programs: ebpf.ProgramOptions{LogLevel: 2, LogSize: 20 * 1024 * 1024},
 	})
 	if err != nil {
@@ -248,7 +264,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 
 	pageSize := os.Getpagesize()
 	for _, pm := range perfMaps {
-		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: 100})
+		r, err := newPerfReader(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: 100})
 		if err != nil {
 			t.Close()
 			return fmt.Errorf("failed to create ebpf reader: %w", err)
@@ -273,13 +289,13 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		switch programSpec.Type {
 		case ebpf.TracePoint:
 			parts := strings.SplitN(programSpec.AttachTo, "/", 2)
-			l, err = link.Tracepoint(parts[0], parts[1], program, nil)
+			l, err = linkTracepoint(parts[0], parts[1], program, nil)
 		case ebpf.Kprobe:
 			if strings.HasPrefix(programSpec.SectionName, "uprobe/") {
 				t.uprobes[programSpec.Name] = program
 				continue
 			}
-			l, err = link.Kprobe(programSpec.AttachTo, program, nil)
+			l, err = linkKprobe(programSpec.AttachTo, program, nil)
 			if err != nil && programSpec.SectionName == "kprobe/nf_ct_deliver_cached_events" {
 				klog.Warningln("nf_conntrack may not be in use:", err)
 				continue
@@ -374,7 +390,7 @@ type l7Event struct {
 	PayloadSize         uint64
 }
 
-func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType, readTimeout time.Duration) {
+func runEventsReader(name string, r perfReader, ch chan<- Event, typ perfMapType, readTimeout time.Duration) {
 	if readTimeout == 0 {
 		readTimeout = 100 * time.Millisecond
 	}
@@ -486,7 +502,7 @@ func isCtxExtraPaddingRequired(traceFsPath string) bool {
 	return false
 }
 
-const nfConntrackEventsParameterPath = "/proc/sys/net/netfilter/nf_conntrack_events"
+var nfConntrackEventsParameterPath = "/proc/sys/net/netfilter/nf_conntrack_events"
 
 func ensureConntrackEventsAreEnabled() error {
 	v, err := common.ReadUintFromFile(nfConntrackEventsParameterPath)

@@ -11,8 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/codifinary/codexray-node-agent/proc"
-
 	"github.com/coreos/go-systemd/v22/dbus"
 	gdbus "github.com/godbus/dbus/v5"
 
@@ -25,9 +23,13 @@ var (
 )
 
 func init() {
+	systemdInit()
+}
+
+func systemdInit() {
 	var err error
 	dbusConn, err = dbus.NewConnection(func() (*gdbus.Conn, error) {
-		c, err := gdbus.Dial("unix:path=" + proc.HostPath("/run/systemd/private"))
+		c, err := gdbus.Dial("unix:path=" + hostPath("/run/systemd/private"))
 		if err != nil {
 			return nil, err
 		}

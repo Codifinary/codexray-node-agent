@@ -13,6 +13,17 @@ import (
 	"inet.af/netaddr"
 )
 
+var (
+	setNetNs         = netns.Set
+	newNetlinkHandle = func(ns netns.NsHandle) (netlinkHandle, error) { return netlink.NewHandleAt(ns) }
+)
+
+type netlinkHandle interface {
+	LinkList() ([]netlink.Link, error)
+	AddrList(link netlink.Link, family int) ([]netlink.Addr, error)
+	Delete()
+}
+
 func GetNetNs(pid uint32) (netns.NsHandle, error) {
 	return netns.GetFromPid(int(pid))
 }
@@ -32,13 +43,13 @@ func ExecuteInNetNs(newNs, curNs netns.NsHandle, f func() error) error {
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	if err := netns.Set(newNs); err != nil {
+	if err := setNetNs(newNs); err != nil {
 		return err
 	}
 
 	errF := f()
 
-	if err := netns.Set(curNs); err != nil {
+	if err := setNetNs(curNs); err != nil {
 		return err
 	}
 
@@ -46,7 +57,7 @@ func ExecuteInNetNs(newNs, curNs netns.NsHandle, f func() error) error {
 }
 
 func GetNsIps(ns netns.NsHandle) ([]netaddr.IP, error) {
-	h, err := netlink.NewHandleAt(ns)
+	h, err := newNetlinkHandle(ns)
 	if err != nil {
 		return nil, err
 	}

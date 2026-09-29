@@ -17,7 +17,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const ibmInstanceMetadataAddress = "api.metadata.cloud.ibm.com"
+var ibmInstanceMetadataAddress = "api.metadata.cloud.ibm.com"
 
 var ibmAZSuffix = regexp.MustCompile(`-(\d+)$`)
 
@@ -37,7 +37,7 @@ type ibmMetadata struct {
 
 func getIBMToken(scheme string) (string, error) {
 	// a token must be retrieved using the host net NS because the metadata service sets IP TTL to 1 on all response packets
-	hostNetNs, err := proc.GetHostNetNs()
+	hostNetNs, err := getHostNetNs()
 	if err != nil {
 		return "", err
 	}

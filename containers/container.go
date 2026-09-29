@@ -34,6 +34,10 @@ var (
 	pingTimeout               = 300 * time.Millisecond
 	multilineCollectorTimeout = time.Second
 	gpuStatsWindow            = 15 * time.Second
+
+	hostPath   = proc.HostPath
+	getNsIps   = proc.GetNsIps
+	pingerPing = pinger.Ping
 )
 
 type ContainerID string
@@ -566,7 +570,7 @@ func (c *Container) onListenOpen(pid uint32, addr netaddr.IPPort, safe bool) {
 			return
 		}
 		defer ns.Close()
-		ips, err := proc.GetNsIps(ns)
+		ips, err := getNsIps(ns)
 		if err != nil {
 			klog.Warningln(err)
 			return
@@ -976,10 +980,10 @@ func (c *Container) getProxiedListens() map[string]map[netaddr.IPPort]struct{} {
 
 	var hostIps []netaddr.IP
 	if hasUnspecified {
-		if ns, err := proc.GetHostNetNs(); err != nil {
+		if ns, err := getHostNetNs(); err != nil {
 			klog.Warningln(err)
 		} else {
-			ips, err := proc.GetNsIps(ns)
+			ips, err := getNsIps(ns)
 			_ = ns.Close()
 			if err != nil {
 				klog.Warningln(err)
@@ -1053,7 +1057,7 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 		}
 		targets = append(targets, ip)
 	}
-	rtt, err := pinger.Ping(netNs, selfNetNs, targets, pingTimeout)
+	rtt, err := pingerPing(netNs, selfNetNs, targets, pingTimeout)
 	if err != nil {
 		klog.Warningln(err)
 		return nil
@@ -1081,7 +1085,7 @@ func (c *Container) runLogParser(logPath string) {
 		}
 		ch := make(chan logparser.LogEntry)
 		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout)
-		reader, err := logs.NewTailReader(proc.HostPath(logPath), ch)
+		reader, err := logs.NewTailReader(hostPath(logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
 			parser.Stop()
@@ -1116,7 +1120,7 @@ func (c *Container) runLogParser(logPath string) {
 		}
 		ch := make(chan logparser.LogEntry)
 		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout)
-		reader, err := logs.NewTailReader(proc.HostPath(c.metadata.logPath), ch)
+		reader, err := logs.NewTailReader(hostPath(c.metadata.logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
 			parser.Stop()

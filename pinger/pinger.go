@@ -31,7 +31,18 @@ const (
 
 var (
 	pingerID = os.Getpid() & 0xFFFF
+
+	openConnFn       = openConn
+	getTxTimestampFn = getTxTimestamp
 )
+
+type ipConn interface {
+	WriteTo(b []byte, addr net.Addr) (int, error)
+	ReadMsgIP(b, oob []byte) (n, oobn, flags int, addr *net.IPAddr, err error)
+	SetReadDeadline(t time.Time) error
+	File() (*os.File, error)
+	Close() error
+}
 
 type sentPacket struct {
 	seq         int
@@ -42,9 +53,9 @@ func Ping(ns netns.NsHandle, originNs netns.NsHandle, targets []netaddr.IP, time
 	if len(targets) < 1 {
 		return nil, nil
 	}
-	var conn *net.IPConn
+	var conn ipConn
 	err := proc.ExecuteInNetNs(ns, originNs, func() error {
-		c, err := openConn()
+		c, err := openConnFn()
 		if err != nil {
 			return err
 		}
@@ -71,7 +82,7 @@ func Ping(ns netns.NsHandle, originNs netns.NsHandle, targets []netaddr.IP, time
 			}
 			return nil, fmt.Errorf("failed to send packet to %s: %s", ip, err)
 		}
-		if pkt.txTimestamp, err = getTxTimestamp(fd); err != nil {
+		if pkt.txTimestamp, err = getTxTimestampFn(fd); err != nil {
 			if strings.HasPrefix(err.Error(), "resource temporarily unavailable") {
 				continue
 			}
@@ -120,7 +131,7 @@ func Ping(ns netns.NsHandle, originNs netns.NsHandle, targets []netaddr.IP, time
 	}
 }
 
-func send(conn *net.IPConn, seq int, ip net.Addr) error {
+func send(conn ipConn, seq int, ip net.Addr) error {
 	msg := &icmp.Message{
 		Type: ipv4.ICMPTypeEcho,
 		Body: &icmp.Echo{
@@ -164,7 +175,7 @@ func getTxTimestamp(socketFd int) (time.Time, error) {
 	return getTimestampFromOutOfBandData(oob, oobn)
 }
 
-func receive(conn *net.IPConn) (*net.IPAddr, *icmp.Echo, time.Time, error) {
+func receive(conn ipConn) (*net.IPAddr, *icmp.Echo, time.Time, error) {
 	pktBuf := make([]byte, 1024)
 	oob := make([]byte, 1024)
 	var ts time.Time
@@ -213,7 +224,7 @@ func extractEchoFromPacket(pktBuf []byte, n int) (*icmp.Echo, error) {
 	return echo, nil
 }
 
-func openConn() (*net.IPConn, error) {
+func openConn() (ipConn, error) {
 	conn, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
 		return nil, err

@@ -9,18 +9,23 @@ import (
 
 	"github.com/codifinary/codexray-node-agent/cgroup"
 	"github.com/codifinary/codexray-node-agent/logs"
-	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/codifinary/logparser"
 )
 
+type journaldSubscriber interface {
+	Subscribe(cgroup string, ch chan<- logparser.LogEntry) error
+	Unsubscribe(cgroup string)
+}
+
 var (
-	journaldReader *logs.JournaldReader
+	journaldReader    journaldSubscriber
+	newJournaldReader = logs.NewJournaldReader
 )
 
 func JournaldInit() error {
-	r, err := logs.NewJournaldReader(
-		proc.HostPath("/run/log/journal"),
-		proc.HostPath("/var/log/journal"),
+	r, err := newJournaldReader(
+		hostPath("/run/log/journal"),
+		hostPath("/var/log/journal"),
 	)
 	if err != nil {
 		return err

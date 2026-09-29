@@ -1,0 +1,39 @@
+# Git hooks for this repo. Install with: lefthook install
+#
+# pre-commit catches what is cheap to check and embarrassing to push;
+# pre-push catches what is expensive to check and dangerous to merge.
+#
+# Everything here needs CGO and the libsystemd headers (journald):
+#   sudo apt-get install -y libsystemd-dev
+# Skip a hook once with: LEFTHOOK=0 git push   (or --no-verify)
+
+pre-commit:
+  parallel: true
+  commands:
+    gofmt:
+      glob: "*.go"
+      exclude: 'internal/(prom|pyroscope-ebpf)/.*|ebpftracer/ebpf\.go'
+      run: gofmt -l {staged_files} | (! grep .)
+      fail_text: "unformatted Go files — run: gofmt -w ."
+    vet:
+      glob: "*.go"
+      run: go vet ./...
+    secrets:
+      run: gitleaks protect --staged --redact --no-banner
+      fail_text: "possible secret in the staged changes — remove it, don't just unstage"
+    generated-ebpf:
+      # ebpftracer/ebpf.go is generated: C changes must ship with a regenerated blob.
+      glob: "ebpftracer/ebpf/*"
+      run: git diff --cached --name-only | grep -q '^ebpftracer/ebpf\.go$'
+      fail_text: "BPF C changed but ebpftracer/ebpf.go was not regenerated — run: cd ebpftracer && make build"
+
+pre-push:
+  piped: true # stop at the first failure
+  commands:
+    unit:
+      run: make test-unit
+    coverage:
+      run: make cover-check
+# `make vulncheck` is deliberately NOT wired in here: the installed govulncheck
+# panics on this module ("ForEachElement called on type containing *types.TypeParam"),
+# so it would block every push. Run it by hand / in CI until that tool is fixed.

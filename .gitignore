@@ -25,3 +25,6 @@ Thumbs.db
 
 # Local investigation / scratch
 MEMORY_LEAK_INVESTIGATION.md
+
+# Coverage
+cover.out

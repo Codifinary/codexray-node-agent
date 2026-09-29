@@ -41,3 +41,36 @@ func TestCgroup_IOStat(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Nil(t, stat)
 }
+
+func TestCgroupIOStatEdgeCases(t *testing.T) {
+	root := t.TempDir()
+	cgroupTestSetRoots(t, root, root)
+
+	v2 := &Cgroup{subsystems: map[string]string{"": "/app"}}
+	assert.Nil(t, v2.IOStat(), "missing io.stat is tolerated")
+	cgroupTestWriteFile(t, root, "app/io.stat",
+		"8:0 rbytes=100 wbytes=200 rios=3 wios=4 dbytes=0 dios=0\n"+
+			"8:16 rbytes=x wbytes=5 rios=1 wios=2\n"+ // bad value skipped, rest kept
+			"8:32 rbytes=1\n"+ // too few fields
+			"253:0 rbytes=1 wbytes=2 rios noeq=1\n"+
+			"\n")
+	assert.Equal(t, map[string]IOStat{
+		"8:0":   {ReadOps: 3, WriteOps: 4, ReadBytes: 100, WrittenBytes: 200},
+		"8:16":  {ReadOps: 1, WriteOps: 2, ReadBytes: 0, WrittenBytes: 5},
+		"253:0": {ReadBytes: 1, WrittenBytes: 2},
+	}, v2.IOStat())
+
+	st, err := (&Cgroup{subsystems: map[string]string{}}).ioStatV2()
+	assert.NoError(t, err)
+	assert.Nil(t, st)
+
+	v1 := &Cgroup{subsystems: map[string]string{"blkio": "/app"}}
+	assert.Nil(t, v1.IOStat())
+	cgroupTestWriteFile(t, root, "blkio/app/blkio.throttle.io_serviced",
+		"8:0 Read 10\n8:0 Write 20\n8:0 Sync 30\n8:0 Total 30\n8:0 Read notanumber\nTotal 30\n")
+	assert.Nil(t, v1.IOStat(), "missing io_service_bytes is tolerated")
+	cgroupTestWriteFile(t, root, "blkio/app/blkio.throttle.io_service_bytes", "8:0 Read 4096\n8:0 Write 8192\n")
+	assert.Equal(t, map[string]IOStat{
+		"8:0": {ReadOps: 10, WriteOps: 20, ReadBytes: 4096, WrittenBytes: 8192},
+	}, v1.IOStat())
+}

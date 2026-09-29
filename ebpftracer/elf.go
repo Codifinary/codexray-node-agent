@@ -15,6 +15,8 @@ import (
 	"golang.org/x/arch/x86/x86asm"
 )
 
+var uprobe = (*link.Executable).Uprobe
+
 type Symbol struct {
 	s       *elf.Symbol
 	f       *ELFFile
@@ -66,7 +68,7 @@ func (s *Symbol) ReturnOffsets() ([]int, error) {
 }
 
 func (s *Symbol) AttachUprobe(exe *link.Executable, prog *ebpf.Program, pid uint32) (link.Link, error) {
-	return exe.Uprobe(s.Name(), prog, &link.UprobeOptions{Address: s.Address(), PID: int(pid)})
+	return uprobe(exe, s.Name(), prog, &link.UprobeOptions{Address: s.Address(), PID: int(pid)})
 }
 
 func (s *Symbol) AttachUretprobes(exe *link.Executable, prog *ebpf.Program, pid uint32) ([]link.Link, error) {
@@ -76,7 +78,7 @@ func (s *Symbol) AttachUretprobes(exe *link.Executable, prog *ebpf.Program, pid 
 	}
 	var links []link.Link
 	for _, offset := range returnOffsets {
-		l, err := exe.Uprobe("pthread_cond_timedwait", prog, &link.UprobeOptions{Address: s.Address(), Offset: uint64(offset), PID: int(pid)})
+		l, err := uprobe(exe, "pthread_cond_timedwait", prog, &link.UprobeOptions{Address: s.Address(), Offset: uint64(offset), PID: int(pid)})
 		if err != nil {
 			return links, err
 		}

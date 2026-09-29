@@ -7,6 +7,7 @@ package l7
 import (
 	"bytes"
 	"encoding/binary"
+	"math/rand"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -186,7 +187,7 @@ func TestParseClickHouse(t *testing.T) {
 		0x29, 0x29, 0x20, 0x41, 0x4e, 0x44, 0x20, 0x54, 0x69, 0x6d, 0x0,
 	}
 	assert.Equal(t,
-		`SELECT Timestamp, TraceId, SpanId, ParentSpanId, SpanName, ServiceName, Duration, StatusCode, StatusMessage, ResourceAttributes, SpanAttributes, Events.Timestamp, Events.Name, Events.Attributes FROM otel_traces_distributed WHERE ServiceName IN (['/codifinary/codexray-codexray', '/system.slice/k3s-agent.service', '/system.slice/k3s.service']) AND (SpanAttributes['net.peer.name'] IN (['10.42.3.84', '10.42.1.73', '10.42.0.173', '10.42.5.69']) OR (SpanAttributes['net.peer.name'], SpanAttributes['net.peer.port']) IN (('10.42.3.84', '9009'), ('10.42.3.84', '0'), ('10.42.3.84', '9000'), ('10.42.3.84', '8123'), ('10.42.1.73', '0'), ('10.42.1.73', '8123'), ('10.42.1.73', '9009'), ('10.42.1.73', '9000'), ('10.42.0.173', '0'), ('10.42.0.173', '9009'), ('10.42.0.173', '9000'), ('10.42.0.173', '8123'), ('10.42.5.69', '9000'), ('10.42.5.69', '8123'), ('10.42.5.69', '9009'), ('10.42.5.69', '0'))) AND Tim...<TRUNCATED>`,
+		`SELECT Timestamp, TraceId, SpanId, ParentSpanId, SpanName, ServiceName, Duration, StatusCode, StatusMessage, ResourceAttributes, SpanAttributes, Events.Timestamp, Events.Name, Events.Attributes FROM otel_traces_distributed WHERE ServiceName IN (['/k8s/coroot/coroot-coroot', '/system.slice/k3s-agent.service', '/system.slice/k3s.service']) AND (SpanAttributes['net.peer.name'] IN (['10.42.3.84', '10.42.1.73', '10.42.0.173', '10.42.5.69']) OR (SpanAttributes['net.peer.name'], SpanAttributes['net.peer.port']) IN (('10.42.3.84', '9009'), ('10.42.3.84', '0'), ('10.42.3.84', '9000'), ('10.42.3.84', '8123'), ('10.42.1.73', '0'), ('10.42.1.73', '8123'), ('10.42.1.73', '9009'), ('10.42.1.73', '9000'), ('10.42.0.173', '0'), ('10.42.0.173', '9009'), ('10.42.0.173', '9000'), ('10.42.0.173', '8123'), ('10.42.5.69', '9000'), ('10.42.5.69', '8123'), ('10.42.5.69', '9009'), ('10.42.5.69', '0'))) AND Tim...<TRUNCATED>`,
 		ParseClickhouse(payload),
 	)
 
@@ -250,7 +251,7 @@ func TestParseZookeeper(t *testing.T) {
 	}
 	op, arg := ParseZookeeper(payload)
 	assert.Equal(t, "multi(setData, ...)", op)
-	assert.Equal(t, "/clickhouse/tables/shard-1/codexray_3kuq8b3z/otel_traces_trace_id_ts/replicas/codexray-clickhouse-shard-1-0/min_unprocessed_insert_time", arg)
+	assert.Equal(t, "/clickhouse/tables/shard-1/coroot_3kuq8b3z/otel_traces_trace_id_ts/replicas/coroot-clickhouse-shard-1-0/min_unprocessed_insert_time", arg)
 
 	payload = []byte{
 		0x0, 0x0, 0x0, 0x53, 0x0, 0xce, 0x16, 0x90, 0x0, 0x0, 0x0, 0x4, 0x0, 0x0, 0x0, 0x46, 0x2f, 0x63, 0x6c, 0x69, 0x63,
@@ -262,7 +263,7 @@ func TestParseZookeeper(t *testing.T) {
 	op, arg = ParseZookeeper(payload)
 
 	assert.Equal(t, "getData", op)
-	assert.Equal(t, "/clickhouse/tables/shard-1/codexray_3kuq8b3z/otel_traces_trace_id_ts/log", arg)
+	assert.Equal(t, "/clickhouse/tables/shard-1/coroot_3kuq8b3z/otel_traces_trace_id_ts/log", arg)
 
 	payload = []byte{
 		0x0, 0x0, 0x0, 0x53, 0x0, 0xce, 0x16, 0x90, 0x0, 0x0, 0x0, 0x4, 0x0, 0x0, 0x0, 0x46, 0x2f, 0x63, 0x6c, 0x69, 0x63,
@@ -273,5 +274,185 @@ func TestParseZookeeper(t *testing.T) {
 	op, arg = ParseZookeeper(payload)
 
 	assert.Equal(t, "getData", op)
-	assert.Equal(t, "/clickhouse/tables/shard-1/codexray_3kuq8b3z/otel_t...<TRUNCATED>", arg)
+	assert.Equal(t, "/clickhouse/tables/shard-1/coroot_3kuq8b3z/otel_t...<TRUNCATED>", arg)
+}
+
+// l7Recover runs fn and returns the recovered panic value (nil when fn did not panic).
+func l7Recover(fn func()) (p any) {
+	defer func() { p = recover() }()
+	fn()
+	return nil
+}
+
+// l7Prefixes returns every prefix of p (including empty and p itself) as a fresh
+// slice whose capacity equals its length, so that a parser reading past len()
+// panics instead of silently reading stale bytes from a larger backing array.
+func l7Prefixes(p []byte) [][]byte {
+	res := make([][]byte, 0, len(p)+1)
+	for i := 0; i <= len(p); i++ {
+		b := make([]byte, i)
+		copy(b, p[:i])
+		res = append(res, b)
+	}
+	return res
+}
+
+// l7Garbage returns a deterministic set of hostile payloads: empty, 1 byte,
+// all-zero/all-0xff/ASCII buffers of the maximum payload size (1024) and
+// pseudo-random buffers of random length up to 1024.
+func l7Garbage() [][]byte {
+	res := [][]byte{
+		nil,
+		{},
+		{0},
+		{0xff},
+		{'*'},
+		{'\r', '\n'},
+		bytes.Repeat([]byte{0}, 1024),
+		bytes.Repeat([]byte{0xff}, 1024),
+		bytes.Repeat([]byte{0x7f}, 1024),
+		bytes.Repeat([]byte{'A'}, 1024),
+		bytes.Repeat([]byte{'A', ' '}, 512),
+		bytes.Repeat([]byte("\r\n"), 512),
+	}
+	rnd := rand.New(rand.NewSource(20260918))
+	for i := 0; i < 500; i++ {
+		b := make([]byte, rnd.Intn(1025))
+		rnd.Read(b)
+		res = append(res, b)
+	}
+	return res
+}
+
+// l7Mutations returns copies of p with a single byte replaced by 0x00, 0xff and
+// 0x80 at every position (bounded to the first 128 positions).
+func l7Mutations(p []byte) [][]byte {
+	var res [][]byte
+	for i := 0; i < len(p) && i < 128; i++ {
+		for _, v := range []byte{0x00, 0xff, 0x80} {
+			b := make([]byte, len(p))
+			copy(b, p)
+			b[i] = v
+			res = append(res, b)
+		}
+	}
+	return res
+}
+
+func TestProtocolString(t *testing.T) {
+	cases := map[Protocol]string{
+		ProtocolHTTP:         "HTTP",
+		ProtocolPostgres:     "Postgres",
+		ProtocolRedis:        "Redis",
+		ProtocolMemcached:    "Memcached",
+		ProtocolMysql:        "Mysql",
+		ProtocolMongo:        "Mongo",
+		ProtocolKafka:        "Kafka",
+		ProtocolCassandra:    "Cassandra",
+		ProtocolRabbitmq:     "Rabbitmq",
+		ProtocolNats:         "NATS",
+		ProtocolHTTP2:        "HTTP2",
+		ProtocolDubbo2:       "Dubbo2",
+		ProtocolDNS:          "DNS",
+		ProtocolClickhouse:   "ClickHouse",
+		ProtocolZookeeper:    "Zookeeper",
+		ProtocolFoundationDB: "FoundationDB",
+		0:                    "UNKNOWN:0",
+		17:                   "UNKNOWN:17",
+		255:                  "UNKNOWN:255",
+	}
+	for p, expected := range cases {
+		assert.Equal(t, expected, p.String(), "protocol %d", uint8(p))
+	}
+	// the Go enum must match the kernel-side PROTOCOL_* ids (ebpftracer/ebpf/l7/l7.c)
+	assert.EqualValues(t, 1, ProtocolHTTP)
+	assert.EqualValues(t, 11, ProtocolHTTP2)
+	assert.EqualValues(t, 13, ProtocolDNS)
+	assert.EqualValues(t, 16, ProtocolFoundationDB)
+}
+
+func TestMethodString(t *testing.T) {
+	cases := map[Method]string{
+		MethodUnknown:           "unknown",
+		MethodProduce:           "produce",
+		MethodConsume:           "consume",
+		MethodStatementPrepare:  "statement_prepare",
+		MethodStatementClose:    "statement_close",
+		MethodHttp2ClientFrames: "http2_client_frames",
+		MethodHttp2ServerFrames: "http2_server_frames",
+		7:                       "UNKNOWN:7",
+		255:                     "UNKNOWN:255",
+	}
+	for m, expected := range cases {
+		assert.Equal(t, expected, m.String(), "method %d", uint8(m))
+	}
+}
+
+func TestStatusString(t *testing.T) {
+	assert.Equal(t, "unknown", StatusUnknown.String())
+	assert.Equal(t, "ok", StatusOk.String())
+	assert.Equal(t, "failed", StatusFailed.String())
+	assert.Equal(t, "404", Status(404).String())
+	assert.Equal(t, "-1", Status(-1).String())
+}
+
+func TestStatusHttp(t *testing.T) {
+	cases := []struct {
+		s        Status
+		expected string
+	}{
+		{-1, "unknown"}, {0, "unknown"}, {99, "unknown"},
+		{100, "1xx"}, {199, "1xx"},
+		{200, "2xx"}, {204, "2xx"}, {299, "2xx"},
+		{300, "3xx"}, {399, "3xx"},
+		{400, "4xx"}, {404, "4xx"}, {499, "4xx"},
+		{500, "5xx"}, {503, "5xx"}, {599, "5xx"},
+		{600, "unknown"}, {1000, "unknown"},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.expected, c.s.Http(), "status %d", c.s)
+	}
+}
+
+func TestStatusDNS(t *testing.T) {
+	// RFC 1035 §4.1.1 RCODE values
+	cases := map[Status]string{
+		0: "ok", 1: "format_error", 2: "servfail", 3: "nxdomain", 4: "not_implemented", 5: "refused",
+		6: "", -1: "", 200: "",
+	}
+	for s, expected := range cases {
+		assert.Equal(t, expected, s.DNS(), "rcode %d", s)
+	}
+}
+
+func TestStatusZookeeper(t *testing.T) {
+	// system errors (-1..-9) and ZRECONFIGDISABLED (-123) are failures; ZOK and
+	// API-level outcomes such as ZNONODE (-101) are not
+	for s := Status(-1); s >= -9; s-- {
+		assert.Equal(t, "failed", s.Zookeeper(), "code %d", s)
+	}
+	assert.Equal(t, "failed", Status(-123).Zookeeper())
+	for _, s := range []Status{0, -10, -100, -101, -110, -122, -124, 1} {
+		assert.Equal(t, "ok", s.Zookeeper(), "code %d", s)
+	}
+}
+
+func TestStatusGRPC(t *testing.T) {
+	names := []string{
+		"OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED", "NOT_FOUND", "ALREADY_EXISTS",
+		"PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE",
+		"UNIMPLEMENTED", "INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED",
+	}
+	for i, n := range names {
+		assert.Equal(t, "grpc:"+n, Status(i).GRPC())
+	}
+	assert.Equal(t, "", Status(17).GRPC())
+	assert.Equal(t, "", Status(-1).GRPC())
+}
+
+func TestStatusError(t *testing.T) {
+	assert.True(t, StatusFailed.Error())
+	assert.False(t, StatusOk.Error())
+	assert.False(t, StatusUnknown.Error())
+	assert.False(t, Status(404).Error())
 }
