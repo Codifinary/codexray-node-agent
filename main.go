@@ -6,14 +6,22 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
+	"errors"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/containers"
+	"github.com/codifinary/codexray-node-agent/dogstatsd"
 	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/codifinary/codexray-node-agent/gpu"
 	"github.com/codifinary/codexray-node-agent/logs"
@@ -173,13 +181,150 @@ func main() {
 	profiling.Start()
 	defer profiling.Stop()
 
-	if err := prom.StartAgent(registry, machineId, systemUuid); err != nil {
+	var seriesSources []prom.SeriesSource
+	var dogStatsDPipeline *dogstatsd.Pipeline
+	var dogStatsDReceiver *dogstatsd.Receiver
+	if *flags.DogStatsDEnabled {
+		if *flags.MetricsEndpoint == nil {
+			klog.Exitln("DogStatsD requires --collector-endpoint or --metrics-endpoint")
+		}
+		timerBuckets, parseErr := dogstatsd.ParseBuckets(*flags.DogStatsDTimerBucketsMS)
+		if parseErr != nil {
+			klog.Exitln("failed to parse DogStatsD timer buckets:", parseErr)
+		}
+		histogramBuckets, parseErr := dogstatsd.ParseBuckets(*flags.DogStatsDHistogramBuckets)
+		if parseErr != nil {
+			klog.Exitln("failed to parse DogStatsD histogram buckets:", parseErr)
+		}
+		aggregator, aggregatorErr := dogstatsd.NewAggregator(dogstatsd.AggregationConfig{
+			TimerBucketsMS:        timerBuckets,
+			HistogramBuckets:      histogramBuckets,
+			MaxSetValuesPerSeries: *flags.DogStatsDSetMaxValuesPerSeries,
+			MaxBytes:              int64(*flags.DogStatsDAggregationMaxBytes),
+			GaugeTTL:              *flags.DogStatsDActiveSeriesTTL,
+		})
+		if aggregatorErr != nil {
+			klog.Exitln("failed to configure DogStatsD aggregation:", aggregatorErr)
+		}
+		customSpoolDir := *flags.DogStatsDCustomSpoolDir
+		if customSpoolDir == "" {
+			customSpoolDir = filepath.Join(*flags.WalDir, "custom-metrics-spool")
+		}
+		customSpool, spoolErr := dogstatsd.OpenCustomSpoolWithPolicy(customSpoolDir, int64(*flags.DogStatsDCustomSpoolMaxBytes), *flags.DogStatsDCustomSpoolMaxAge, int64(*flags.DogStatsDQuarantineMaxBytes))
+		if spoolErr != nil {
+			klog.Exitln("failed to configure DogStatsD custom spool:", spoolErr)
+		}
+		customSender, senderErr := dogstatsd.NewCustomSender(&http.Client{
+			Timeout:   30 * time.Second,
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: *flags.InsecureSkipVerify}},
+		}, (*flags.MetricsEndpoint).String(), common.AuthHeaders())
+		if senderErr != nil {
+			klog.Exitln("failed to configure DogStatsD custom sender:", senderErr)
+		}
+		pipeline, pipelineErr := dogstatsd.NewPipeline(dogstatsd.PipelineConfig{
+			FlushInterval:       *flags.DogStatsDFlushInterval,
+			MaxBatchBytes:       int(*flags.DogStatsDMaxBatchBytes),
+			ExternalLabels:      prom.SourceLabels(machineId, systemUuid),
+			RetryMin:            5 * time.Second,
+			RetryMax:            time.Minute,
+			SaturationThreshold: *flags.DogStatsDSaturationThreshold,
+			SaturationDuration:  *flags.DogStatsDSaturationDuration,
+			Registerer:          registerer,
+		}, aggregator, customSpool, customSender)
+		if pipelineErr != nil {
+			klog.Exitln("failed to configure DogStatsD custom pipeline:", pipelineErr)
+		}
+		pipeline.Start()
+		defer pipeline.Close()
+		dogStatsDPipeline = pipeline
+
+		receiver, receiverErr := dogstatsd.NewProduction(dogstatsd.Config{
+			ListenAddr:               *flags.DogStatsDListen,
+			MaxPacketBytes:           *flags.DogStatsDMaxPacketBytes,
+			PacketQueueSize:          *flags.DogStatsDPacketQueueSize,
+			PacketQueueMaxBytes:      int64(*flags.DogStatsDPacketQueueMaxBytes),
+			ParseWorkers:             *flags.DogStatsDParseWorkers,
+			BufferMaxEvents:          *flags.DogStatsDBufferMaxEvents,
+			BatchMaxSeries:           *flags.DogStatsDBatchMaxSeries,
+			MaxMetricNameLength:      *flags.DogStatsDMaxMetricNameLength,
+			MaxTagsPerMetric:         *flags.DogStatsDMaxTagsPerMetric,
+			MaxTagKeyLength:          *flags.DogStatsDMaxTagKeyLength,
+			MaxTagValueLength:        *flags.DogStatsDMaxTagValueLength,
+			ActiveSeriesPerMetricCap: *flags.DogStatsDActiveSeriesPerMetricCap,
+			ActiveSeriesGlobalCap:    *flags.DogStatsDActiveSeriesGlobalCap,
+			ActiveSeriesTTL:          *flags.DogStatsDActiveSeriesTTL,
+			TagKeyBlocklist:          *flags.DogStatsDTagKeyBlocklist,
+			AllowedSourceCIDRs:       *flags.DogStatsDAllowedSourceCIDRs,
+			MaxBytesPerSecond:        *flags.DogStatsDMaxBytesPerSecond,
+			MaxEventsPerSecond:       *flags.DogStatsDMaxEventsPerSecond,
+			SaturationThreshold:      *flags.DogStatsDSaturationThreshold,
+			SaturationDuration:       *flags.DogStatsDSaturationDuration,
+			ShutdownDrainTimeout:     *flags.DogStatsDShutdownDrainTimeout,
+		}, registerer, aggregator)
+		if receiverErr != nil {
+			klog.Exitln("failed to configure DogStatsD receiver:", receiverErr)
+		}
+		if receiverErr = receiver.Start(); receiverErr != nil {
+			klog.Exitln("failed to start DogStatsD receiver:", receiverErr)
+		}
+		defer receiver.Close()
+		dogStatsDReceiver = receiver
+	}
+
+	if err := prom.StartAgent(registry, machineId, systemUuid, seriesSources...); err != nil {
 		klog.Exitln(err)
 	}
 
 	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
-	klog.Infoln("listening on:", *flags.ListenAddress)
-	klog.Errorln(http.ListenAndServe(*flags.ListenAddress, nil))
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	http.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if *flags.DogStatsDEnabled && (dogStatsDReceiver == nil || !dogStatsDReceiver.Ready() || dogStatsDPipeline == nil || !dogStatsDPipeline.Healthy()) {
+			http.Error(w, "dogstatsd pipeline not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready\n"))
+	})
+	server := &http.Server{
+		Addr:              *flags.ListenAddress,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	serverErr := make(chan error, 1)
+	go func() {
+		klog.Infoln("listening on:", *flags.ListenAddress)
+		serverErr <- server.ListenAndServe()
+	}()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	select {
+	case sig := <-signals:
+		klog.Infof("received %s, starting graceful shutdown", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := server.Shutdown(ctx); err != nil {
+			klog.Warningln("HTTP shutdown did not complete cleanly:", err)
+		}
+		cancel()
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			klog.Errorln("HTTP server failed:", err)
+		}
+	}
+	if dogStatsDReceiver != nil {
+		if err := dogStatsDReceiver.Close(); err != nil {
+			klog.Warningln("DogStatsD receiver shutdown did not drain cleanly:", err)
+		}
+	}
+	if dogStatsDPipeline != nil {
+		if err := dogStatsDPipeline.Close(); err != nil {
+			klog.Warningln("DogStatsD final spool flush failed:", err)
+		}
+	}
 }
 
 func info(name, version string) prometheus.Collector {

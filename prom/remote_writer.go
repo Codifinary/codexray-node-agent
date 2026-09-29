@@ -33,9 +33,11 @@ import (
 const RemoteWriteTimeout = 30 * time.Second
 
 type Agent struct {
-	reg    *prometheus.Registry
-	url    *url.URL
-	labels map[string]string
+	reg          *prometheus.Registry
+	url          *url.URL
+	labels       map[string]string
+	sourceLabels map[string]string
+	sources      []SeriesSource
 
 	httpClient http.Client
 
@@ -43,7 +45,14 @@ type Agent struct {
 	maxSpoolSize int64
 }
 
-func StartAgent(reg *prometheus.Registry, machineId, systemUuid string) error {
+// SeriesSource supplies transient application metrics that must be committed
+// only after the combined remote-write payload is safely in the disk spool.
+type SeriesSource interface {
+	Snapshot(maxSeries int) []prompb.TimeSeries
+	Commit(count int)
+}
+
+func StartAgent(reg *prometheus.Registry, machineId, systemUuid string, sources ...SeriesSource) error {
 	if *flags.MetricsEndpoint == nil {
 		return nil
 	}
@@ -53,21 +62,18 @@ func StartAgent(reg *prometheus.Registry, machineId, systemUuid string) error {
 	up.Set(1)
 	reg.MustRegister(up)
 
-	instance := machineId
-	if s := strings.ReplaceAll(systemUuid, "-", ""); s != "" && s != machineId {
-		hash := md5.New()
-		hash.Write([]byte(machineId))
-		hash.Write([]byte(s))
-		instance = hex.EncodeToString(hash.Sum(nil))
+	sourceLabels := SourceLabels(machineId, systemUuid)
+	labels := map[string]string{
+		model.InstanceLabel: sourceLabels[model.InstanceLabel],
+		model.JobLabel:      sourceLabels[model.JobLabel],
 	}
 
 	a := &Agent{
-		reg: reg,
-		url: *flags.MetricsEndpoint,
-		labels: map[string]string{
-			model.InstanceLabel: instance,
-			model.JobLabel:      "codexray-node-agent",
-		},
+		reg:          reg,
+		url:          *flags.MetricsEndpoint,
+		labels:       labels,
+		sourceLabels: sourceLabels,
+		sources:      append([]SeriesSource(nil), sources...),
 		httpClient: http.Client{
 			Timeout: RemoteWriteTimeout,
 			Transport: &http.Transport{
@@ -90,6 +96,29 @@ func StartAgent(reg *prometheus.Registry, machineId, systemUuid string) error {
 	go a.sendLoop()
 	go a.scrapeLoop()
 	return nil
+}
+
+// SourceLabels returns the protected identity labels shared by node telemetry
+// and independently-spooled custom metrics.
+func SourceLabels(machineId, systemUuid string) map[string]string {
+	instance := machineId
+	if s := strings.ReplaceAll(systemUuid, "-", ""); s != "" && s != machineId {
+		hash := md5.New()
+		hash.Write([]byte(machineId))
+		hash.Write([]byte(s))
+		instance = hex.EncodeToString(hash.Sum(nil))
+	}
+	labels := map[string]string{
+		model.InstanceLabel: instance,
+		model.JobLabel:      "codexray-node-agent",
+	}
+	if machineId != "" {
+		labels["machine_id"] = machineId
+	}
+	if systemUuid != "" {
+		labels["system_uuid"] = systemUuid
+	}
+	return labels
 }
 
 func (a *Agent) scrapeLoop() {
@@ -176,14 +205,62 @@ func (a *Agent) scrape() error {
 		mfsByName[mf.GetName()] = mf
 	}
 	wr := buildWriteRequest(mfs, timestamp, a.labels)
+	type sourceSnapshot struct {
+		source SeriesSource
+		count  int
+	}
+	snapshots := make([]sourceSnapshot, 0, len(a.sources))
+	for _, source := range a.sources {
+		if source == nil {
+			continue
+		}
+		series := source.Snapshot(0)
+		if len(series) == 0 {
+			continue
+		}
+		for i := range series {
+			wr.Timeseries = append(wr.Timeseries, withExternalLabels(series[i], a.sourceLabels))
+		}
+		snapshots = append(snapshots, sourceSnapshot{source: source, count: len(series)})
+	}
 	decompressed, err := wr.Marshal()
 	if err != nil {
 		return err
 	}
 
 	compressed := snappy.Encode(nil, decompressed)
-	err = a.writeToSpool(timestamp, compressed)
-	return err
+	if err = a.writeToSpool(timestamp, compressed); err != nil {
+		return err
+	}
+	for _, snapshot := range snapshots {
+		snapshot.source.Commit(snapshot.count)
+	}
+	return nil
+}
+
+func withExternalLabels(series prompb.TimeSeries, agentLabels map[string]string) prompb.TimeSeries {
+	labels := make(map[string]string, len(series.Labels)+len(agentLabels))
+	for _, label := range series.Labels {
+		labels[label.Name] = label.Value
+	}
+	// Agent identity always wins over application-provided labels.
+	for name, value := range agentLabels {
+		labels[name] = value
+	}
+
+	names := make([]string, 0, len(labels))
+	for name := range labels {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	result := prompb.TimeSeries{
+		Labels:  make([]prompb.Label, 0, len(names)),
+		Samples: append([]prompb.Sample(nil), series.Samples...),
+	}
+	for _, name := range names {
+		result.Labels = append(result.Labels, prompb.Label{Name: name, Value: labels[name]})
+	}
+	return result
 }
 
 func (a *Agent) writeToSpool(timestamp int64, payload []byte) error {

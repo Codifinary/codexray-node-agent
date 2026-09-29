@@ -841,3 +841,127 @@ func TestStartAgentWalDirErrors(t *testing.T) {
 		assert.True(t, os.IsNotExist(statErr))
 	})
 }
+
+// --- SeriesSource plumbing (merged from main: custom StatsD metrics ride along
+// with the node scrape, and must not be able to impersonate the agent) ---
+
+// remoteWriterSource is a SeriesSource whose Snapshot/Commit calls are recorded.
+type remoteWriterSource struct {
+	series    []prompb.TimeSeries
+	snapshots int
+	committed []int
+}
+
+func (s *remoteWriterSource) Snapshot(int) []prompb.TimeSeries {
+	s.snapshots++
+	return s.series
+}
+
+func (s *remoteWriterSource) Commit(count int) { s.committed = append(s.committed, count) }
+
+func remoteWriterSeries(kv ...string) prompb.TimeSeries {
+	ts := prompb.TimeSeries{Samples: []prompb.Sample{{Value: 1, Timestamp: 7}}}
+	for i := 0; i+1 < len(kv); i += 2 {
+		ts.Labels = append(ts.Labels, prompb.Label{Name: kv[i], Value: kv[i+1]})
+	}
+	return ts
+}
+
+func TestSourceLabels(t *testing.T) {
+	// machine id only: it is the instance, and there is no system_uuid label.
+	ls := SourceLabels("machine-1", "")
+	assert.Equal(t, "machine-1", ls["instance"])
+	assert.Equal(t, "codexray-node-agent", ls["job"])
+	assert.Equal(t, "machine-1", ls["machine_id"])
+	assert.NotContains(t, ls, "system_uuid")
+
+	// a differing system uuid makes the instance a hash of both, so two nodes
+	// that share a machine id still land on distinct series.
+	ls = SourceLabels("machine-1", "AAAA-BBBB")
+	assert.NotEqual(t, "machine-1", ls["instance"])
+	assert.Len(t, ls["instance"], 32, "md5 hex")
+	assert.Equal(t, "machine-1", ls["machine_id"])
+	assert.Equal(t, "AAAA-BBBB", ls["system_uuid"])
+
+	// a uuid equal to the machine id (once dashes are stripped) is not hashed.
+	assert.Equal(t, "machine1", SourceLabels("machine1", "mach-ine1")["instance"])
+
+	// nothing known: no identity labels beyond the job.
+	ls = SourceLabels("", "")
+	assert.Equal(t, "codexray-node-agent", ls["job"])
+	assert.NotContains(t, ls, "machine_id")
+}
+
+func TestWithExternalLabelsAgentIdentityWins(t *testing.T) {
+	agent := map[string]string{"instance": "real", "job": "codexray-node-agent", "machine_id": "m1"}
+	// an application sending StatsD can put anything in its tags, including the
+	// agent's own identity labels - those must not be able to spoof a node.
+	got := withExternalLabels(remoteWriterSeries(
+		"__name__", "app_requests_total", "instance", "spoofed", "job", "evil", "env", "prod",
+	), agent)
+
+	ls := remoteWriterLabelsMap(got.Labels)
+	assert.Equal(t, "real", ls["instance"])
+	assert.Equal(t, "codexray-node-agent", ls["job"])
+	assert.Equal(t, "m1", ls["machine_id"])
+	assert.Equal(t, "prod", ls["env"], "application labels that don't clash are kept")
+	assert.Equal(t, "app_requests_total", ls["__name__"])
+
+	names := make([]string, 0, len(got.Labels))
+	for _, l := range got.Labels {
+		names = append(names, l.Name)
+	}
+	assert.IsIncreasing(t, names, "remote write requires sorted label names")
+	assert.Equal(t, []prompb.Sample{{Value: 1, Timestamp: 7}}, got.Samples)
+}
+
+func TestScrapeAppendsSourceSeriesAndCommitsOncePerSource(t *testing.T) {
+	a := remoteWriterNewAgent(t, "http://example.invalid/write", 0)
+	a.sourceLabels = SourceLabels("machine-1", "")
+	s1 := &remoteWriterSource{series: []prompb.TimeSeries{
+		remoteWriterSeries("__name__", "app_a", "instance", "spoofed"),
+	}}
+	s2 := &remoteWriterSource{series: []prompb.TimeSeries{
+		remoteWriterSeries("__name__", "app_b"), remoteWriterSeries("__name__", "app_c"),
+	}}
+	empty := &remoteWriterSource{}
+	a.sources = []SeriesSource{s1, nil, empty, s2}
+
+	require.NoError(t, a.scrape())
+
+	assert.Equal(t, []int{1}, s1.committed)
+	assert.Equal(t, []int{2}, s2.committed)
+	assert.Empty(t, empty.committed, "a source with nothing to send is never committed")
+	assert.Equal(t, 1, empty.snapshots)
+
+	files, err := a.listSpoolFiles()
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	raw, err := os.ReadFile(files[0])
+	require.NoError(t, err)
+	decoded, err := snappy.Decode(nil, raw)
+	require.NoError(t, err)
+	var wr prompb.WriteRequest
+	require.NoError(t, wr.Unmarshal(decoded))
+
+	byName := map[string]map[string]string{}
+	for _, ts := range wr.Timeseries {
+		ls := remoteWriterLabelsMap(ts.Labels)
+		byName[ls["__name__"]] = ls
+	}
+	for _, n := range []string{"app_a", "app_b", "app_c"} {
+		require.Contains(t, byName, n, "source series reached the spool")
+		assert.Equal(t, "machine-1", byName[n]["instance"], "%s carries the agent identity", n)
+		assert.Equal(t, "codexray-node-agent", byName[n]["job"])
+	}
+}
+
+func TestScrapeGatherErrorDoesNotCommitSources(t *testing.T) {
+	a := remoteWriterNewAgent(t, "http://example.invalid/write", 0)
+	a.reg.MustRegister(remoteWriterFailingCollector{})
+	s := &remoteWriterSource{series: []prompb.TimeSeries{remoteWriterSeries("__name__", "app_a")}}
+	a.sources = []SeriesSource{s}
+
+	assert.Error(t, a.scrape())
+	assert.Empty(t, s.committed, "nothing was spooled, so nothing may be committed")
+}
