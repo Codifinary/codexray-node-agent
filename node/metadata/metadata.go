@@ -11,10 +11,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codifinary/codexray-node-agent/proc"
 	"k8s.io/klog/v2"
 )
 
 const metadataServiceTimeout = 5 * time.Second
+
+var (
+	sysfsRoot    = "/sys"
+	getHostNetNs = proc.GetHostNetNs
+)
 
 type CloudProvider string
 
@@ -45,12 +51,12 @@ type CloudMetadata struct {
 }
 
 func getCloudProvider() CloudProvider {
-	if d, err := os.ReadFile("/sys/hypervisor/uuid"); err == nil { // AWS Xen instances
+	if d, err := os.ReadFile(sysfsRoot + "/hypervisor/uuid"); err == nil { // AWS Xen instances
 		if strings.HasPrefix(strings.ToLower(string(d)), "ec2") {
 			return CloudProviderAWS
 		}
 	}
-	if vendor, err := os.ReadFile("/sys/class/dmi/id/board_vendor"); err == nil {
+	if vendor, err := os.ReadFile(sysfsRoot + "/class/dmi/id/board_vendor"); err == nil {
 		switch strings.TrimSpace(string(vendor)) {
 		case "Amazon EC2":
 			return CloudProviderAWS
@@ -62,7 +68,7 @@ func getCloudProvider() CloudProvider {
 			return CloudProviderDigitalOcean
 		}
 	}
-	if vendor, err := os.ReadFile("/sys/class/dmi/id/sys_vendor"); err == nil {
+	if vendor, err := os.ReadFile(sysfsRoot + "/class/dmi/id/sys_vendor"); err == nil {
 		switch strings.TrimSpace(string(vendor)) {
 		case "Hetzner":
 			return CloudProviderHetzner
@@ -72,12 +78,12 @@ func getCloudProvider() CloudProvider {
 			return CloudProviderScaleway
 		}
 	}
-	if vendor, err := os.ReadFile("/sys/class/dmi/id/chassis_vendor"); err == nil {
+	if vendor, err := os.ReadFile(sysfsRoot + "/class/dmi/id/chassis_vendor"); err == nil {
 		if strings.HasPrefix(string(vendor), "IBM:Cloud Compute Server") {
 			return CloudProviderIBM
 		}
 	}
-	if vendor, err := os.ReadFile("/sys/class/dmi/id/chassis_asset_tag"); err == nil {
+	if vendor, err := os.ReadFile(sysfsRoot + "/class/dmi/id/chassis_asset_tag"); err == nil {
 		if strings.TrimSpace(string(vendor)) == "OracleCloud.com" {
 			return CloudProviderOracle
 		}

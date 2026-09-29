@@ -46,8 +46,20 @@ func ipTupleValid(t *conntrack.IPTuple) bool {
 	return true
 }
 
+type conntrackDumper interface {
+	Dump(conntrack.Table, conntrack.Family) ([]conntrack.Con, error)
+	Close() error
+}
+
+var (
+	openConntrack = func(config *conntrack.Config) (conntrackDumper, error) {
+		return conntrack.Open(config)
+	}
+	updateMap = (*ebpf.Map).Update
+)
+
 func getConntrack(netNs netns.NsHandle) (map[connId]netaddr.IPPort, error) {
-	c, err := conntrack.Open(&conntrack.Config{NetNS: int(netNs)})
+	c, err := openConntrack(&conntrack.Config{NetNS: int(netNs)})
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +192,7 @@ func (t *Tracer) init(ch chan<- Event) error {
 		if typ == EventTypeConnectionOpen {
 			id := ConnectionId{FD: s.fd, PID: s.pid}
 			conn := Connection{Timestamp: timestamp}
-			if err := ebpfConnectionsMap.Update(id, conn, ebpf.UpdateNoExist); err != nil {
+			if err := updateMap(ebpfConnectionsMap, id, conn, ebpf.UpdateNoExist); err != nil {
 				klog.Warningln(err)
 			}
 		}

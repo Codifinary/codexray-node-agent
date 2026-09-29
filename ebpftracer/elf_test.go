@@ -8,11 +8,15 @@ import (
 	"bytes"
 	"debug/elf"
 	"encoding/binary"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -303,4 +307,222 @@ func TestELFFileOnTestBinary(t *testing.T) {
 	for _, o := range offs {
 		assert.Less(t, o, int(s.s.Size))
 	}
+}
+
+// elfTestLib writes an x86-64 shared object exporting the given functions and returns
+// the uprobe address (file offset) of each of them.
+func elfTestLib(t *testing.T, path string, funcs map[string][]byte) map[string]uint64 {
+	t.Helper()
+	var names []string
+	for name := range funcs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var text []byte
+	var syms []elfTestSym
+	offs := map[string]uint64{}
+	for _, name := range names {
+		offs[name] = uint64(len(text))
+		syms = append(syms, elfTestSym{name: name, info: elf.ST_INFO(elf.STB_GLOBAL, elf.STT_FUNC), value: elfTestTextVaddr + uint64(len(text)), size: uint64(len(funcs[name]))})
+		text = append(text, funcs[name]...)
+	}
+	textOff := elfTestBuild(t, path, elfTestSpec{machine: elf.EM_X86_64, text: text, symbols: syms})
+	for name := range offs {
+		offs[name] += textOff
+	}
+	return offs
+}
+
+// elfTestFuncs returns funcs that all have the two RETs of elfTestX86FuncB (return offsets 1 and 3).
+func elfTestFuncs(names ...string) map[string][]byte {
+	res := map[string][]byte{}
+	for _, n := range names {
+		res[n] = elfTestX86FuncB
+	}
+	return res
+}
+
+type elfTestLink struct {
+	link.Link
+	closed int
+}
+
+func (l *elfTestLink) Close() error {
+	l.closed++
+	return nil
+}
+
+type elfTestUprobeCall struct {
+	symbol string
+	prog   *ebpf.Program
+	opts   link.UprobeOptions
+	link   *elfTestLink
+}
+
+type elfTestUprobes struct {
+	calls []*elfTestUprobeCall
+	fail  func(n int, c *elfTestUprobeCall) error
+}
+
+// elfTestFakeUprobes replaces the uprobe attach call; fail (optional) is given the 1-based call number.
+func elfTestFakeUprobes(t *testing.T, fail func(n int, c *elfTestUprobeCall) error) *elfTestUprobes {
+	f := &elfTestUprobes{fail: fail}
+	prev := uprobe
+	t.Cleanup(func() { uprobe = prev })
+	uprobe = func(ex *link.Executable, symbol string, prog *ebpf.Program, opts *link.UprobeOptions) (link.Link, error) {
+		require.NotNil(t, ex)
+		c := &elfTestUprobeCall{symbol: symbol, prog: prog, opts: *opts}
+		f.calls = append(f.calls, c)
+		if f.fail != nil {
+			if err := f.fail(len(f.calls), c); err != nil {
+				return nil, err
+			}
+		}
+		c.link = &elfTestLink{}
+		return c.link, nil
+	}
+	return f
+}
+
+func elfTestFailAt(n int, err error) func(int, *elfTestUprobeCall) error {
+	return func(i int, _ *elfTestUprobeCall) error {
+		if i == n {
+			return err
+		}
+		return nil
+	}
+}
+
+func (f *elfTestUprobes) links() []link.Link {
+	var res []link.Link
+	for _, c := range f.calls {
+		if c.link != nil {
+			res = append(res, c.link)
+		}
+	}
+	return res
+}
+
+func (f *elfTestUprobes) closed() []bool {
+	var res []bool
+	for _, c := range f.calls {
+		if c.link != nil {
+			res = append(res, c.link.closed > 0)
+		}
+	}
+	return res
+}
+
+// elfTestProbe describes an expected attachment: prog name, uprobe address and return offset.
+type elfTestProbe struct {
+	prog   string
+	addr   uint64
+	offset uint64
+}
+
+func (f *elfTestUprobes) probes(progs map[*ebpf.Program]string) []elfTestProbe {
+	var res []elfTestProbe
+	for _, c := range f.calls {
+		res = append(res, elfTestProbe{prog: progs[c.prog], addr: c.opts.Address, offset: c.opts.Offset})
+	}
+	return res
+}
+
+// elfTestProgs registers distinct (never loaded) programs as the tracer's uprobes and
+// returns a reverse lookup for asserting which program got attached.
+func elfTestProgs(tr *Tracer, names ...string) map[*ebpf.Program]string {
+	res := map[*ebpf.Program]string{}
+	for _, n := range names {
+		p := &ebpf.Program{}
+		tr.uprobes[n] = p
+		res[p] = n
+	}
+	return res
+}
+
+func elfTestOpen(t *testing.T, path, symbol string) (*link.Executable, *Symbol) {
+	exe, err := link.OpenExecutable(path)
+	require.NoError(t, err)
+	f, err := OpenELFFile(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = f.Close() })
+	s, err := f.GetSymbol(symbol)
+	require.NoError(t, err)
+	return exe, s
+}
+
+func TestSymbolAttachUprobe(t *testing.T) {
+	path, textOff := elfTestFixture(t)
+	exe, a := elfTestOpen(t, path, "func_a")
+	prog := &ebpf.Program{}
+
+	f := elfTestFakeUprobes(t, nil)
+	l, err := a.AttachUprobe(exe, prog, 42)
+	require.NoError(t, err)
+	require.Len(t, f.calls, 1)
+	assert.Same(t, f.calls[0].link, l)
+	assert.Equal(t, "func_a", f.calls[0].symbol)
+	assert.Same(t, prog, f.calls[0].prog)
+	assert.Equal(t, link.UprobeOptions{Address: textOff, PID: 42}, f.calls[0].opts)
+
+	f = elfTestFakeUprobes(t, elfTestFailAt(1, errors.New("boom")))
+	l, err = a.AttachUprobe(exe, prog, 42)
+	assert.EqualError(t, err, "boom")
+	assert.Nil(t, l)
+}
+
+func TestSymbolAttachUretprobes(t *testing.T) {
+	path, textOff := elfTestFixture(t)
+	exe, b := elfTestOpen(t, path, "func_b")
+	prog := &ebpf.Program{}
+	bAddr := textOff + uint64(len(elfTestX86FuncA))
+
+	t.Run("a probe at every return offset", func(t *testing.T) {
+		f := elfTestFakeUprobes(t, nil)
+		links, err := b.AttachUretprobes(exe, prog, 7)
+		require.NoError(t, err)
+		assert.Equal(t, f.links(), links)
+		require.Len(t, f.calls, 2)
+		for i, off := range []uint64{1, 3} {
+			assert.Same(t, prog, f.calls[i].prog)
+			assert.Equal(t, link.UprobeOptions{Address: bAddr, Offset: off, PID: 7}, f.calls[i].opts)
+		}
+	})
+
+	t.Run("partial failure returns the links attached so far", func(t *testing.T) {
+		f := elfTestFakeUprobes(t, elfTestFailAt(2, errors.New("boom")))
+		links, err := b.AttachUretprobes(exe, prog, 7)
+		assert.EqualError(t, err, "boom")
+		require.Len(t, links, 1)
+		assert.Same(t, f.calls[0].link, links[0])
+		assert.Equal(t, []bool{false}, f.closed(), "closing is up to the caller")
+	})
+
+	t.Run("no return offsets", func(t *testing.T) {
+		noRet := filepath.Join(t.TempDir(), "noret.so")
+		elfTestLib(t, noRet, map[string][]byte{"f": {0x90, 0x90}})
+		exe, s := elfTestOpen(t, noRet, "f")
+		f := elfTestFakeUprobes(t, nil)
+		links, err := s.AttachUretprobes(exe, prog, 7)
+		assert.EqualError(t, err, "no offsets found")
+		assert.Nil(t, links)
+		assert.Empty(t, f.calls)
+	})
+}
+
+func TestSymbolReturnOffsetsReadErrors(t *testing.T) {
+	path, _ := elfTestFixture(t)
+	f, err := OpenELFFile(path)
+	require.NoError(t, err)
+	defer f.Close()
+
+	// a symbol below .text: the start offset wraps around and seeking fails
+	s := &Symbol{s: &elf.Symbol{Name: "below", Value: elfTestTextVaddr - 1, Size: 1}, f: f}
+	_, err = s.ReturnOffsets()
+	assert.Error(t, err)
+
+	// a symbol past the end of .text: nothing to read
+	s = &Symbol{s: &elf.Symbol{Name: "past", Value: elfTestTextVaddr + 0x1000, Size: 1}, f: f}
+	_, err = s.ReturnOffsets()
+	assert.ErrorIs(t, err, io.EOF)
 }

@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -398,4 +399,432 @@ func TestDotNetMonitorConnectBrokenServer(t *testing.T) {
 	m.lastUpdate = time.Now()
 	mfs := dotnetTestGather(t, m)
 	assert.Equal(t, 1.0, metricsTestOne(t, mfs, "container_dotnet_info", map[string]string{"runtime_version": "unknown"}).GetGauge().GetValue())
+}
+
+// ---- a fake .NET runtime diagnostic server (Diagnostics IPC protocol + NetTrace) ----
+
+// dotnetTestNettrace encodes a NetTrace (EventPipe) stream the way the runtime does:
+// FastSerialization objects, 4-byte aligned blocks, compressed blob headers.
+type dotnetTestNettrace struct{ bytes.Buffer }
+
+func dotnetTestNewNettrace() *dotnetTestNettrace {
+	n := &dotnetTestNettrace{}
+	n.WriteString("Nettrace")
+	n.le(int32(len("!FastSerialization.1")))
+	n.WriteString("!FastSerialization.1")
+	n.objectHeader("Trace")
+	n.Write(make([]byte, 48)) // clock/process info: unused by the agent
+	n.WriteByte(6)            // EndObject
+	return n
+}
+
+func (n *dotnetTestNettrace) le(v interface{}) { _ = binary.Write(&n.Buffer, binary.LittleEndian, v) }
+
+func (n *dotnetTestNettrace) objectHeader(typ string) {
+	n.Write([]byte{5, 5, 1}) // BeginPrivateObject, BeginPrivateObject, NullReference
+	n.le(int32(4))           // version
+	n.le(int32(4))           // minimum reader version
+	n.le(int32(len(typ)))
+	n.WriteString(typ)
+	n.WriteByte(6) // EndObject (type)
+}
+
+func (n *dotnetTestNettrace) block(typ string, payload []byte) *dotnetTestNettrace {
+	n.objectHeader(typ)
+	n.le(int32(len(payload)))
+	if pad := n.Len() % 4; pad != 0 {
+		n.Write(make([]byte, 4-pad))
+	}
+	n.Write(payload)
+	n.WriteByte(6)
+	return n
+}
+
+// blobs wraps blobs into a Metadata/Event block with compressed headers.
+func (n *dotnetTestNettrace) blobs(typ string, blobs ...[]byte) *dotnetTestNettrace {
+	var b bytes.Buffer
+	for _, v := range []interface{}{int16(20), int16(1), int64(0), int64(0)} { // header size, flags=compressed, min/max ts
+		_ = binary.Write(&b, binary.LittleEndian, v)
+	}
+	for _, blob := range blobs {
+		b.Write(blob)
+	}
+	return n.block(typ, b.Bytes())
+}
+
+func dotnetTestBlob(metadataID int32, payload []byte) []byte {
+	b := []byte{1 | 1<<7} // flags: MetadataID, PayloadSize
+	b = binary.AppendUvarint(b, uint64(metadataID))
+	b = binary.AppendUvarint(b, 0) // timestamp delta
+	b = binary.AppendUvarint(b, uint64(len(payload)))
+	return append(b, payload...)
+}
+
+func dotnetTestMetadata(id int32, provider string, fields ...nettrace.MetadataField) []byte {
+	p := (&dotnetTestPayload{}).i32(id).str(provider).i32(1).str("EventCounters")
+	_ = binary.Write(&p.Buffer, binary.LittleEndian, int64(0)) // keywords
+	p.i32(3).i32(5)                                            // version (NetTrace), level
+	dotnetTestFields(p, fields)
+	return dotnetTestBlob(0, p.Bytes())
+}
+
+func dotnetTestFields(p *dotnetTestPayload, fields []nettrace.MetadataField) {
+	p.i32(int32(len(fields)))
+	for _, f := range fields {
+		p.i32(int32(f.TypeCode))
+		if f.TypeCode == typecode.Object {
+			dotnetTestFields(p, f.Payload.Fields)
+		}
+		p.str(f.Name)
+	}
+}
+
+const (
+	dotnetTestMeanMD  = 1 // System.Runtime mean counter
+	dotnetTestSumMD   = 2 // System.Runtime sum (rate) counter
+	dotnetTestOtherMD = 3 // another provider
+)
+
+func dotnetTestCounterMetadata() []byte {
+	var b bytes.Buffer
+	b.Write(dotnetTestMetadata(dotnetTestMeanMD, "System.Runtime", dotnetTestField("Payload", typecode.Object,
+		dotnetTestField("Name", typecode.String),
+		dotnetTestField("DisplayName", typecode.String),
+		dotnetTestField("Mean", typecode.Double),
+		dotnetTestField("Count", typecode.Int32),
+		dotnetTestField("IntervalSec", typecode.Single),
+		dotnetTestField("CounterType", typecode.String),
+		dotnetTestField("DisplayUnits", typecode.String),
+	)))
+	b.Write(dotnetTestMetadata(dotnetTestSumMD, "System.Runtime", dotnetTestField("Payload", typecode.Object,
+		dotnetTestField("Name", typecode.String),
+		dotnetTestField("Increment", typecode.Double),
+		dotnetTestField("CounterType", typecode.String),
+		dotnetTestField("DisplayUnits", typecode.String),
+	)))
+	b.Write(dotnetTestMetadata(dotnetTestOtherMD, "Microsoft-Windows-DotNETRuntime", dotnetTestField("Count", typecode.Int32)))
+	return b.Bytes()
+}
+
+func dotnetTestMean(name string, v float64, units string) []byte {
+	return dotnetTestBlob(dotnetTestMeanMD, (&dotnetTestPayload{}).str(name).str(name).f64(v).i32(1).f32(5).str("Mean").str(units).Bytes())
+}
+
+func dotnetTestSum(name string, v float64, units string) []byte {
+	return dotnetTestBlob(dotnetTestSumMD, (&dotnetTestPayload{}).str(name).f64(v).str("Sum").str(units).Bytes())
+}
+
+var dotnetTestIpcMagic = [14]byte{'D', 'O', 'T', 'N', 'E', 'T', '_', 'I', 'P', 'C', '_', 'V', '1', 0}
+
+type dotnetTestIpcHeader struct {
+	Magic      [14]byte
+	Size       uint16
+	CommandSet uint8
+	CommandID  uint8
+	Reserved   uint16
+}
+
+// dotnetTestServer is a fake runtime listening on its diagnostic socket.
+type dotnetTestServer struct {
+	processInfoFails bool
+	collectFailures  int32  // number of CollectTracing requests to reject before accepting
+	stream           []byte // NetTrace bytes sent right after a session is created
+	tail             []byte // sent once release is closed
+	release          chan struct{}
+	endOfStream      bool // close the session right after the stream (runtime shutdown)
+
+	lock          sync.Mutex
+	collects      int32
+	collectBodies [][]byte
+	stopped       []uint64
+}
+
+const dotnetTestSessionID = uint64(0x5e55)
+
+// dotnetTestServe starts the server at /tmp/dotnet-diagnostic-<nspid>-<key>-socket for
+// the test process itself (connect looks the socket up via /proc/<pid>/root/tmp).
+func dotnetTestServe(t *testing.T, s *dotnetTestServer) uint32 {
+	t.Helper()
+	pid := uint32(os.Getpid())
+	nsPid, err := proc.GetNsPid(pid)
+	require.NoError(t, err)
+	if existing, _ := filepath.Glob(fmt.Sprintf("/tmp/dotnet-diagnostic-%d-*-socket", nsPid)); len(existing) > 0 {
+		t.Skipf("host already has diagnostic sockets for pid %d", nsPid)
+	}
+	sock := fmt.Sprintf("/tmp/dotnet-diagnostic-%d-%d-socket", nsPid, time.Now().UnixNano())
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Skipf("cannot listen on %s: %s", sock, err)
+	}
+	if s.release == nil {
+		s.release = make(chan struct{})
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		close(done)
+		_ = l.Close()
+		_ = os.Remove(sock)
+		wg.Wait()
+	})
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer c.Close()
+				go func() { <-done; _ = c.Close() }()
+				s.handle(c, done)
+			}()
+		}
+	}()
+	return pid
+}
+
+func (s *dotnetTestServer) respond(c net.Conn, ok bool, body ...interface{}) {
+	h := dotnetTestIpcHeader{Magic: dotnetTestIpcMagic, CommandSet: 0xFF}
+	if !ok {
+		h.CommandID = 0xFF
+		body = []interface{}{uint32(0x80131384)} // E_NOTSUPPORTED-like HRESULT
+	}
+	var b bytes.Buffer
+	_ = binary.Write(&b, binary.LittleEndian, h)
+	for _, v := range body {
+		if s, ok := v.(string); ok {
+			u := append(utf16.Encode([]rune(s)), 0)
+			_ = binary.Write(&b, binary.LittleEndian, uint32(len(u)))
+			_ = binary.Write(&b, binary.LittleEndian, u)
+			continue
+		}
+		_ = binary.Write(&b, binary.LittleEndian, v)
+	}
+	_, _ = c.Write(b.Bytes())
+}
+
+func (s *dotnetTestServer) handle(c net.Conn, done chan struct{}) {
+	var h dotnetTestIpcHeader
+	if err := binary.Read(c, binary.LittleEndian, &h); err != nil || h.Magic != dotnetTestIpcMagic || h.Size < 20 {
+		return
+	}
+	body := make([]byte, h.Size-20)
+	if _, err := io.ReadFull(c, body); err != nil {
+		return
+	}
+	switch {
+	case h.CommandSet == 4 && h.CommandID == 4: // Process/ProcessInfo2
+		s.respond(c, !s.processInfoFails, uint64(1), [16]byte{}, "dotnet Shop.dll", "Linux", "x64", "Shop", "8.0.1+abc")
+	case h.CommandSet == 2 && h.CommandID == 2: // EventPipe/CollectTracing
+		s.lock.Lock()
+		s.collects++
+		n := s.collects
+		s.collectBodies = append(s.collectBodies, body)
+		s.lock.Unlock()
+		if n <= s.collectFailures {
+			s.respond(c, false)
+			return
+		}
+		s.respond(c, true, dotnetTestSessionID)
+		_, _ = c.Write(s.stream)
+		if s.endOfStream {
+			return
+		}
+		select {
+		case <-s.release:
+			_, _ = c.Write(s.tail)
+		case <-done:
+			return
+		}
+		_, _ = io.Copy(io.Discard, c) // until the client closes the session
+	case h.CommandSet == 2 && h.CommandID == 1: // EventPipe/StopTracing
+		id := binary.LittleEndian.Uint64(body)
+		s.lock.Lock()
+		s.stopped = append(s.stopped, id)
+		s.lock.Unlock()
+		s.respond(c, true, id)
+	}
+}
+
+func (s *dotnetTestServer) stoppedSessions() []uint64 {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return append([]uint64{}, s.stopped...)
+}
+
+func dotnetTestCounterStream() *dotnetTestNettrace {
+	return dotnetTestNewNettrace().
+		blobs("MetadataBlock", dotnetTestCounterMetadata()).
+		blobs("EventBlock",
+			dotnetTestMean("threadpool-thread-count", 12, ""),
+			dotnetTestMean("gen-0-size", 2, "MB"),
+			dotnetTestBlob(dotnetTestOtherMD, (&dotnetTestPayload{}).i32(7).Bytes()), // not System.Runtime: ignored
+			dotnetTestSum("alloc-rate", 3, "MB"),
+		)
+}
+
+// dotnetTestCounterValue reads a counter concurrently with the stream goroutine.
+func dotnetTestCounterValue(c prometheus.Counter) float64 {
+	var m dto.Metric
+	_ = c.Write(&m)
+	return m.GetCounter().GetValue()
+}
+
+func dotnetTestUtf16(s string) []byte {
+	return (&dotnetTestPayload{}).str(s).Bytes()[:2*len(s)]
+}
+
+func TestDotNetMonitorConnectStreamsCounters(t *testing.T) {
+	srv := &dotnetTestServer{}
+	full := dotnetTestCounterStream()
+	srv.stream = append([]byte{}, full.Bytes()...)
+	// an (unhandled) sequence point block wakes the blocked reader up after cancellation
+	srv.tail = full.block("SPBlock", make([]byte, 12)).Bytes()[len(srv.stream):]
+	m := dotnetTestMonitor(t, "Shop")
+	m.pid = dotnetTestServe(t, srv)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- m.connect(ctx) }()
+
+	// events are handled in order: the last one being applied means all were
+	require.Eventually(t, func() bool { return dotnetTestCounterValue(m.memoryAllocatedBytes) > 0 }, 5*time.Second, 5*time.Millisecond)
+	cancel()
+	close(srv.release)
+	select {
+	case err := <-errCh:
+		assert.NoError(t, err, "a cancelled session ends cleanly")
+	case <-time.After(5 * time.Second):
+		t.Fatal("connect did not return after cancellation")
+	}
+	assert.Equal(t, []uint64{dotnetTestSessionID}, srv.stoppedSessions(), "the session is stopped on exit")
+
+	srv.lock.Lock()
+	require.Len(t, srv.collectBodies, 1)
+	assert.True(t, bytes.Contains(srv.collectBodies[0], dotnetTestUtf16("System.Runtime")))
+	assert.True(t, bytes.Contains(srv.collectBodies[0], dotnetTestUtf16("EventCounterIntervalSec=5")))
+	srv.lock.Unlock()
+
+	mfs := dotnetTestGather(t, m)
+	assert.Equal(t, 1.0, metricsTestOne(t, mfs, "container_dotnet_info", map[string]string{"runtime_version": "8.0.1+abc"}).GetGauge().GetValue())
+	assert.Equal(t, 12.0, metricsTestOne(t, mfs, "container_dotnet_thread_pool_size", nil).GetGauge().GetValue())
+	assert.Equal(t, 2e6, metricsTestOne(t, mfs, "container_dotnet_memory_heap_size_bytes", map[string]string{"generation": "Gen0"}).GetGauge().GetValue())
+	assert.Equal(t, 3e6, metricsTestOne(t, mfs, "container_dotnet_memory_allocated_bytes_total", nil).GetCounter().GetValue())
+}
+
+func TestDotNetMonitorConnectErrors(t *testing.T) {
+	counters := dotnetTestCounterMetadata()
+	unsupported := dotnetTestMetadata(dotnetTestMeanMD, "System.Runtime", dotnetTestField("Min", typecode.Int64))
+	cases := []struct {
+		name    string
+		server  *dotnetTestServer
+		err     string
+		stopped bool
+	}{
+		{
+			name:   "runtime refuses both commands",
+			server: &dotnetTestServer{processInfoFails: true, collectFailures: 1},
+			err:    "diagnostic server",
+		},
+		{
+			name:    "not a NetTrace stream",
+			server:  &dotnetTestServer{stream: []byte("definitely not nettrace, but long enough to be read")},
+			err:     nettrace.ErrInvalidNetTraceHeader.Error(),
+			stopped: true,
+		},
+		{
+			name:    "stream ends",
+			server:  &dotnetTestServer{stream: append(dotnetTestNewNettrace().Bytes(), 1), endOfStream: true}, // NullReference: end of stream
+			err:     "EOF",
+			stopped: true,
+		},
+		{
+			name:    "event without metadata",
+			server:  &dotnetTestServer{stream: dotnetTestNewNettrace().blobs("EventBlock", dotnetTestMean("cpu-usage", 1, "%")).Bytes()},
+			err:     "metadata not found",
+			stopped: true,
+		},
+		{
+			name: "unsupported payload field",
+			server: &dotnetTestServer{stream: dotnetTestNewNettrace().
+				blobs("MetadataBlock", unsupported).
+				blobs("EventBlock", dotnetTestBlob(dotnetTestMeanMD, (&dotnetTestPayload{}).i32(1).i32(0).Bytes())).Bytes()},
+			err:     "unsupported field type",
+			stopped: true,
+		},
+		{
+			name: "malformed event payload",
+			server: &dotnetTestServer{stream: dotnetTestNewNettrace().
+				blobs("MetadataBlock", counters).
+				blobs("EventBlock", dotnetTestBlob(dotnetTestMeanMD, []byte{'x', 0})).Bytes()},
+			err:     "parser",
+			stopped: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := dotnetTestMonitor(t, "Shop")
+			m.pid = dotnetTestServe(t, tc.server)
+			err := m.connect(context.Background())
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.err)
+			if tc.stopped {
+				assert.Equal(t, []uint64{dotnetTestSessionID}, tc.server.stoppedSessions())
+			}
+			if tc.server.processInfoFails {
+				m.lastUpdate = time.Now()
+				mfs := dotnetTestGather(t, m)
+				assert.Equal(t, 1.0, metricsTestOne(t, mfs, "container_dotnet_info", map[string]string{"runtime_version": "unknown"}).GetGauge().GetValue())
+			}
+		})
+	}
+}
+
+func TestDotNetMonitorRunRetriesUntilConnected(t *testing.T) {
+	srv := &dotnetTestServer{collectFailures: 1}
+	full := dotnetTestCounterStream()
+	srv.stream = append([]byte{}, full.Bytes()...)
+	srv.tail = full.block("SPBlock", make([]byte, 12)).Bytes()[len(srv.stream):]
+	m := dotnetTestMonitor(t, "Shop")
+	m.pid = dotnetTestServe(t, srv)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		m.run(ctx)
+		close(done)
+	}()
+	// the first attempt is refused, the second one (after a 1s backoff) streams counters
+	require.Eventually(t, func() bool { return dotnetTestCounterValue(m.memoryAllocatedBytes) > 0 }, 10*time.Second, 10*time.Millisecond)
+	cancel()
+	close(srv.release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not return after the session ended")
+	}
+	srv.lock.Lock()
+	assert.Equal(t, int32(2), srv.collects)
+	srv.lock.Unlock()
+}
+
+func TestDotNetMonitorRunStopsWhileBackingOff(t *testing.T) {
+	m := dotnetTestMonitor(t, "Shop") // pid 4e9: every attempt fails
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		m.run(ctx)
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond) // let the first attempt fail
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not stop after cancellation")
+	}
 }

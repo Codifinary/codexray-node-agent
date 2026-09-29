@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/codifinary/codexray-node-agent/common"
-	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/codifinary/logparser"
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/oci"
@@ -35,7 +34,7 @@ func ContainerdInit() error {
 	}
 	var err error
 	for _, socket := range sockets {
-		containerdClient, err = containerd.New(proc.HostPath(socket),
+		containerdClient, err = containerd.New(hostPath(socket),
 			containerd.WithDefaultNamespace(constants.K8sContainerdNamespace),
 			containerd.WithTimeout(time.Second))
 		if err == nil {

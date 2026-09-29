@@ -6,7 +6,9 @@ package ebpftracer
 
 import (
 	"debug/elf"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -152,4 +154,238 @@ func TestAttachGoTlsUprobesOnGoBinary(t *testing.T) {
 	links, isGo = tr.AttachGoTlsUprobes(0x7fffffff)
 	assert.False(t, isGo, "process gone")
 	assert.Nil(t, links)
+}
+
+var tlsTestSslFuncs = []string{"SSL_write", "SSL_read", "SSL_write_ex", "SSL_read_ex"}
+
+// tlsTestSslLib maps a libssl exporting funcs and a libcrypto reporting the given OpenSSL version.
+func tlsTestSslLib(t *testing.T, version string, funcs ...string) (*Tracer, map[string]uint64, func(*elfTestUprobes) []elfTestProbe) {
+	if tlsTestSelfMaps(t, "libssl.so") || tlsTestSelfMaps(t, "libcrypto.so") {
+		t.Skip("the test binary itself maps libssl/libcrypto")
+	}
+	tr := NewTracer(0, 0, false)
+	var names []string
+	for _, suffix := range []string{"", "_v1_1_1", "_v3_0"} {
+		for _, p := range []string{"openssl_SSL_write_enter", "openssl_SSL_read_enter", "openssl_SSL_read_ex_enter"} {
+			names = append(names, p+suffix)
+		}
+	}
+	progs := elfTestProgs(tr, append(names, "openssl_SSL_read_exit")...)
+	ssl, crypto := tlsTestLibs(t, []byte("\x00OpenSSL "+version+"  1 Jan 2024\x00"))
+	addrs := elfTestLib(t, ssl, elfTestFuncs(funcs...))
+	tlsTestMmap(t, ssl)
+	tlsTestMmap(t, crypto)
+	return tr, addrs, func(f *elfTestUprobes) []elfTestProbe { return f.probes(progs) }
+}
+
+func TestAttachOpenSslUprobesAttached(t *testing.T) {
+	pid := uint32(os.Getpid())
+	for _, c := range []struct {
+		version string
+		suffix  string
+		ex      bool
+	}{
+		{version: "3.0.2", suffix: "_v3_0", ex: true},
+		{version: "3.2.1", suffix: "_v3_0", ex: true},
+		{version: "1.1.1w", suffix: "_v1_1_1", ex: true},
+		{version: "1.1.0l", suffix: ""},
+		{version: "1.0.2u", suffix: ""},
+	} {
+		t.Run(c.version, func(t *testing.T) {
+			tr, addrs, probes := tlsTestSslLib(t, c.version, tlsTestSslFuncs...)
+			f := elfTestFakeUprobes(t, nil)
+			links := tr.AttachOpenSslUprobes(pid)
+			w, r := addrs["SSL_write"], addrs["SSL_read"]
+			expected := []elfTestProbe{
+				{"openssl_SSL_write_enter" + c.suffix, w, 0},
+				{"openssl_SSL_read_enter" + c.suffix, r, 0},
+				{"openssl_SSL_read_exit", r, 1},
+				{"openssl_SSL_read_exit", r, 3},
+			}
+			if c.ex {
+				w, r = addrs["SSL_write_ex"], addrs["SSL_read_ex"]
+				expected = append(expected,
+					elfTestProbe{"openssl_SSL_write_enter" + c.suffix, w, 0},
+					elfTestProbe{"openssl_SSL_read_ex_enter" + c.suffix, r, 0},
+					elfTestProbe{"openssl_SSL_read_exit", r, 1},
+					elfTestProbe{"openssl_SSL_read_exit", r, 3},
+				)
+			}
+			assert.Equal(t, expected, probes(f))
+			assert.Equal(t, f.links(), links)
+			for _, call := range f.calls {
+				assert.Equal(t, int(pid), call.opts.PID)
+			}
+		})
+	}
+}
+
+func TestAttachOpenSslUprobesFailures(t *testing.T) {
+	pid := uint32(os.Getpid())
+
+	t.Run("missing symbol closes what is attached", func(t *testing.T) {
+		tr, _, _ := tlsTestSslLib(t, "3.0.2", "SSL_write", "SSL_read")
+		f := elfTestFakeUprobes(t, nil)
+		assert.Nil(t, tr.AttachOpenSslUprobes(pid))
+		assert.Len(t, f.calls, 4)
+		assert.Equal(t, []bool{true, true, true, true}, f.closed())
+	})
+
+	t.Run("uprobe failure", func(t *testing.T) {
+		tr, _, _ := tlsTestSslLib(t, "3.0.2", tlsTestSslFuncs...)
+		f := elfTestFakeUprobes(t, elfTestFailAt(2, errors.New("boom")))
+		assert.Nil(t, tr.AttachOpenSslUprobes(pid))
+		assert.Equal(t, []bool{true}, f.closed())
+	})
+
+	t.Run("uretprobe failure", func(t *testing.T) {
+		tr, _, _ := tlsTestSslLib(t, "3.0.2", tlsTestSslFuncs...)
+		f := elfTestFakeUprobes(t, elfTestFailAt(4, errors.New("attach: permission denied")))
+		assert.Nil(t, tr.AttachOpenSslUprobes(pid))
+		assert.Equal(t, []bool{true, true, true}, f.closed())
+	})
+
+	t.Run("unknown libssl version", func(t *testing.T) {
+		if tlsTestSelfMaps(t, "libssl.so") || tlsTestSelfMaps(t, "libcrypto.so") {
+			t.Skip("the test binary itself maps libssl/libcrypto")
+		}
+		ssl, crypto := tlsTestLibs(t, []byte("\x00LibreSSL 3.8.2\x00"))
+		elfTestLib(t, ssl, elfTestFuncs(tlsTestSslFuncs...))
+		tlsTestMmap(t, ssl)
+		tlsTestMmap(t, crypto)
+		f := elfTestFakeUprobes(t, nil)
+		assert.Nil(t, NewTracer(0, 0, false).AttachOpenSslUprobes(pid))
+		assert.Empty(t, f.calls)
+	})
+
+	t.Run("libssl is not an ELF", func(t *testing.T) {
+		if tlsTestSelfMaps(t, "libssl.so") || tlsTestSelfMaps(t, "libcrypto.so") {
+			t.Skip("the test binary itself maps libssl/libcrypto")
+		}
+		ssl, crypto := tlsTestLibs(t, []byte("\x00OpenSSL 3.0.2  1 Jan 2024\x00"))
+		require.NoError(t, os.WriteFile(ssl, []byte("not an elf file, but long enough to be mapped"), 0o644))
+		tlsTestMmap(t, ssl)
+		tlsTestMmap(t, crypto)
+		f := elfTestFakeUprobes(t, nil)
+		assert.Nil(t, NewTracer(0, 0, false).AttachOpenSslUprobes(pid))
+		assert.Empty(t, f.calls)
+	})
+}
+
+// tlsTestGoProgram builds and starts a Go program that links the crypto/tls.(*Conn) methods
+// called in calls (on c) and keeps its symbol table (unlike the test binary itself).
+func tlsTestGoProgram(t *testing.T, calls string) (uint32, string) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go toolchain is not available")
+	}
+	dir := t.TempDir()
+	src := `package main
+
+import (
+	"crypto/tls"
+	"os"
+	"time"
+)
+
+func main() {
+	if len(os.Args) > 1 {
+		c := tls.Client(nil, &tls.Config{})
+		CALLS
+	}
+	time.Sleep(time.Minute)
+}
+`
+	src = strings.Replace(src, "CALLS", calls, 1)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(src), 0o644))
+	bin := filepath.Join(dir, "goapp")
+	build := exec.Command(goBin, "build", "-o", bin, "main.go")
+	build.Dir = dir
+	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=", "GOTOOLCHAIN=local", "GO111MODULE=off")
+	out, err := build.CombinedOutput()
+	require.NoError(t, err, string(out))
+	cmd := exec.Command(bin)
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	return uint32(cmd.Process.Pid), bin
+}
+
+func TestAttachGoTlsUprobesAttached(t *testing.T) {
+	pid, bin := tlsTestGoProgram(t, "_, _ = c.Write(nil); _, _ = c.Read(nil)")
+	tr := NewTracer(0, 0, false)
+	progs := elfTestProgs(tr, "go_crypto_tls_write_enter", "go_crypto_tls_read_enter", "go_crypto_tls_read_exit")
+
+	ef, err := OpenELFFile(bin)
+	require.NoError(t, err)
+	defer ef.Close()
+	ws, err := ef.GetSymbol(goTlsWriteSymbol)
+	require.NoError(t, err)
+	rs, err := ef.GetSymbol(goTlsReadSymbol)
+	require.NoError(t, err)
+	retOffsets, err := rs.ReturnOffsets()
+	require.NoError(t, err)
+	require.NotEmpty(t, retOffsets)
+
+	t.Run("write entry, read entry and every read return", func(t *testing.T) {
+		f := elfTestFakeUprobes(t, nil)
+		links, isGo := tr.AttachGoTlsUprobes(pid)
+		assert.True(t, isGo)
+		expected := []elfTestProbe{
+			{"go_crypto_tls_write_enter", ws.Address(), 0},
+			{"go_crypto_tls_read_enter", rs.Address(), 0},
+		}
+		for _, o := range retOffsets {
+			expected = append(expected, elfTestProbe{"go_crypto_tls_read_exit", rs.Address(), uint64(o)})
+		}
+		assert.Equal(t, expected, f.probes(progs))
+		assert.Equal(t, f.links(), links)
+		for _, c := range f.calls {
+			assert.Equal(t, int(pid), c.opts.PID)
+		}
+	})
+
+	t.Run("write entry failure", func(t *testing.T) {
+		f := elfTestFakeUprobes(t, elfTestFailAt(1, errors.New("boom")))
+		links, isGo := tr.AttachGoTlsUprobes(pid)
+		assert.True(t, isGo)
+		assert.Nil(t, links)
+		assert.Len(t, f.calls, 1)
+	})
+
+	t.Run("read entry failure closes the write probe", func(t *testing.T) {
+		f := elfTestFakeUprobes(t, elfTestFailAt(2, errors.New("boom")))
+		links, isGo := tr.AttachGoTlsUprobes(pid)
+		assert.True(t, isGo)
+		assert.Nil(t, links)
+		assert.Equal(t, []bool{true}, f.closed())
+	})
+
+	t.Run("read return failure closes every link", func(t *testing.T) {
+		f := elfTestFakeUprobes(t, elfTestFailAt(3, errors.New("boom")))
+		links, isGo := tr.AttachGoTlsUprobes(pid)
+		assert.True(t, isGo)
+		assert.Nil(t, links)
+		assert.Equal(t, []bool{true, true}, f.closed())
+	})
+}
+
+func TestAttachGoTlsUprobesWithoutReadSymbol(t *testing.T) {
+	// A Go app that only ever writes to TLS connections has no crypto/tls.(*Conn).Read (dead-code
+	// eliminated). The write uprobe is already attached when the Read lookup fails, and
+	// AttachGoTlsUprobes returns nil (so the caller never tracks or closes it) without calling
+	// closeLinks() (tls.go:218-221), leaking the uprobe for the lifetime of the agent.
+	// BUG: AttachGoTlsUprobes leaks the write uprobe when crypto/tls.(*Conn).Read is missing — unskip when fixed
+	t.Skip("BUG: AttachGoTlsUprobes leaks the already attached write uprobe when crypto/tls.(*Conn).Read is missing")
+	pid, _ := tlsTestGoProgram(t, "_, _ = c.Write(nil)")
+	tr := NewTracer(0, 0, false)
+	elfTestProgs(tr, "go_crypto_tls_write_enter", "go_crypto_tls_read_enter", "go_crypto_tls_read_exit")
+	f := elfTestFakeUprobes(t, nil)
+	links, isGo := tr.AttachGoTlsUprobes(pid)
+	assert.True(t, isGo)
+	assert.Nil(t, links)
+	require.Len(t, f.calls, 1, "only the write entry probe is attached")
+	assert.Equal(t, []bool{true}, f.closed())
 }

@@ -5,6 +5,7 @@
 package containers
 
 import (
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -23,6 +24,7 @@ import (
 	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/codifinary/codexray-node-agent/tracing"
 	"github.com/codifinary/logparser"
+	"github.com/mdlayher/taskstats"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
@@ -83,6 +85,17 @@ func containerTestNew(t *testing.T) *Container {
 		},
 		done: make(chan struct{}),
 	}
+}
+
+// containerTestHostPath points hostPath (proc.HostPath, i.e. /proc/1/root/...) at a
+// temporary directory and returns it.
+func containerTestHostPath(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	saved := hostPath
+	hostPath = func(p string) string { return filepath.Join(root, p) }
+	t.Cleanup(func() { hostPath = saved })
+	return root
 }
 
 // containerTestAddProcess registers a process; netNsId pre-seeds NetNsId() so no /proc read happens.
@@ -1206,4 +1219,263 @@ func TestContainerWildcardListensSmoke(t *testing.T) {
 	for addr := range res["docker-proxy"] {
 		assert.False(t, addr.IP().IsUnspecified())
 	}
+}
+
+// containerTestTracer is a real tracer with L7 tracing disabled: its uprobe attach
+// methods return immediately, so no eBPF/root is needed.
+func containerTestTracer() *ebpftracer.Tracer {
+	return ebpftracer.NewTracer(netns.None(), netns.None(), true)
+}
+
+func TestContainerOnProcessStart(t *testing.T) {
+	ts := taskstatsTestUse(t)
+	c := containerTestNew(t)
+	c.registry.tracer = containerTestTracer()
+	t0 := time.Now().Add(-time.Hour).Truncate(time.Second)
+	a, b, d := containerTestPid, containerTestPid+1, containerTestPid+2 // vanished pids: instrumentation is a no-op
+
+	assert.Nil(t, c.onProcessStart(a), "no taskstats for the pid (it has already exited)")
+	assert.Empty(t, c.processes)
+
+	c.zombieAt = time.Now()
+	ts.setPID(a, &taskstats.Stats{BeginTime: t0})
+	p := c.onProcessStart(a)
+	require.NotNil(t, p)
+	t.Cleanup(p.Close)
+	assert.Equal(t, a, p.Pid)
+	assert.Equal(t, t0, p.StartedAt)
+	assert.Same(t, p, c.processes[a])
+	assert.True(t, c.zombieAt.IsZero(), "a new process revives a zombie container")
+	assert.Equal(t, t0, c.startedAt)
+	assert.Equal(t, 0, c.restarts)
+
+	// the only process exits and a new one starts later: the container restarted
+	c.onProcessExit(a, false)
+	ts.setPID(b, &taskstats.Stats{BeginTime: t0.Add(time.Minute)})
+	pb := c.onProcessStart(b)
+	require.NotNil(t, pb)
+	t.Cleanup(pb.Close)
+	assert.Equal(t, 1, c.restarts)
+	assert.Equal(t, t0.Add(time.Minute), c.startedAt)
+
+	// a sibling process started while b is running is not a restart
+	ts.setPID(d, &taskstats.Stats{BeginTime: t0.Add(2 * time.Minute)})
+	pd := c.onProcessStart(d)
+	require.NotNil(t, pd)
+	t.Cleanup(pd.Close)
+	assert.Equal(t, 1, c.restarts)
+	assert.Equal(t, t0.Add(time.Minute), c.startedAt)
+	assert.Len(t, c.processes, 2)
+}
+
+func TestContainerUpdateDelays(t *testing.T) {
+	ts := taskstatsTestUse(t)
+	c := containerTestNew(t)
+	a, b := containerTestPid, containerTestPid+1
+	containerTestAddProcess(c, a, "other")
+	containerTestAddProcess(c, b, "other") // taskstats fails for it: skipped
+	ts.setTGID(a, &taskstats.Stats{CPUDelay: 3 * time.Second, BlockIODelay: time.Second})
+
+	c.updateDelays()
+	assert.Equal(t, 3*time.Second, c.delays.cpu)
+	assert.Equal(t, time.Second, c.delays.disk)
+	assert.Equal(t, Delays{cpu: 3 * time.Second, disk: time.Second}, c.delaysByPid[a])
+	assert.NotContains(t, c.delaysByPid, b)
+
+	// cumulative per-process counters are turned into container-level deltas
+	ts.setTGID(a, &taskstats.Stats{CPUDelay: 5 * time.Second, BlockIODelay: time.Second})
+	ts.setTGID(b, &taskstats.Stats{CPUDelay: time.Second, BlockIODelay: 2 * time.Second})
+	c.updateDelays()
+	assert.Equal(t, 6*time.Second, c.delays.cpu)
+	assert.Equal(t, 3*time.Second, c.delays.disk)
+
+	mfs := containerTestGather(t, c)
+	assert.Equal(t, 6.0, metricsTestOne(t, mfs, "container_resources_cpu_delay_seconds_total", nil).GetCounter().GetValue())
+	assert.Equal(t, 3.0, metricsTestOne(t, mfs, "container_resources_disk_delay_seconds_total", nil).GetCounter().GetValue())
+}
+
+func TestContainerAttachTlsUprobesWithTracer(t *testing.T) {
+	c := containerTestNew(t)
+	p := containerTestAddProcess(c, containerTestPid, "other")
+	c.attachTlsUprobes(containerTestTracer(), containerTestPid)
+	assert.True(t, p.openSslUprobesChecked)
+	assert.True(t, p.goTlsUprobesChecked)
+	assert.False(t, p.isGolangApp)
+	assert.Empty(t, p.uprobes)
+	// the checks are done once per process: a nil tracer would panic if they ran again
+	assert.NotPanics(t, func() { c.attachTlsUprobes(nil, containerTestPid) })
+}
+
+// containerTestPinger replaces pinger.Ping (raw ICMP sockets need CAP_NET_RAW).
+func containerTestPinger(t *testing.T, rtt map[netaddr.IP]float64, err error) *[][]netaddr.IP {
+	t.Helper()
+	var calls [][]netaddr.IP
+	saved := pingerPing
+	pingerPing = func(ns, origin netns.NsHandle, targets []netaddr.IP, timeout time.Duration) (map[netaddr.IP]float64, error) {
+		assert.True(t, ns.IsOpen())
+		assert.Equal(t, pingTimeout, timeout)
+		calls = append(calls, targets)
+		return rtt, err
+	}
+	t.Cleanup(func() { pingerPing = saved })
+	return &calls
+}
+
+func containerTestSelfNetNs(t *testing.T) {
+	t.Helper()
+	ns, err := netns.Get()
+	require.NoError(t, err)
+	saved := selfNetNs
+	selfNetNs = ns
+	t.Cleanup(func() {
+		selfNetNs = saved
+		_ = ns.Close()
+	})
+}
+
+func TestContainerPing(t *testing.T) {
+	addDestinations := func(c *Container) {
+		for _, d := range []string{"10.1.2.3:80", "127.0.0.1:8080", "[fd00::1]:443"} {
+			c.connectionStats[common.NewDestinationKey(containerTestAddr("10.96.0.10:80"), containerTestAddr(d), nil)] = &ConnectionStats{Count: 1}
+		}
+		c.failedConnectionAttempts[containerTestHP("10.9.9.9:5432")] = 1
+		c.failedConnectionAttempts[common.HostPortWithEmptyIP("db.example.com", 5432)] = 1 // unresolved: nothing to ping
+		c.failedConnectionAttempts[common.NewDestinationKey(containerTestAddr("10.96.0.11:80"), containerTestAddr("10.96.0.11:80"), &common.Domain{FQDN: "api.example.com"}).Destination()] = 1
+	}
+
+	t.Run("agent process uses the agent netns", func(t *testing.T) {
+		containerTestSelfNetNs(t)
+		want := map[netaddr.IP]float64{netaddr.MustParseIP("10.1.2.3"): 0.001}
+		calls := containerTestPinger(t, want, nil)
+		c := containerTestNew(t)
+		containerTestAddProcess(c, agentPid, "other")
+		assert.Nil(t, c.ping(), "no destinations")
+		assert.Empty(t, *calls)
+
+		addDestinations(c)
+		assert.Equal(t, want, c.ping())
+		require.Len(t, *calls, 1)
+		// loopback and IPv6 destinations are not pinged
+		assert.ElementsMatch(t, []netaddr.IP{netaddr.MustParseIP("10.1.2.3"), netaddr.MustParseIP("10.9.9.9"), netaddr.MustParseIP("10.96.0.11")}, (*calls)[0])
+	})
+
+	t.Run("other processes use their own netns", func(t *testing.T) {
+		calls := containerTestPinger(t, nil, errors.New("operation not permitted"))
+		c := containerTestNew(t)
+		containerTestAddProcess(c, containerTestChild(t, "app"), "other")
+		addDestinations(c)
+		assert.Nil(t, c.ping(), "pinger errors are logged, nothing is reported")
+		assert.Len(t, *calls, 1)
+	})
+
+	t.Run("netns of another user's process", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root can open any netns")
+		}
+		calls := containerTestPinger(t, nil, nil)
+		c := containerTestNew(t)
+		containerTestAddProcess(c, 1, "other")
+		addDestinations(c)
+		assert.Nil(t, c.ping())
+		assert.Empty(t, *calls)
+	})
+}
+
+// containerTestHostNetNs fakes the host netns (/proc/1/ns/net needs privileges) and its IPs.
+func containerTestHostNetNs(t *testing.T, nsErr error, ips []netaddr.IP, ipsErr error) {
+	t.Helper()
+	savedNs, savedIps := getHostNetNs, getNsIps
+	t.Cleanup(func() { getHostNetNs, getNsIps = savedNs, savedIps })
+	getHostNetNs = func() (netns.NsHandle, error) {
+		if nsErr != nil {
+			return netns.None(), nsErr
+		}
+		return netns.Get()
+	}
+	getNsIps = func(ns netns.NsHandle) ([]netaddr.IP, error) {
+		assert.True(t, ns.IsOpen())
+		return ips, ipsErr
+	}
+}
+
+func TestContainerProxiedListensWildcard(t *testing.T) {
+	hostListens := map[string][]netaddr.IPPort{
+		"docker-proxy": {containerTestAddr("0.0.0.0:80"), containerTestAddr("[::]:443"), containerTestAddr("192.168.1.10:8080")},
+	}
+	hostIps := []netaddr.IP{netaddr.MustParseIP("192.168.1.10"), netaddr.MustParseIP("10.0.0.1"), netaddr.MustParseIP("fd00::10")}
+
+	t.Run("expanded to the host IPs of the same family", func(t *testing.T) {
+		containerTestHostNetNs(t, nil, hostIps, nil)
+		c := containerTestNew(t)
+		c.metadata.hostListens = hostListens
+		assert.Equal(t, map[string]map[netaddr.IPPort]struct{}{"docker-proxy": {
+			containerTestAddr("192.168.1.10:80"):   {},
+			containerTestAddr("10.0.0.1:80"):       {},
+			containerTestAddr("[fd00::10]:443"):    {},
+			containerTestAddr("192.168.1.10:8080"): {},
+		}}, c.getProxiedListens())
+	})
+
+	for name, errs := range map[string][2]error{
+		"host netns unavailable": {errors.New("permission denied"), nil},
+		"host IPs unavailable":   {nil, errors.New("operation not permitted")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			containerTestHostNetNs(t, errs[0], hostIps, errs[1])
+			c := containerTestNew(t)
+			c.metadata.hostListens = hostListens
+			assert.Equal(t, map[string]map[netaddr.IPPort]struct{}{"docker-proxy": {
+				containerTestAddr("192.168.1.10:8080"): {},
+			}}, c.getProxiedListens(), "only explicit addresses are reported")
+		})
+	}
+}
+
+func TestContainerOnListenOpenWildcardNsIps(t *testing.T) {
+	c := containerTestNew(t)
+	self := uint32(os.Getpid())
+	containerTestAddProcess(c, self, "other")
+
+	containerTestHostNetNs(t, nil, []netaddr.IP{netaddr.MustParseIP("10.0.0.5")}, nil)
+	c.onListenOpen(self, containerTestAddr("0.0.0.0:8080"), false)
+	assert.Equal(t, []netaddr.IP{netaddr.MustParseIP("10.0.0.5")}, c.listens[containerTestAddr("0.0.0.0:8080")][self].NsIPs)
+	assert.Equal(t, map[netaddr.IPPort]int{containerTestAddr("10.0.0.5:8080"): 1}, c.getListens())
+
+	containerTestHostNetNs(t, nil, nil, errors.New("operation not permitted"))
+	c.onListenOpen(self, containerTestAddr("0.0.0.0:9090"), false)
+	assert.Nil(t, c.listens[containerTestAddr("0.0.0.0:9090")][self].NsIPs)
+}
+
+func TestContainerRunLogParserJournald(t *testing.T) {
+	c := containerTestNew(t)
+	c.cgroup = &cgroup.Cgroup{Id: "/system.slice/nginx.service", ContainerType: cgroup.ContainerTypeSystemdService, ContainerId: "/system.slice/nginx.service"}
+
+	journaldTestUse(t)
+	r := journaldReader.(*journaldTestReader)
+	c.runLogParser("")
+	require.Contains(t, c.logParsers, "journald")
+	assert.Contains(t, r.subscribers, c.cgroup.Id)
+
+	c.Close() // stops the parser and unsubscribes from the journal
+	assert.Equal(t, []string{c.cgroup.Id}, r.unsubscribed)
+}
+
+func TestContainerRunLogParserTailsHostFiles(t *testing.T) {
+	root := containerTestHostPath(t)
+	c := containerTestNew(t)
+	c.cgroup = &cgroup.Cgroup{Id: "/docker/x", ContainerType: cgroup.ContainerTypeDocker}
+	c.metadata.logPath = "/var/lib/docker/containers/x/x-json.log"
+	c.metadata.logDecoder = logparser.DockerJsonDecoder{}
+	for _, p := range []string{c.metadata.logPath, "/var/log/app.log"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(root, filepath.Dir(p)), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(root, p), nil, 0o644))
+	}
+	t.Cleanup(c.Close)
+
+	c.runLogParser("")
+	assert.Contains(t, c.logParsers, "stdout/stderr", "the container log is read through the host root")
+	c.runLogParser("/var/log/app.log")
+	assert.Contains(t, c.logParsers, "/var/log/app.log")
+	c.runLogParser("/var/log/missing.log")
+	assert.NotContains(t, c.logParsers, "/var/log/missing.log")
 }

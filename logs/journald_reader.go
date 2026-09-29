@@ -19,8 +19,25 @@ const (
 	journaldPollTimeout = 100 * time.Millisecond
 )
 
+type journal interface {
+	Next() (uint64, error)
+	Wait(timeout time.Duration) int
+	GetEntry() (*sdjournal.JournalEntry, error)
+	GetUsage() (uint64, error)
+	SeekRealtimeUsec(usec uint64) error
+	Close() error
+}
+
+var openJournal = func(path string) (journal, error) {
+	j, err := sdjournal.NewJournalFromDir(path)
+	if err != nil {
+		return nil, err
+	}
+	return j, nil
+}
+
 type JournaldReader struct {
-	journal     *sdjournal.Journal
+	journal     journal
 	subscribers map[string]chan<- logparser.LogEntry
 	until       chan time.Time
 	lock        sync.Mutex
@@ -33,7 +50,7 @@ func NewJournaldReader(journalPaths ...string) (*JournaldReader, error) {
 	}
 	var err error
 	for _, journalPath := range journalPaths {
-		if r.journal, err = sdjournal.NewJournalFromDir(journalPath); err != nil {
+		if r.journal, err = openJournal(journalPath); err != nil {
 			klog.Errorf("failed to get journal at %s: %s", journalPath, err)
 			continue
 		}

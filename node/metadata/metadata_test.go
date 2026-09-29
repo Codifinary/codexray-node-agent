@@ -8,12 +8,17 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/vishvananda/netns"
 )
 
 // metadataTestRequest is what the fake metadata service observed.
@@ -254,4 +259,164 @@ func TestGetInstanceMetadataDispatch(t *testing.T) {
 	for _, b := range tr.bodies {
 		assert.True(t, b.isClosed(), "every metadata response body must be closed")
 	}
+}
+
+// metadataTestSysfs points getCloudProvider at a fake /sys built from files
+// (paths relative to /sys).
+func metadataTestSysfs(t *testing.T, files map[string]string) {
+	t.Helper()
+	root := t.TempDir()
+	for name, content := range files {
+		p := filepath.Join(root, name)
+		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+		require.NoError(t, os.WriteFile(p, []byte(content), 0o644))
+	}
+	orig := sysfsRoot
+	sysfsRoot = root
+	t.Cleanup(func() { sysfsRoot = orig })
+}
+
+// metadataTestSelfNetNs makes the "host" netns the test's own one, so the
+// token dialers run without setns (and without root).
+func metadataTestSelfNetNs(t *testing.T) {
+	t.Helper()
+	orig := getHostNetNs
+	getHostNetNs = proc.GetSelfNetNs
+	t.Cleanup(func() { getHostNetNs = orig })
+}
+
+func metadataTestHostNetNsErr(t *testing.T, err error) {
+	t.Helper()
+	orig := getHostNetNs
+	getHostNetNs = func() (netns.NsHandle, error) { return netns.None(), err }
+	t.Cleanup(func() { getHostNetNs = orig })
+}
+
+func TestGetCloudProvider(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+		want  CloudProvider
+	}{
+		{"empty sysfs", nil, CloudProviderUnknown},
+		{"xen ec2 uuid", map[string]string{"hypervisor/uuid": "ec2e1916-9099-7caf-fd21-012345abcdef\n"}, CloudProviderAWS},
+		{"xen ec2 uuid upper-case", map[string]string{"hypervisor/uuid": "EC2E1916-9099-7CAF-FD21-012345ABCDEF\n"}, CloudProviderAWS},
+		{"xen non-ec2 uuid", map[string]string{"hypervisor/uuid": "4c4c4544-0042-3510-8052-b4c04f4d3232\n"}, CloudProviderUnknown},
+		{"ec2 uuid wins over board_vendor", map[string]string{
+			"hypervisor/uuid": "ec2abc", "class/dmi/id/board_vendor": "Google\n",
+		}, CloudProviderAWS},
+		{"non-ec2 uuid falls through to dmi", map[string]string{
+			"hypervisor/uuid": "abc", "class/dmi/id/board_vendor": "Google\n",
+		}, CloudProviderGCP},
+		{"board Amazon EC2", map[string]string{"class/dmi/id/board_vendor": "Amazon EC2\n"}, CloudProviderAWS},
+		{"board Google", map[string]string{"class/dmi/id/board_vendor": "Google\n"}, CloudProviderGCP},
+		{"board Microsoft", map[string]string{"class/dmi/id/board_vendor": "Microsoft Corporation\n"}, CloudProviderAzure},
+		{"board DigitalOcean", map[string]string{"class/dmi/id/board_vendor": "DigitalOcean\n"}, CloudProviderDigitalOcean},
+		{"sys Hetzner", map[string]string{
+			"class/dmi/id/board_vendor": "Dell Inc.\n", "class/dmi/id/sys_vendor": "Hetzner\n",
+		}, CloudProviderHetzner},
+		{"sys Alibaba", map[string]string{"class/dmi/id/sys_vendor": "Alibaba Cloud\n"}, CloudProviderAlibaba},
+		{"sys Scaleway", map[string]string{"class/dmi/id/sys_vendor": "Scaleway\n"}, CloudProviderScaleway},
+		{"chassis IBM", map[string]string{
+			"class/dmi/id/sys_vendor": "QEMU\n", "class/dmi/id/chassis_vendor": "IBM:Cloud Compute Server 1.0:Nitro\n",
+		}, CloudProviderIBM},
+		{"chassis Oracle", map[string]string{
+			"class/dmi/id/chassis_vendor": "QEMU\n", "class/dmi/id/chassis_asset_tag": "OracleCloud.com\n",
+		}, CloudProviderOracle},
+		{"bare metal", map[string]string{
+			"class/dmi/id/board_vendor":      "LENOVO\n",
+			"class/dmi/id/sys_vendor":        "LENOVO\n",
+			"class/dmi/id/chassis_vendor":    "LENOVO\n",
+			"class/dmi/id/chassis_asset_tag": "No Asset Information\n",
+		}, CloudProviderUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metadataTestSysfs(t, tc.files)
+			assert.Equal(t, tc.want, getCloudProvider())
+		})
+	}
+}
+
+func TestGetInstanceMetadataFakeSysfs(t *testing.T) {
+	origTimeout := http.DefaultClient.Timeout
+	t.Cleanup(func() { http.DefaultClient.Timeout = origTimeout })
+
+	t.Run("unknown", func(t *testing.T) {
+		tr := metadataTestInstall(t, http.NotFoundHandler())
+		metadataTestSysfs(t, nil)
+		assert.Nil(t, GetInstanceMetadata())
+		assert.Empty(t, tr.urls(), "the metadata service must not be queried")
+	})
+	t.Run("AWS", func(t *testing.T) {
+		metadataTestSysfs(t, map[string]string{"class/dmi/id/board_vendor": "Amazon EC2\n"})
+		awsTestStart(t, http.StatusOK, awsTestVars())
+		md := GetInstanceMetadata()
+		require.NotNil(t, md)
+		assert.Equal(t, CloudProviderAWS, md.Provider)
+		assert.Equal(t, "i-0abc", md.InstanceId)
+	})
+	t.Run("GCP", func(t *testing.T) {
+		metadataTestSysfs(t, map[string]string{"class/dmi/id/board_vendor": "Google\n"})
+		gcpTestServer(t, map[string]string{"project/project-id": "my-project", "instance/id": "42"})
+		md := GetInstanceMetadata()
+		require.NotNil(t, md)
+		assert.Equal(t, CloudProviderGCP, md.Provider)
+		assert.Equal(t, "42", md.InstanceId)
+	})
+	t.Run("Azure", func(t *testing.T) {
+		metadataTestSysfs(t, map[string]string{"class/dmi/id/board_vendor": "Microsoft Corporation\n"})
+		metadataTestInstall(t, metadataTestPaths(map[string]string{"/metadata/instance": azureTestResponse}))
+		md := GetInstanceMetadata()
+		require.NotNil(t, md)
+		assert.Equal(t, CloudProviderAzure, md.Provider)
+		assert.Equal(t, "02aab8a4-74ef-476e-8182-f6d2ba4166a6", md.InstanceId)
+	})
+	t.Run("DigitalOcean", func(t *testing.T) {
+		metadataTestSysfs(t, map[string]string{"class/dmi/id/board_vendor": "DigitalOcean\n"})
+		metadataTestInstall(t, metadataTestPaths(map[string]string{"/metadata/v1/id": "2756294", "/metadata/v1/region": "nyc3"}))
+		md := GetInstanceMetadata()
+		require.NotNil(t, md)
+		assert.Equal(t, CloudProviderDigitalOcean, md.Provider)
+		assert.Equal(t, "2756294", md.InstanceId)
+	})
+	t.Run("Hetzner", func(t *testing.T) {
+		metadataTestSysfs(t, map[string]string{"class/dmi/id/sys_vendor": "Hetzner\n"})
+		metadataTestInstall(t, metadataTestPaths(map[string]string{"/hetzner/v1/metadata": "instance-id: 42\nregion: eu-central\n"}))
+		md := GetInstanceMetadata()
+		require.NotNil(t, md)
+		assert.Equal(t, CloudProviderHetzner, md.Provider)
+		assert.Equal(t, "42", md.InstanceId)
+	})
+	t.Run("Alibaba", func(t *testing.T) {
+		metadataTestSysfs(t, map[string]string{"class/dmi/id/sys_vendor": "Alibaba Cloud\n"})
+		metadataTestInstall(t, metadataTestPaths(alibabaTestBodies()))
+		md := GetInstanceMetadata()
+		require.NotNil(t, md)
+		assert.Equal(t, CloudProviderAlibaba, md.Provider)
+		assert.Equal(t, "cn-hangzhou", md.Region)
+	})
+	t.Run("Scaleway", func(t *testing.T) {
+		metadataTestSysfs(t, map[string]string{"class/dmi/id/sys_vendor": "Scaleway\n"})
+		metadataTestInstall(t, metadataTestPaths(map[string]string{"/conf": "ID=abc\nZONE=fr-par-1\n"}))
+		md := GetInstanceMetadata()
+		require.NotNil(t, md)
+		assert.Equal(t, CloudProviderScaleway, md.Provider)
+		assert.Equal(t, "abc", md.InstanceId)
+	})
+	t.Run("IBM", func(t *testing.T) {
+		metadataTestSysfs(t, map[string]string{"class/dmi/id/chassis_vendor": "IBM:Cloud Compute Server 1.0\n"})
+		ibmTestStart(t, ibmTestHandler(`{"access_token":"tok"}`, http.StatusOK, ibmTestInstance))
+		md := GetInstanceMetadata()
+		require.NotNil(t, md)
+		assert.Equal(t, CloudProviderIBM, md.Provider)
+		assert.Equal(t, "0717_abc", md.InstanceId)
+	})
+	t.Run("Oracle", func(t *testing.T) {
+		metadataTestSysfs(t, map[string]string{"class/dmi/id/chassis_asset_tag": "OracleCloud.com\n"})
+		metadataTestInstall(t, metadataTestPaths(map[string]string{"/opc/v2/instance/": `{"id":"ocid1.instance.oc1.iad.abc","canonicalRegionName":"us-ashburn-1"}`}))
+		md := GetInstanceMetadata()
+		require.NotNil(t, md)
+		assert.Equal(t, CloudProviderOracle, md.Provider)
+		assert.True(t, strings.HasPrefix(md.InstanceId, "ocid1."), md.InstanceId)
+	})
 }

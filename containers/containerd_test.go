@@ -7,18 +7,22 @@ package containers
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/codifinary/logparser"
 	"github.com/containerd/containerd"
+	namespacesapi "github.com/containerd/containerd/api/services/namespaces/v1"
 	ctrcontainers "github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/typeurl/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
@@ -185,4 +189,57 @@ func TestContainerdInitWithoutContainerd(t *testing.T) {
 	assert.Contains(t, err.Error(), "/run/containerd/containerd.sock")
 	assert.Nil(t, containerdClient)
 	assert.Less(t, time.Since(start), 5*time.Second, "each socket attempt is bounded by a 1s timeout")
+}
+
+// containerdTestNamespaces answers the namespace lookup containerd.New does for
+// its default namespace.
+type containerdTestNamespaces struct {
+	namespacesapi.UnimplementedNamespacesServer
+}
+
+func (containerdTestNamespaces) Get(_ context.Context, req *namespacesapi.GetNamespaceRequest) (*namespacesapi.GetNamespaceResponse, error) {
+	return &namespacesapi.GetNamespaceResponse{Namespace: &namespacesapi.Namespace{Name: req.Name}}, nil
+}
+
+// containerdTestServeHost runs a minimal containerd gRPC endpoint at hostPath(socket).
+func containerdTestServeHost(t *testing.T, socket string) {
+	t.Helper()
+	sock := hostPath(socket)
+	require.NoError(t, os.MkdirAll(filepath.Dir(sock), 0o755))
+	l, err := net.Listen("unix", sock)
+	require.NoError(t, err)
+	srv := grpc.NewServer()
+	namespacesapi.RegisterNamespacesServer(srv, containerdTestNamespaces{})
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(srv.Stop)
+}
+
+// containerdTestShortHostPath is containerTestHostPath with a short root: sun_path is
+// limited to 108 bytes and t.TempDir() embeds the (long) test name.
+func containerdTestShortHostPath(t *testing.T) string {
+	t.Helper()
+	root, err := os.MkdirTemp("", "ctrd")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	saved := hostPath
+	hostPath = func(p string) string { return filepath.Join(root, p) }
+	t.Cleanup(func() { hostPath = saved })
+	return root
+}
+
+func TestContainerdInitUsesFirstReachableSocket(t *testing.T) {
+	containerdTestShortHostPath(t)
+	saved := containerdClient
+	containerdClient = nil
+	t.Cleanup(func() { containerdClient = saved })
+
+	// microk8s' socket is tried first
+	containerdTestServeHost(t, "/var/snap/microk8s/common/run/containerd.sock")
+
+	start := time.Now()
+	require.NoError(t, ContainerdInit())
+	require.NotNil(t, containerdClient)
+	t.Cleanup(func() { _ = containerdClient.Close() })
+	assert.Equal(t, "k8s.io", containerdClient.DefaultNamespace())
+	assert.Less(t, time.Since(start), time.Second, "no other socket is tried")
 }

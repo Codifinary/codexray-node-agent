@@ -5,7 +5,13 @@
 package pinger
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
+	"flag"
+	"net"
+	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -18,6 +24,7 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
 	"inet.af/netaddr"
+	"k8s.io/klog/v2"
 )
 
 // pingerTestIPv4 builds a raw IPv4 packet (as delivered by an ip4:icmp socket)
@@ -227,4 +234,463 @@ func TestSendReceiveLoopback(t *testing.T) {
 		return
 	}
 	t.Fatal("no echo reply from loopback")
+}
+
+type pingerTestRead struct {
+	pkt  []byte
+	oob  []byte
+	addr *net.IPAddr
+	err  error
+}
+
+// pingerTestConn is an in-memory ipConn: writes are recorded, reads are served
+// from a queue and time out once it is drained.
+type pingerTestConn struct {
+	writes    [][]byte
+	addrs     []net.Addr
+	writeErrs map[int]error // by write index
+	reads     []pingerTestRead
+	fileErr   error
+	deadline  time.Time
+	closed    bool
+}
+
+func (c *pingerTestConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	i := len(c.writes)
+	c.writes = append(c.writes, append([]byte(nil), b...))
+	c.addrs = append(c.addrs, addr)
+	if err := c.writeErrs[i]; err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (c *pingerTestConn) ReadMsgIP(b, oob []byte) (int, int, int, *net.IPAddr, error) {
+	if len(c.reads) == 0 {
+		time.Sleep(time.Millisecond)
+		return 0, 0, 0, nil, &net.OpError{Op: "read", Net: "ip4", Err: os.ErrDeadlineExceeded}
+	}
+	r := c.reads[0]
+	c.reads = c.reads[1:]
+	if r.err != nil {
+		return 0, 0, 0, nil, r.err
+	}
+	return copy(b, r.pkt), copy(oob, r.oob), 0, r.addr, nil
+}
+
+func (c *pingerTestConn) SetReadDeadline(t time.Time) error {
+	c.deadline = t
+	return nil
+}
+
+func (c *pingerTestConn) File() (*os.File, error) {
+	if c.fileErr != nil {
+		return nil, c.fileErr
+	}
+	return os.Open(os.DevNull)
+}
+
+func (c *pingerTestConn) Close() error {
+	c.closed = true
+	return nil
+}
+
+// pingerTestReply is an echo reply from ip received at rx.
+func pingerTestReply(t *testing.T, ip string, id, seq int, rx time.Time) pingerTestRead {
+	return pingerTestRead{
+		pkt:  pingerTestIPv4(t, 5, pingerTestEcho(ipv4.ICMPTypeEchoReply, id, seq)),
+		oob:  pingerTestCmsg(syscall.SOL_SOCKET, unix.SO_TIMESTAMPING, pingerTestTimestamping(rx)),
+		addr: &net.IPAddr{IP: net.ParseIP(ip)},
+	}
+}
+
+func pingerTestReadErr(err error) pingerTestRead {
+	return pingerTestRead{err: &net.OpError{Op: "read", Net: "ip4", Err: err}}
+}
+
+// pingerTestSetup installs conn and a TX timestamp source returning txs[i] (or
+// txErrs[i]) for the i-th sent packet.
+func pingerTestSetup(t *testing.T, conn *pingerTestConn, txs []time.Time, txErrs map[int]error) {
+	t.Helper()
+	origOpen, origTx := openConnFn, getTxTimestampFn
+	t.Cleanup(func() { openConnFn, getTxTimestampFn = origOpen, origTx })
+	openConnFn = func() (ipConn, error) { return conn, nil }
+	calls := 0
+	getTxTimestampFn = func(fd int) (time.Time, error) {
+		i := calls
+		calls++
+		assert.GreaterOrEqual(t, fd, 0)
+		if err := txErrs[i]; err != nil {
+			return time.Time{}, err
+		}
+		return txs[i], nil
+	}
+}
+
+func pingerTestCaptureKlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	fs := flag.NewFlagSet("klog", flag.ContinueOnError)
+	klog.InitFlags(fs)
+	require.NoError(t, fs.Set("logtostderr", "false"))
+	require.NoError(t, fs.Set("alsologtostderr", "false"))
+	buf := &bytes.Buffer{}
+	klog.SetOutput(buf)
+	t.Cleanup(func() {
+		klog.Flush()
+		require.NoError(t, fs.Set("logtostderr", "true"))
+		klog.SetOutput(os.Stderr)
+	})
+	return buf
+}
+
+func pingerTestIPs(ips ...string) []netaddr.IP {
+	res := make([]netaddr.IP, 0, len(ips))
+	for _, ip := range ips {
+		res = append(res, netaddr.MustParseIP(ip))
+	}
+	return res
+}
+
+func pingerTestPing(targets []netaddr.IP, timeout time.Duration) (map[netaddr.IP]float64, error) {
+	return Ping(netns.None(), netns.None(), targets, timeout)
+}
+
+func TestPingOpenConnError(t *testing.T) {
+	orig := openConnFn
+	t.Cleanup(func() { openConnFn = orig })
+	openConnFn = func() (ipConn, error) { return nil, errors.New("operation not permitted") }
+
+	res, err := pingerTestPing(pingerTestIPs("10.0.0.1"), time.Second)
+	assert.EqualError(t, err, "failed to open IPConn: operation not permitted")
+	assert.Nil(t, res)
+}
+
+func TestPingFileError(t *testing.T) {
+	conn := &pingerTestConn{fileErr: errors.New("dup failed")}
+	pingerTestSetup(t, conn, nil, nil)
+
+	res, err := pingerTestPing(pingerTestIPs("10.0.0.1"), time.Second)
+	assert.EqualError(t, err, "dup failed")
+	assert.Nil(t, res)
+	assert.True(t, conn.closed)
+	assert.Empty(t, conn.writes)
+}
+
+func TestPingSendError(t *testing.T) {
+	conn := &pingerTestConn{writeErrs: map[int]error{1: errors.New("network is unreachable")}}
+	now := time.Now()
+	pingerTestSetup(t, conn, []time.Time{now, now}, nil)
+
+	res, err := pingerTestPing(pingerTestIPs("10.0.0.1", "10.0.0.2", "10.0.0.3"), time.Second)
+	assert.EqualError(t, err, "failed to send packet to 10.0.0.2: network is unreachable")
+	assert.Nil(t, res)
+	assert.True(t, conn.closed)
+	assert.Len(t, conn.writes, 2, "sending stops at the first hard error")
+}
+
+func TestPingSendEAGAINSkipsTarget(t *testing.T) {
+	// the error text of a bare syscall.EAGAIN
+	conn := &pingerTestConn{writeErrs: map[int]error{0: syscall.EAGAIN}}
+	tx := time.Now()
+	conn.reads = []pingerTestRead{
+		pingerTestReply(t, "10.0.0.1", pingerID, 1, tx), // skipped target: ignored
+		pingerTestReply(t, "10.0.0.2", pingerID, 2, tx.Add(3*time.Millisecond)),
+	}
+	pingerTestSetup(t, conn, []time.Time{tx}, nil) // one TX timestamp: only the 2nd packet was sent
+
+	res, err := pingerTestPing(pingerTestIPs("10.0.0.1", "10.0.0.2"), 50*time.Millisecond)
+	require.NoError(t, err)
+	assert.Equal(t, map[netaddr.IP]float64{netaddr.MustParseIP("10.0.0.2"): 0.003}, res)
+	assert.Len(t, conn.writes, 2)
+}
+
+func TestPingSendWrappedEAGAINSkipsTarget(t *testing.T) {
+	// BUG: Ping checks strings.HasPrefix(err.Error(), "resource temporarily unavailable")
+	// on the error from send(), but net.IPConn.WriteTo wraps errors in *net.OpError
+	// ("write ip4 ...: sendto: resource temporarily unavailable"), so the prefix
+	// never matches and an EAGAIN aborts the whole Ping instead of skipping the
+	// target — unskip when fixed
+	t.Skip("BUG: Ping's EAGAIN check on send() errors never matches the *net.OpError returned by WriteTo")
+	dst := netaddr.MustParseIP("10.0.0.1")
+	conn := &pingerTestConn{writeErrs: map[int]error{0: &net.OpError{
+		Op: "write", Net: "ip4", Addr: dst.IPAddr(), Err: os.NewSyscallError("sendto", syscall.EAGAIN),
+	}}}
+	pingerTestSetup(t, conn, nil, nil)
+
+	res, err := pingerTestPing([]netaddr.IP{dst}, 20*time.Millisecond)
+	assert.NoError(t, err)
+	assert.Empty(t, res)
+}
+
+func TestPingTxTimestampError(t *testing.T) {
+	conn := &pingerTestConn{}
+	pingerTestSetup(t, conn, nil, map[int]error{0: syscall.ENOTSOCK})
+
+	res, err := pingerTestPing(pingerTestIPs("10.0.0.1"), time.Second)
+	assert.EqualError(t, err, "failed to get TX timestamp: socket operation on non-socket")
+	assert.Nil(t, res)
+	assert.True(t, conn.closed)
+}
+
+func TestPingTxTimestampEAGAINSkipsTarget(t *testing.T) {
+	conn := &pingerTestConn{}
+	tx := time.Now()
+	conn.reads = []pingerTestRead{
+		pingerTestReply(t, "10.0.0.1", pingerID, 1, tx.Add(time.Millisecond)), // no TX timestamp: ignored
+		pingerTestReply(t, "10.0.0.2", pingerID, 2, tx.Add(2*time.Millisecond)),
+	}
+	pingerTestSetup(t, conn, []time.Time{{}, tx}, map[int]error{0: syscall.EAGAIN})
+
+	res, err := pingerTestPing(pingerTestIPs("10.0.0.1", "10.0.0.2"), 50*time.Millisecond)
+	require.NoError(t, err)
+	assert.Equal(t, map[netaddr.IP]float64{netaddr.MustParseIP("10.0.0.2"): 0.002}, res)
+}
+
+func TestPingSkippedTargetDoesNotWaitForTimeout(t *testing.T) {
+	// BUG: the early return compares the number of replies with len(targets)
+	// rather than with the number of packets actually sent, so when a target is
+	// skipped (EAGAIN) Ping always blocks for the full timeout even though every
+	// sent packet was answered — unskip when fixed
+	t.Skip("BUG: Ping waits for the full timeout when a target was skipped on EAGAIN")
+	conn := &pingerTestConn{}
+	tx := time.Now()
+	conn.reads = []pingerTestRead{pingerTestReply(t, "10.0.0.2", pingerID, 2, tx)}
+	pingerTestSetup(t, conn, []time.Time{{}, tx}, map[int]error{0: syscall.EAGAIN})
+
+	start := time.Now()
+	res, err := pingerTestPing(pingerTestIPs("10.0.0.1", "10.0.0.2"), 2*time.Second)
+	require.NoError(t, err)
+	assert.Len(t, res, 1)
+	assert.Less(t, time.Since(start), time.Second)
+}
+
+func TestPingSendsEchoRequests(t *testing.T) {
+	conn := &pingerTestConn{}
+	tx := time.Now()
+	pingerTestSetup(t, conn, []time.Time{tx, tx}, nil)
+
+	targets := pingerTestIPs("10.0.0.1", "192.168.1.1")
+	_, err := pingerTestPing(targets, time.Millisecond)
+	require.NoError(t, err)
+	require.Len(t, conn.writes, 2)
+	for i, ip := range targets {
+		assert.Equal(t, ip.IPAddr(), conn.addrs[i])
+		m, err := icmp.ParseMessage(protocolICMP, conn.writes[i])
+		require.NoError(t, err)
+		assert.Equal(t, ipv4.ICMPTypeEcho, m.Type)
+		echo, ok := m.Body.(*icmp.Echo)
+		require.True(t, ok)
+		assert.Equal(t, pingerID, echo.ID)
+		assert.Equal(t, i+1, echo.Seq, "seq is the 1-based target index")
+	}
+	assert.True(t, conn.closed)
+}
+
+func TestPingIgnoresUnrelatedReplies(t *testing.T) {
+	logs := pingerTestCaptureKlog(t)
+	conn := &pingerTestConn{}
+	tx := time.Unix(1_700_000_000, 0)
+	conn.reads = []pingerTestRead{
+		pingerTestReply(t, "10.0.0.1", (pingerID+1)&0xFFFF, 1, tx.Add(time.Millisecond)), // another pinger
+		pingerTestReply(t, "10.0.0.1", pingerID, 2, tx.Add(time.Millisecond)),            // seq of another target
+		pingerTestReply(t, "10.0.0.9", pingerID, 1, tx.Add(time.Millisecond)),            // not a target
+		{ // not a valid IP address
+			pkt:  pingerTestIPv4(t, 5, pingerTestEcho(ipv4.ICMPTypeEchoReply, pingerID, 1)),
+			oob:  pingerTestCmsg(syscall.SOL_SOCKET, unix.SO_TIMESTAMPING, pingerTestTimestamping(tx)),
+			addr: &net.IPAddr{IP: net.IP{1, 2, 3}},
+		},
+		{pkt: pingerTestIPv4(t, 5, pingerTestEcho(ipv4.ICMPTypeEcho, pingerID, 1)), addr: &net.IPAddr{IP: net.ParseIP("10.0.0.1")}}, // not a reply
+		pingerTestReply(t, "10.0.0.1", pingerID, 1, tx.Add(5*time.Millisecond)),
+	}
+	pingerTestSetup(t, conn, []time.Time{tx, tx}, nil)
+
+	res, err := pingerTestPing(pingerTestIPs("10.0.0.1", "10.0.0.2"), 50*time.Millisecond)
+	require.NoError(t, err)
+	assert.Equal(t, map[netaddr.IP]float64{netaddr.MustParseIP("10.0.0.1"): 0.005}, res)
+	assert.Empty(t, conn.reads)
+	klog.Flush()
+	assert.Empty(t, logs.String())
+}
+
+func TestPingNegativeRTTClampedToZero(t *testing.T) {
+	conn := &pingerTestConn{}
+	tx := time.Now()
+	conn.reads = []pingerTestRead{pingerTestReply(t, "10.0.0.1", pingerID, 1, tx.Add(-time.Millisecond))}
+	pingerTestSetup(t, conn, []time.Time{tx}, nil)
+
+	res, err := pingerTestPing(pingerTestIPs("10.0.0.1"), time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, map[netaddr.IP]float64{netaddr.MustParseIP("10.0.0.1"): 0}, res)
+}
+
+func TestPingReturnsOnceAllTargetsAnswered(t *testing.T) {
+	conn := &pingerTestConn{}
+	tx := time.Now()
+	conn.reads = []pingerTestRead{
+		pingerTestReply(t, "10.0.0.2", pingerID, 2, tx.Add(2*time.Millisecond)),
+		pingerTestReply(t, "10.0.0.1", pingerID, 1, tx.Add(time.Millisecond)),
+	}
+	pingerTestSetup(t, conn, []time.Time{tx, tx}, nil)
+
+	start := time.Now()
+	res, err := pingerTestPing(pingerTestIPs("10.0.0.1", "10.0.0.2"), time.Minute)
+	require.NoError(t, err)
+	assert.Less(t, time.Since(start), 10*time.Second, "must not wait for the timeout")
+	assert.Equal(t, map[netaddr.IP]float64{
+		netaddr.MustParseIP("10.0.0.1"): 0.001,
+		netaddr.MustParseIP("10.0.0.2"): 0.002,
+	}, res)
+	assert.True(t, conn.closed)
+}
+
+func TestPingTimeoutReturnsPartialResults(t *testing.T) {
+	conn := &pingerTestConn{}
+	tx := time.Now()
+	conn.reads = []pingerTestRead{pingerTestReply(t, "10.0.0.2", pingerID, 2, tx.Add(time.Millisecond))}
+	pingerTestSetup(t, conn, []time.Time{tx, tx}, nil)
+
+	start := time.Now()
+	res, err := pingerTestPing(pingerTestIPs("10.0.0.1", "10.0.0.2"), 30*time.Millisecond)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, time.Since(start), 30*time.Millisecond)
+	assert.Equal(t, map[netaddr.IP]float64{netaddr.MustParseIP("10.0.0.2"): 0.001}, res)
+}
+
+func TestPingReceiveErrors(t *testing.T) {
+	logs := pingerTestCaptureKlog(t)
+	conn := &pingerTestConn{}
+	tx := time.Now()
+	conn.reads = []pingerTestRead{
+		pingerTestReadErr(syscall.EINTR), // "interrupted system call": expected, not logged
+		pingerTestReadErr(syscall.ECONNREFUSED),
+		{pkt: make([]byte, 4), addr: &net.IPAddr{IP: net.ParseIP("10.0.0.1")}}, // malformed
+		pingerTestReply(t, "10.0.0.1", pingerID, 1, tx.Add(time.Millisecond)),
+	}
+	pingerTestSetup(t, conn, []time.Time{tx}, nil)
+
+	res, err := pingerTestPing(pingerTestIPs("10.0.0.1"), time.Second)
+	require.NoError(t, err, "receive errors do not abort Ping")
+	assert.Equal(t, map[netaddr.IP]float64{netaddr.MustParseIP("10.0.0.1"): 0.001}, res)
+	klog.Flush()
+	out := logs.String()
+	assert.NotContains(t, out, "interrupted system call")
+	assert.Contains(t, out, "connection refused")
+	assert.Contains(t, out, "failed to extract ICMP Echo from IPv4 packet 10.0.0.1")
+}
+
+func TestSend(t *testing.T) {
+	conn := &pingerTestConn{}
+	dst := &net.IPAddr{IP: net.ParseIP("10.1.2.3")}
+	require.NoError(t, send(conn, 0xFFFF, dst))
+	require.Len(t, conn.writes, 1)
+	assert.Equal(t, dst, conn.addrs[0])
+	m, err := icmp.ParseMessage(protocolICMP, conn.writes[0])
+	require.NoError(t, err)
+	assert.Equal(t, ipv4.ICMPTypeEcho, m.Type)
+	assert.Equal(t, &icmp.Echo{ID: pingerID, Seq: 0xFFFF, Data: nil}, m.Body)
+
+	conn.writeErrs = map[int]error{1: errors.New("no buffer space available")}
+	assert.EqualError(t, send(conn, 1, dst), "no buffer space available")
+}
+
+func TestReceive(t *testing.T) {
+	rx := time.Unix(1_700_000_000, 5_000)
+	reply := pingerTestReply(t, "10.0.0.1", pingerID, 4, rx)
+
+	t.Run("reply", func(t *testing.T) {
+		conn := &pingerTestConn{reads: []pingerTestRead{reply}}
+		start := time.Now()
+		ra, echo, ts, err := receive(conn)
+		require.NoError(t, err)
+		assert.Equal(t, "10.0.0.1", ra.IP.String())
+		require.NotNil(t, echo)
+		assert.Equal(t, pingerID, echo.ID)
+		assert.Equal(t, 4, echo.Seq)
+		assert.True(t, rx.Equal(ts), "want %s got %s", rx, ts)
+		assert.WithinDuration(t, start.Add(pingReplyPollTimeout), conn.deadline, time.Second)
+	})
+	t.Run("timeout", func(t *testing.T) {
+		ra, echo, ts, err := receive(&pingerTestConn{})
+		assert.NoError(t, err)
+		assert.Nil(t, ra)
+		assert.Nil(t, echo)
+		assert.True(t, ts.IsZero())
+	})
+	t.Run("no message of desired type", func(t *testing.T) {
+		ra, echo, _, err := receive(&pingerTestConn{reads: []pingerTestRead{pingerTestReadErr(syscall.ENOMSG)}})
+		assert.NoError(t, err)
+		assert.Nil(t, ra)
+		assert.Nil(t, echo)
+	})
+	t.Run("read error", func(t *testing.T) {
+		_, echo, _, err := receive(&pingerTestConn{reads: []pingerTestRead{pingerTestReadErr(syscall.EINTR)}})
+		assert.ErrorIs(t, err, syscall.EINTR)
+		assert.Nil(t, echo)
+	})
+	t.Run("not an echo reply", func(t *testing.T) {
+		r := reply
+		r.pkt = pingerTestIPv4(t, 5, &icmp.Message{Type: ipv4.ICMPTypeDestinationUnreachable, Body: &icmp.RawBody{Data: make([]byte, 28)}})
+		ra, echo, _, err := receive(&pingerTestConn{reads: []pingerTestRead{r}})
+		assert.NoError(t, err)
+		assert.Nil(t, ra)
+		assert.Nil(t, echo)
+	})
+	t.Run("malformed packet", func(t *testing.T) {
+		r := reply
+		r.pkt = make([]byte, ipv4.HeaderLen-1)
+		_, echo, _, err := receive(&pingerTestConn{reads: []pingerTestRead{r}})
+		assert.EqualError(t, err, "failed to extract ICMP Echo from IPv4 packet 10.0.0.1: malformed IPv4 packet")
+		assert.Nil(t, echo)
+	})
+	t.Run("no RX timestamp", func(t *testing.T) {
+		r := reply
+		r.oob = nil
+		ra, echo, _, err := receive(&pingerTestConn{reads: []pingerTestRead{r}})
+		assert.EqualError(t, err, "failed to get RX timestamp: no timestamp found")
+		assert.Nil(t, ra)
+		assert.Nil(t, echo)
+	})
+}
+
+// pingerTestUDPSocket returns a bound UDP socket with software TX timestamping,
+// which (unlike a raw ICMP socket) needs no privileges.
+func pingerTestUDPSocket(t *testing.T) (int, unix.Sockaddr) {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = unix.Close(fd) })
+	flags := unix.SOF_TIMESTAMPING_SOFTWARE | unix.SOF_TIMESTAMPING_TX_SOFTWARE |
+		unix.SOF_TIMESTAMPING_OPT_CMSG | unix.SOF_TIMESTAMPING_OPT_TSONLY
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TIMESTAMPING, flags); err != nil {
+		t.Skip("SO_TIMESTAMPING unsupported:", err)
+	}
+	require.NoError(t, unix.Bind(fd, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}))
+	sa, err := unix.Getsockname(fd)
+	require.NoError(t, err)
+	return fd, sa
+}
+
+func TestGetTxTimestampEmptyErrQueue(t *testing.T) {
+	fd, _ := pingerTestUDPSocket(t)
+	_, err := getTxTimestamp(fd)
+	assert.ErrorIs(t, err, syscall.EAGAIN)
+	assert.True(t, strings.HasPrefix(err.Error(), "resource temporarily unavailable"), "Ping relies on this text: %s", err)
+}
+
+func TestGetTxTimestamp(t *testing.T) {
+	fd, sa := pingerTestUDPSocket(t)
+	before := time.Now()
+	require.NoError(t, unix.Sendto(fd, []byte("ping"), 0, sa))
+	var ts time.Time
+	var err error
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		if ts, err = getTxTimestamp(fd); !errors.Is(err, syscall.EAGAIN) {
+			break
+		}
+	}
+	if errors.Is(err, syscall.EAGAIN) {
+		t.Skip("no TX timestamp was queued by the kernel")
+	}
+	require.NoError(t, err)
+	assert.WithinDuration(t, before, ts, 5*time.Second)
 }

@@ -12,20 +12,32 @@ import (
 	"debug/elf"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/perf"
 	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/ebpftracer/l7"
+	"github.com/florianl/go-conntrack"
+	"inet.af/netaddr"
 
 	"github.com/containerd/cgroups"
 	cgroupsV2 "github.com/containerd/cgroups/v2"
@@ -496,6 +508,10 @@ func TestIsCtxExtraPaddingRequired(t *testing.T) {
 		"format:\n\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;\n"+
 			"\tfield:unsigned char common_preempt_lazy_count;\toffset:4;\tsize:1;\tsigned:0;\n"), 0o644))
 	assert.True(t, isCtxExtraPaddingRequired(dir))
+
+	require.NoError(t, os.Remove(format))
+	require.NoError(t, os.Mkdir(format, 0o755))
+	assert.False(t, isCtxExtraPaddingRequired(dir), "unreadable format file")
 }
 
 func TestEbpfProgVariants(t *testing.T) {
@@ -549,4 +565,675 @@ func TestNewTracer(t *testing.T) {
 	links, isGo := tr.AttachGoTlsUprobes(uint32(os.Getpid()))
 	assert.Nil(t, links)
 	assert.False(t, isGo)
+}
+
+// --- runEventsReader / ebpf / Run / Close with the kernel faked out ---
+
+type tracerTestRead struct {
+	rec perf.Record
+	err error
+}
+
+type tracerTestReader struct {
+	reads chan tracerTestRead
+	done  chan struct{}
+	once  sync.Once
+
+	mu        sync.Mutex
+	closed    int
+	deadlines []time.Duration
+	size      int
+	opts      perf.ReaderOptions
+}
+
+func newTracerTestReader(reads ...tracerTestRead) *tracerTestReader {
+	r := &tracerTestReader{reads: make(chan tracerTestRead, 100), done: make(chan struct{})}
+	for _, rd := range reads {
+		r.reads <- rd
+	}
+	return r
+}
+
+// Read returns the queued reads first and perf.ErrClosed once the queue is drained and the reader is closed.
+func (r *tracerTestReader) Read() (perf.Record, error) {
+	select {
+	case rd := <-r.reads:
+		return rd.rec, rd.err
+	default:
+	}
+	select {
+	case rd := <-r.reads:
+		return rd.rec, rd.err
+	case <-r.done:
+		return perf.Record{}, fmt.Errorf("read: %w", perf.ErrClosed)
+	}
+}
+
+func (r *tracerTestReader) SetDeadline(t time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.deadlines = append(r.deadlines, time.Until(t))
+}
+
+func (r *tracerTestReader) Close() error {
+	r.mu.Lock()
+	r.closed++
+	r.mu.Unlock()
+	r.once.Do(func() { close(r.done) })
+	return nil
+}
+
+func (r *tracerTestReader) closedCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closed
+}
+
+func (r *tracerTestReader) maxDeadline() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var res time.Duration
+	for _, d := range r.deadlines {
+		if d > res {
+			res = d
+		}
+	}
+	return res
+}
+
+func tracerTestSample(raw []byte) tracerTestRead {
+	return tracerTestRead{rec: perf.Record{RawSample: raw}}
+}
+
+func tracerTestProcRecord(typ EventType, pid uint32, reason EventReason) []byte {
+	raw := make([]byte, 12)
+	binary.LittleEndian.PutUint32(raw[0:], uint32(typ))
+	binary.LittleEndian.PutUint32(raw[4:], pid)
+	binary.LittleEndian.PutUint32(raw[8:], uint32(reason))
+	return raw
+}
+
+func tracerTestFileRecord(pid uint32, fd, mnt, log uint64) []byte {
+	raw := make([]byte, 32)
+	binary.LittleEndian.PutUint32(raw[0:], uint32(EventTypeFileOpen))
+	binary.LittleEndian.PutUint32(raw[4:], pid)
+	binary.LittleEndian.PutUint64(raw[8:], fd)
+	binary.LittleEndian.PutUint64(raw[16:], mnt)
+	binary.LittleEndian.PutUint64(raw[24:], log)
+	return raw
+}
+
+func tracerTestTcpRecord(typ EventType, pid uint32, src, dst, actual string) []byte {
+	le := binary.LittleEndian
+	raw := make([]byte, 104)
+	le.PutUint64(raw[0:], 11)
+	le.PutUint64(raw[8:], 1_000_000)
+	le.PutUint64(raw[16:], 2_500_000)
+	le.PutUint32(raw[24:], uint32(typ))
+	le.PutUint32(raw[28:], pid)
+	le.PutUint64(raw[32:], 1234)
+	le.PutUint64(raw[40:], 5678)
+	for i, a := range []string{src, dst, actual} {
+		ipp := netaddr.MustParseIPPort(a)
+		le.PutUint16(raw[48+2*i:], ipp.Port())
+		ip := ipp.IP().As16()
+		copy(raw[54+16*i:], ip[:])
+	}
+	return raw
+}
+
+func tracerTestL7Record(pid uint32, payloadSize uint64, payload []byte) []byte {
+	le := binary.LittleEndian
+	raw := make([]byte, 48+MaxPayloadSize)
+	le.PutUint64(raw[0:], 5)
+	le.PutUint64(raw[8:], 777)
+	le.PutUint32(raw[16:], pid)
+	le.PutUint32(raw[20:], 200)
+	le.PutUint64(raw[24:], 3_000_000)
+	raw[32] = uint8(l7.ProtocolHTTP)
+	raw[33] = uint8(l7.MethodStatementPrepare)
+	le.PutUint32(raw[36:], 42)
+	le.PutUint64(raw[40:], payloadSize)
+	copy(raw[48:], payload)
+	return raw
+}
+
+func tracerTestRunReader(typ perfMapType, readTimeout time.Duration, reads ...tracerTestRead) ([]Event, *tracerTestReader) {
+	r := newTracerTestReader(reads...)
+	_ = r.Close()
+	ch := make(chan Event, 100)
+	runEventsReader("test", r, ch, typ, readTimeout)
+	close(ch)
+	var res []Event
+	for e := range ch {
+		res = append(res, e)
+	}
+	return res, r
+}
+
+func TestRunEventsReaderProcAndFileEvents(t *testing.T) {
+	events, r := tracerTestRunReader(perfMapTypeProcEvents, 0,
+		tracerTestSample(tracerTestProcRecord(EventTypeProcessStart, 1, EventReasonNone)),
+		tracerTestRead{rec: perf.Record{LostSamples: 10}},
+		tracerTestRead{err: os.ErrDeadlineExceeded},
+		tracerTestSample([]byte{1, 2, 3}),
+		tracerTestSample(tracerTestProcRecord(EventTypeProcessExit, 2, EventReasonOOMKill)),
+	)
+	assert.Equal(t, []Event{
+		{Type: EventTypeProcessStart, Pid: 1},
+		{Type: EventTypeProcessExit, Reason: EventReasonOOMKill, Pid: 2},
+	}, events)
+	// a deadline is set before every read: 5 queued + the final closed read
+	assert.Len(t, r.deadlines, 6)
+	for _, d := range r.deadlines {
+		assert.True(t, d > 50*time.Millisecond && d <= 100*time.Millisecond, "default read timeout, got %s", d)
+	}
+
+	events, r = tracerTestRunReader(perfMapTypeFileEvents, 10*time.Millisecond,
+		tracerTestSample(tracerTestFileRecord(7, 3, 0xdead, 0)),
+		tracerTestSample(tracerTestFileRecord(8, 4, 0xbeef, 1)),
+		tracerTestSample(make([]byte, 20)),
+	)
+	assert.Equal(t, []Event{
+		{Type: EventTypeFileOpen, Pid: 7, Fd: 3, Mnt: 0xdead},
+		{Type: EventTypeFileOpen, Pid: 8, Fd: 4, Mnt: 0xbeef, Log: true},
+	}, events)
+	assert.LessOrEqual(t, r.maxDeadline(), 10*time.Millisecond)
+}
+
+func TestRunEventsReaderTcpEvents(t *testing.T) {
+	events, _ := tracerTestRunReader(perfMapTypeTCPEvents, 0,
+		tracerTestSample(tracerTestTcpRecord(EventTypeConnectionOpen, 99, "10.0.0.1:50000", "10.96.0.10:443", "10.244.0.5:8443")),
+		tracerTestSample(tracerTestTcpRecord(EventTypeConnectionClose, 99, "[2001:db8::1]:50000", "[2001:db8::2]:443", "0.0.0.0:0")),
+		tracerTestSample(make([]byte, 101)),
+	)
+	src, dst, actual := netaddr.MustParseIPPort("10.0.0.1:50000"), netaddr.MustParseIPPort("10.96.0.10:443"), netaddr.MustParseIPPort("10.244.0.5:8443")
+	assert.Equal(t, []Event{
+		{Type: EventTypeConnectionOpen, Pid: 99, SrcAddr: src, DstAddr: dst, ActualDstAddr: actual, Fd: 11, Timestamp: 1_000_000, Duration: 2500 * time.Microsecond},
+		{Type: EventTypeConnectionClose, Pid: 99, SrcAddr: netaddr.MustParseIPPort("[2001:db8::1]:50000"), DstAddr: netaddr.MustParseIPPort("[2001:db8::2]:443"),
+			ActualDstAddr: netaddr.IPPortFrom(netaddr.IPv4(0, 0, 0, 0), 0), Fd: 11, Timestamp: 1_000_000, Duration: 2500 * time.Microsecond,
+			TrafficStats: &TrafficStats{BytesSent: 1234, BytesReceived: 5678}},
+	}, events)
+}
+
+func TestRunEventsReaderL7Events(t *testing.T) {
+	payload := []byte("GET /health HTTP/1.1\r\n")
+	full := bytes.Repeat([]byte("x"), MaxPayloadSize)
+	events, _ := tracerTestRunReader(perfMapTypeL7Events, 0,
+		tracerTestSample(tracerTestL7Record(1, 0, payload)),
+		tracerTestSample(tracerTestL7Record(2, uint64(len(payload)), payload)),
+		tracerTestSample(tracerTestL7Record(3, 5000, full)),
+		tracerTestSample(make([]byte, 47)),
+	)
+	require.Len(t, events, 3)
+	req := func(payload []byte) *l7.RequestData {
+		return &l7.RequestData{Protocol: l7.ProtocolHTTP, Status: 200, Duration: 3 * time.Millisecond,
+			Method: l7.MethodStatementPrepare, StatementId: 42, Payload: payload}
+	}
+	assert.Equal(t, Event{Type: EventTypeL7Request, Pid: 1, Fd: 5, Timestamp: 777, L7Request: req(nil)}, events[0])
+	assert.Equal(t, Event{Type: EventTypeL7Request, Pid: 2, Fd: 5, Timestamp: 777, L7Request: req(payload)}, events[1])
+	assert.Equal(t, Event{Type: EventTypeL7Request, Pid: 3, Fd: 5, Timestamp: 777, L7Request: req(full)}, events[2], "payload is capped at MaxPayloadSize")
+}
+
+func TestRunEventsReaderUnknownMapType(t *testing.T) {
+	events, r := tracerTestRunReader(perfMapType(99), 0, tracerTestSample(tracerTestProcRecord(EventTypeProcessStart, 1, 0)))
+	assert.Empty(t, events)
+	assert.Len(t, r.deadlines, 2)
+}
+
+type tracerTestEbpfEnv struct {
+	specs       []*ebpf.CollectionSpec
+	collErr     error
+	readers     []*tracerTestReader
+	readerErr   func(n int) error
+	tracepoints []string
+	kprobes     []string
+	links       []*elfTestLink
+	linkErr     func(name string) error
+}
+
+func tracerTestKernel(t *testing.T, version string) {
+	prev := common.GetKernelVersion()
+	t.Cleanup(func() {
+		if prev.Major > 0 {
+			_ = common.SetKernelVersion(prev.String())
+		}
+	})
+	require.NoError(t, common.SetKernelVersion(version))
+}
+
+func tracerTestTraceFs(t *testing.T, paths ...string) {
+	prev := traceFsPaths
+	t.Cleanup(func() { traceFsPaths = prev })
+	traceFsPaths = paths
+}
+
+// tracerTestFakeEbpf fakes collection loading, perf readers and kprobe/tracepoint links,
+// with a tracefs that does (padding) or does not require the ctx-extra-padding variant.
+func tracerTestFakeEbpf(t *testing.T, kernel string, padding bool) *tracerTestEbpfEnv {
+	tracerTestKernel(t, kernel)
+	traceFs := t.TempDir()
+	format := filepath.Join(traceFs, "events/task/task_newtask/format")
+	require.NoError(t, os.MkdirAll(filepath.Dir(format), 0o755))
+	field := "common_pid"
+	if padding {
+		field = "common_preempt_lazy_count"
+	}
+	require.NoError(t, os.WriteFile(format, []byte("format:\n\tfield:unsigned char "+field+";\toffset:4;\tsize:1;\tsigned:0;\n"), 0o644))
+	tracerTestTraceFs(t, filepath.Join(t.TempDir(), "missing"), traceFs)
+
+	env := &tracerTestEbpfEnv{}
+	prevColl, prevReader, prevTp, prevKp := newCollection, newPerfReader, linkTracepoint, linkKprobe
+	t.Cleanup(func() {
+		newCollection, newPerfReader, linkTracepoint, linkKprobe = prevColl, prevReader, prevTp, prevKp
+	})
+	newCollection = func(spec *ebpf.CollectionSpec, opts ebpf.CollectionOptions) (*ebpf.Collection, error) {
+		env.specs = append(env.specs, spec)
+		if env.collErr != nil {
+			return nil, env.collErr
+		}
+		c := &ebpf.Collection{Programs: map[string]*ebpf.Program{}, Maps: map[string]*ebpf.Map{}}
+		for name := range spec.Programs {
+			c.Programs[name] = nil
+		}
+		for name := range spec.Maps {
+			c.Maps[name] = nil
+		}
+		return c, nil
+	}
+	newPerfReader = func(array *ebpf.Map, perCPUBuffer int, opts perf.ReaderOptions) (perfReader, error) {
+		if env.readerErr != nil {
+			if err := env.readerErr(len(env.readers) + 1); err != nil {
+				return nil, err
+			}
+		}
+		r := newTracerTestReader()
+		r.size, r.opts = perCPUBuffer, opts
+		env.readers = append(env.readers, r)
+		return r, nil
+	}
+	attach := func(name string) (link.Link, error) {
+		if env.linkErr != nil {
+			if err := env.linkErr(name); err != nil {
+				return nil, err
+			}
+		}
+		l := &elfTestLink{}
+		env.links = append(env.links, l)
+		return l, nil
+	}
+	linkTracepoint = func(group, name string, prog *ebpf.Program, opts *link.TracepointOptions) (link.Link, error) {
+		assert.Nil(t, opts)
+		env.tracepoints = append(env.tracepoints, group+"/"+name)
+		return attach(name)
+	}
+	linkKprobe = func(symbol string, prog *ebpf.Program, opts *link.KprobeOptions) (link.Link, error) {
+		assert.Nil(t, opts)
+		env.kprobes = append(env.kprobes, symbol)
+		return attach(symbol)
+	}
+	return env
+}
+
+// programs returns the sorted AttachTo of the loaded spec's programs of the given type
+// (uprobe=true: the names of the uprobe programs).
+func (env *tracerTestEbpfEnv) programs(typ ebpf.ProgramType, uprobes bool, except ...string) []string {
+	var res []string
+	for name, p := range env.specs[0].Programs {
+		if p.Type != typ || strings.HasPrefix(p.SectionName, "uprobe/") != uprobes || slices.Contains(except, name) {
+			continue
+		}
+		if uprobes {
+			res = append(res, name)
+		} else {
+			res = append(res, p.AttachTo)
+		}
+	}
+	sort.Strings(res)
+	return res
+}
+
+func (env *tracerTestEbpfEnv) linksClosed() []int {
+	var res []int
+	for _, l := range env.links {
+		res = append(res, l.closed)
+	}
+	return res
+}
+
+func (env *tracerTestEbpfEnv) readersClosed() []int {
+	var res []int
+	for _, r := range env.readers {
+		res = append(res, r.closedCount())
+	}
+	return res
+}
+
+func tracerTestRepeat(v, n int) []int {
+	res := make([]int, n)
+	for i := range res {
+		res[i] = v
+	}
+	return res
+}
+
+var tracerTestL7Syscalls = []string{
+	"sys_enter_writev", "sys_enter_write", "sys_enter_sendto", "sys_enter_sendmsg", "sys_enter_sendmmsg",
+	"sys_enter_read", "sys_enter_readv", "sys_enter_recvfrom", "sys_enter_recvmsg",
+	"sys_exit_read", "sys_exit_readv", "sys_exit_recvfrom", "sys_exit_recvmsg",
+}
+
+func tracerTestWaitEvents(t *testing.T, ch <-chan Event, n int) map[uint32]Event {
+	res := map[uint32]Event{}
+	timeout := time.After(5 * time.Second)
+	for len(res) < n {
+		select {
+		case e := <-ch:
+			res[e.Pid] = e
+		case <-timeout:
+			t.Fatalf("got %d of %d events", len(res), n)
+		}
+	}
+	return res
+}
+
+func TestTracerEbpf(t *testing.T) {
+	env := tracerTestFakeEbpf(t, "6.8.0", false)
+	tr := NewTracer(0, 0, false)
+	ch := make(chan Event, 100)
+	require.NoError(t, tr.ebpf(ch))
+	require.Len(t, env.specs, 1)
+	require.NotNil(t, tr.collection)
+
+	// perf readers: one per perf map, each decoding its own record type
+	pageSize := os.Getpagesize()
+	expected := map[string]int{"proc_events": 4, "tcp_listen_events": 4, "tcp_connect_events": 8, "tcp_retransmit_events": 4, "file_events": 4, "l7_events": 32}
+	require.Len(t, tr.readers, len(expected))
+	for name, pages := range expected {
+		r := tr.readers[name].(*tracerTestReader)
+		assert.Equal(t, pages*pageSize, r.size, name)
+		assert.Equal(t, perf.ReaderOptions{WakeupEvents: 100}, r.opts, name)
+		assert.Contains(t, env.specs[0].Maps, name)
+	}
+	reader := func(name string) *tracerTestReader { return tr.readers[name].(*tracerTestReader) }
+	reader("proc_events").reads <- tracerTestSample(tracerTestProcRecord(EventTypeProcessStart, 1, 0))
+	reader("tcp_listen_events").reads <- tracerTestSample(tracerTestTcpRecord(EventTypeListenOpen, 2, "0.0.0.0:80", "0.0.0.0:0", "0.0.0.0:0"))
+	reader("tcp_connect_events").reads <- tracerTestSample(tracerTestTcpRecord(EventTypeConnectionOpen, 3, "10.0.0.1:5000", "10.0.0.2:80", "0.0.0.0:0"))
+	reader("tcp_retransmit_events").reads <- tracerTestSample(tracerTestTcpRecord(EventTypeTCPRetransmit, 4, "10.0.0.1:5000", "10.0.0.2:80", "0.0.0.0:0"))
+	reader("file_events").reads <- tracerTestSample(tracerTestFileRecord(5, 3, 1, 1))
+	reader("l7_events").reads <- tracerTestSample(tracerTestL7Record(6, 0, nil))
+	events := tracerTestWaitEvents(t, ch, 6)
+	for pid, typ := range map[uint32]EventType{1: EventTypeProcessStart, 2: EventTypeListenOpen, 3: EventTypeConnectionOpen,
+		4: EventTypeTCPRetransmit, 5: EventTypeFileOpen, 6: EventTypeL7Request} {
+		assert.Equal(t, typ, events[pid].Type, "pid %d", pid)
+	}
+	assert.LessOrEqual(t, reader("tcp_connect_events").maxDeadline(), 10*time.Millisecond)
+	assert.Greater(t, reader("proc_events").maxDeadline(), 10*time.Millisecond)
+
+	// every tracepoint and kprobe is linked; uprobes are only kept for later
+	sort.Strings(env.tracepoints)
+	sort.Strings(env.kprobes)
+	assert.Equal(t, env.programs(ebpf.TracePoint, false), env.tracepoints)
+	assert.Contains(t, env.tracepoints, "sched/sched_process_exit")
+	assert.Equal(t, []string{"nf_ct_deliver_cached_events", "path_get"}, env.kprobes)
+	assert.Equal(t, env.programs(ebpf.Kprobe, true), slices.Sorted(maps.Keys(tr.uprobes)))
+	assert.Contains(t, tr.uprobes, "openssl_SSL_read_exit")
+	assert.Len(t, tr.links, len(env.tracepoints)+len(env.kprobes))
+	for i, l := range tr.links {
+		assert.Same(t, env.links[i], l)
+	}
+
+	tr.Close()
+	assert.Equal(t, tracerTestRepeat(1, len(env.links)), env.linksClosed())
+	assert.Equal(t, tracerTestRepeat(1, len(env.readers)), env.readersClosed())
+}
+
+func TestTracerEbpfL7Disabled(t *testing.T) {
+	env := tracerTestFakeEbpf(t, "6.8.0", false)
+	tr := NewTracer(0, 0, true)
+	require.NoError(t, tr.ebpf(make(chan Event)))
+	assert.NotContains(t, tr.readers, "l7_events")
+	assert.Len(t, tr.readers, 5)
+	sort.Strings(env.tracepoints)
+	assert.Equal(t, env.programs(ebpf.TracePoint, false, tracerTestL7Syscalls...), env.tracepoints)
+	for _, name := range tracerTestL7Syscalls {
+		assert.NotContains(t, env.tracepoints, "syscalls/"+name)
+	}
+	assert.Contains(t, env.tracepoints, "syscalls/sys_enter_connect")
+	assert.Len(t, env.kprobes, 2)
+	// TLS uprobe programs are still registered; attaching them is gated separately
+	assert.Contains(t, tr.uprobes, "go_crypto_tls_write_enter")
+	tr.Close()
+}
+
+func TestTracerEbpfVariantSelection(t *testing.T) {
+	sentinel := errors.New("variant loaded")
+	real := ebpfProgs[runtime.GOARCH]
+	t.Cleanup(func() { ebpfProgs[runtime.GOARCH] = real })
+	for _, c := range []struct {
+		kernel  string
+		padding bool
+		version string
+		flags   string
+	}{
+		{"6.8.0", true, "5.12", "ctx-extra-padding"},
+		{"6.8.0", false, "5.12", ""},
+		{"5.12.0", false, "5.12", ""},
+		{"5.11.0", false, "5.6", ""},
+		{"5.4.0", false, "4.20", ""},
+		{"4.19.0", false, "4.16", ""},
+		{"4.16.0", false, "4.16", ""},
+	} {
+		t.Run(fmt.Sprintf("%s %v", c.kernel, c.padding), func(t *testing.T) {
+			// only the expected variant decodes; picking any other one fails with an encoding error
+			var variants []struct {
+				version string
+				flags   string
+				prog    []byte
+			}
+			for _, p := range real {
+				if p.version != c.version || p.flags != c.flags {
+					p.prog = []byte("!")
+				}
+				variants = append(variants, p)
+			}
+			ebpfProgs[runtime.GOARCH] = variants
+			env := tracerTestFakeEbpf(t, c.kernel, c.padding)
+			env.collErr = sentinel
+			err := NewTracer(0, 0, false).ebpf(make(chan Event))
+			assert.ErrorIs(t, err, sentinel)
+			assert.Len(t, env.specs, 1)
+		})
+	}
+
+	ebpfProgs[runtime.GOARCH] = real
+	env := tracerTestFakeEbpf(t, "4.15.0", false)
+	assert.EqualError(t, NewTracer(0, 0, false).ebpf(nil), "unsupported kernel version: 4.15.0 ")
+	env = tracerTestFakeEbpf(t, "5.11.0", true)
+	assert.EqualError(t, NewTracer(0, 0, false).ebpf(nil), "unsupported kernel version: 5.11.0 ctx-extra-padding")
+	assert.Empty(t, env.specs)
+}
+
+func TestTracerEbpfLoadErrors(t *testing.T) {
+	real := ebpfProgs[runtime.GOARCH]
+	t.Cleanup(func() { ebpfProgs[runtime.GOARCH] = real })
+	gz := func(data []byte) []byte {
+		b := &bytes.Buffer{}
+		w := gzip.NewWriter(b)
+		_, _ = w.Write(data)
+		require.NoError(t, w.Close())
+		return b.Bytes()
+	}
+	b64 := func(data []byte) []byte { return []byte(base64.StdEncoding.EncodeToString(data)) }
+	for blob, msg := range map[string]string{
+		"!":                                   "invalid program encoding",
+		string(b64(gz([]byte("hello"))[:15])): "failed to ungzip program",
+		string(b64(gz([]byte("not an ELF")))): "failed to load collection spec",
+	} {
+		ebpfProgs[runtime.GOARCH] = []struct {
+			version string
+			flags   string
+			prog    []byte
+		}{{"4.16", "", []byte(blob)}}
+		env := tracerTestFakeEbpf(t, "6.8.0", false)
+		err := NewTracer(0, 0, false).ebpf(nil)
+		require.Error(t, err)
+		assert.True(t, strings.HasPrefix(err.Error(), msg+": "), err.Error())
+		assert.Empty(t, env.specs)
+	}
+
+	ebpfProgs[runtime.GOARCH] = real
+	env := tracerTestFakeEbpf(t, "6.8.0", false)
+	env.collErr = fmt.Errorf("load program: %w", &ebpf.VerifierError{Cause: syscall.EACCES, Log: []string{"0: (b7) r0 = 0", "R1 invalid mem access"}})
+	err := NewTracer(0, 0, false).ebpf(nil)
+	assert.ErrorContains(t, err, "failed to load collection: load program: ")
+	var vErr *ebpf.VerifierError
+	assert.ErrorAs(t, err, &vErr)
+
+	tracerTestFakeEbpf(t, "6.8.0", false)
+	tracerTestTraceFs(t, filepath.Join(t.TempDir(), "missing"))
+	assert.EqualError(t, NewTracer(0, 0, false).ebpf(nil), "kernel tracing is not available: debugfs or tracefs must be mounted")
+}
+
+func TestTracerEbpfAttachErrors(t *testing.T) {
+	t.Run("perf reader", func(t *testing.T) {
+		env := tracerTestFakeEbpf(t, "6.8.0", false)
+		env.readerErr = func(n int) error {
+			if n == 3 {
+				return errors.New("boom")
+			}
+			return nil
+		}
+		assert.EqualError(t, NewTracer(0, 0, false).ebpf(make(chan Event)), "failed to create ebpf reader: boom")
+		assert.Equal(t, []int{1, 1}, env.readersClosed())
+		assert.Empty(t, env.links)
+	})
+
+	for _, name := range []string{"sys_enter_connect", "path_get"} {
+		t.Run(name, func(t *testing.T) {
+			env := tracerTestFakeEbpf(t, "6.8.0", false)
+			env.linkErr = func(n string) error {
+				if n == name {
+					return errors.New("boom")
+				}
+				return nil
+			}
+			tr := NewTracer(0, 0, false)
+			assert.EqualError(t, tr.ebpf(make(chan Event)), "failed to link program '"+name+"': boom")
+			assert.Equal(t, tracerTestRepeat(1, len(env.links)), env.linksClosed(), "links attached before the failure are released")
+			assert.Equal(t, tracerTestRepeat(1, 6), env.readersClosed())
+		})
+	}
+
+	t.Run("nf_conntrack not in use", func(t *testing.T) {
+		env := tracerTestFakeEbpf(t, "6.8.0", false)
+		env.linkErr = func(n string) error {
+			if n == "nf_ct_deliver_cached_events" {
+				return errors.New("symbol not found")
+			}
+			return nil
+		}
+		tr := NewTracer(0, 0, false)
+		require.NoError(t, tr.ebpf(make(chan Event)))
+		assert.Len(t, tr.links, len(env.programs(ebpf.TracePoint, false))+1)
+		tr.Close()
+	})
+}
+
+func TestTracerDefaultSeams(t *testing.T) {
+	// the defaults call straight into cilium/ebpf and go-conntrack
+	_, err := newPerfReader(nil, 0, perf.ReaderOptions{})
+	assert.EqualError(t, err, "perCPUBuffer must be larger than 0")
+	if c, err := openConntrack(&conntrack.Config{}); err == nil {
+		assert.NoError(t, c.Close())
+	}
+}
+
+func TestTracerMapIterators(t *testing.T) {
+	tr := NewTracer(0, 0, false)
+	tr.collection = &ebpf.Collection{Maps: map[string]*ebpf.Map{"active_connections": {}, "nodejs_stats": {}, "python_stats": {}}}
+	assert.NotNil(t, tr.ActiveConnectionsIterator())
+	assert.NotNil(t, tr.NodejsStatsIterator())
+	assert.NotNil(t, tr.PythonStatsIterator())
+}
+
+func tracerTestConntrackParam(t *testing.T, value string) string {
+	p := filepath.Join(t.TempDir(), "nf_conntrack_events")
+	if value != "" {
+		require.NoError(t, os.WriteFile(p, []byte(value), 0o644))
+	}
+	prev := nfConntrackEventsParameterPath
+	t.Cleanup(func() { nfConntrackEventsParameterPath = prev })
+	nfConntrackEventsParameterPath = p
+	return p
+}
+
+func TestEnsureConntrackEventsAreEnabled(t *testing.T) {
+	p := tracerTestConntrackParam(t, "1\n")
+	require.NoError(t, ensureConntrackEventsAreEnabled())
+	data, err := os.ReadFile(p)
+	require.NoError(t, err)
+	assert.Equal(t, "1\n", string(data), "already enabled: not rewritten")
+
+	p = tracerTestConntrackParam(t, "0\n")
+	require.NoError(t, ensureConntrackEventsAreEnabled())
+	data, err = os.ReadFile(p)
+	require.NoError(t, err)
+	assert.Equal(t, "1", string(data))
+
+	tracerTestConntrackParam(t, "")
+	assert.NoError(t, ensureConntrackEventsAreEnabled(), "nf_conntrack is not loaded")
+
+	tracerTestConntrackParam(t, "yes")
+	assert.Error(t, ensureConntrackEventsAreEnabled())
+
+	if os.Geteuid() != 0 {
+		p = tracerTestConntrackParam(t, "2")
+		require.NoError(t, os.Chmod(p, 0o444))
+		assert.ErrorIs(t, ensureConntrackEventsAreEnabled(), os.ErrPermission)
+	}
+}
+
+func TestTracerRun(t *testing.T) {
+	pid := uint32(os.Getpid())
+
+	t.Run("conntrack events check fails", func(t *testing.T) {
+		tracerTestConntrackParam(t, "garbage")
+		env := tracerTestFakeEbpf(t, "6.8.0", false)
+		assert.Error(t, NewTracer(0, 0, false).Run(make(chan Event)))
+		assert.Empty(t, env.specs)
+	})
+
+	t.Run("ebpf fails", func(t *testing.T) {
+		tracerTestConntrackParam(t, "1")
+		tracerTestFakeEbpf(t, "4.15.0", false)
+		assert.EqualError(t, NewTracer(0, 0, false).Run(make(chan Event)), "unsupported kernel version: 4.15.0 ")
+	})
+
+	t.Run("init fails", func(t *testing.T) {
+		tracerTestConntrackParam(t, "1")
+		env := tracerTestFakeEbpf(t, "6.8.0", false)
+		initTestFakeConntrack(t, func(int) (*initTestConntrack, error) { return nil, errors.New("netlink: boom") })
+		tr := NewTracer(0, 0, false)
+		assert.EqualError(t, tr.Run(make(chan Event, 1<<16)), "netlink: boom")
+		tr.Close()
+		assert.Equal(t, tracerTestRepeat(1, len(env.readers)), env.readersClosed())
+	})
+
+	t.Run("ok", func(t *testing.T) {
+		p := tracerTestConntrackParam(t, "0")
+		env := tracerTestFakeEbpf(t, "6.8.0", false)
+		initTestFakeConntrack(t, func(int) (*initTestConntrack, error) { return &initTestConntrack{}, nil })
+		initTestFakeUpdateMap(t, nil)
+		ch := make(chan Event, 1<<16)
+		tr := NewTracer(0, 0, false)
+		require.NoError(t, tr.Run(ch))
+		data, err := os.ReadFile(p)
+		require.NoError(t, err)
+		assert.Equal(t, "1", string(data))
+		assert.Len(t, env.specs, 1)
+		tr.Close()
+		assert.Equal(t, tracerTestRepeat(1, len(env.links)), env.linksClosed())
+		assert.Contains(t, initTestEvents(ch, pid), Event{Type: EventTypeProcessStart, Pid: pid})
+	})
 }

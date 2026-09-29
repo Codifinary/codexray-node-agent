@@ -7,6 +7,7 @@ package profiling
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,7 +19,10 @@ import (
 	"github.com/codifinary/codexray-node-agent/containers"
 	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/codifinary/codexray-node-agent/proc"
+	"github.com/go-kit/log"
 	"github.com/google/pprof/profile"
+	ebpfspy "github.com/grafana/pyroscope/ebpf"
+	"github.com/grafana/pyroscope/ebpf/cpp/demangle"
 	"github.com/grafana/pyroscope/ebpf/pprof"
 	"github.com/grafana/pyroscope/ebpf/sd"
 	"github.com/prometheus/prometheus/model/labels"
@@ -376,4 +380,414 @@ func TestStartStopWithoutSession(t *testing.T) {
 	require.Nil(t, session)
 	assert.NotPanics(t, Start)
 	assert.NotPanics(t, Stop)
+}
+
+// profilingTestSession is a fake eBPF session: no root, no BPF, scripted samples.
+type profilingTestSession struct {
+	lock       sync.Mutex
+	startErr   error
+	collectErr error
+	samples    []pprof.ProfileSample
+	started    int
+	stopped    int
+	updates    int
+	collects   int
+}
+
+func (s *profilingTestSession) CollectProfiles(cb pprof.CollectProfilesCallback) error {
+	s.lock.Lock()
+	s.collects++
+	samples := s.samples
+	s.lock.Unlock()
+	for _, sample := range samples {
+		cb(sample)
+	}
+	return s.collectErr
+}
+
+func (s *profilingTestSession) Start() error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.started++
+	return s.startErr
+}
+
+func (s *profilingTestSession) Stop() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.stopped++
+}
+
+func (s *profilingTestSession) Update(ebpfspy.SessionOptions) error { return nil }
+
+func (s *profilingTestSession) UpdateTargets(sd.TargetsOptions) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.updates++
+}
+
+func (s *profilingTestSession) DebugInfo() interface{} { return nil }
+
+func (s *profilingTestSession) counts() (started, stopped, updates, collects int) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.started, s.stopped, s.updates, s.collects
+}
+
+// profilingTestUseSession installs fake as the package session and a fresh targetFinder.
+func profilingTestUseSession(t *testing.T, fake ebpfspy.Session) {
+	prevSession, prevFinder := session, targetFinder
+	session = fake
+	targetFinder = &TargetFinder{processes: map[uint32]*processInfo{}}
+	t.Cleanup(func() { session, targetFinder = prevSession, prevFinder })
+}
+
+// profilingTestTicks makes newTicker return a ticker that fires n times and then is closed,
+// so collect() runs exactly n iterations and returns.
+func profilingTestTicks(t *testing.T, n int) *[]time.Duration {
+	var intervals []time.Duration
+	prev := newTicker
+	newTicker = func(d time.Duration) *time.Ticker {
+		intervals = append(intervals, d)
+		ch := make(chan time.Time, n)
+		for i := 0; i < n; i++ {
+			ch <- time.Now()
+		}
+		close(ch)
+		return &time.Ticker{C: ch}
+	}
+	t.Cleanup(func() { newTicker = prev })
+	return &intervals
+}
+
+func profilingTestSamples(cids ...string) []pprof.ProfileSample {
+	var res []pprof.ProfileSample
+	for _, cid := range cids {
+		res = append(res, pprof.ProfileSample{
+			Target:      profilingTestTarget(cid),
+			Pid:         profilingTestPid,
+			SampleType:  pprof.SampleTypeCpu,
+			Aggregation: pprof.SampleAggregated,
+			Stack:       []string{"leaf", "main"},
+			Value:       profilingTestSampleCount,
+		})
+	}
+	return res
+}
+
+func TestCollectUploadsEveryProfile(t *testing.T) {
+	col := profilingTestSetup(t, http.StatusOK, profilingTestAPIKey)
+	fake := &profilingTestSession{samples: profilingTestSamples("/docker/a", "/docker/b", "/docker/c")}
+	profilingTestUseSession(t, fake)
+	intervals := profilingTestTicks(t, 1)
+
+	collect()
+
+	assert.Equal(t, []time.Duration{CollectInterval}, *intervals)
+	_, _, updates, collects := fake.counts()
+	assert.Equal(t, 1, updates, "targets are refreshed before each collection")
+	assert.Equal(t, 1, collects)
+	reqs := col.all()
+	require.Len(t, reqs, 3, "one upload per profile builder")
+	var cids []string
+	for _, r := range reqs {
+		cids = append(cids, r.query.Get("container.id"))
+		require.NotNil(t, r.profile)
+		assert.Equal(t, profilingTestExpectedType, r.profile.SampleType[0].Type)
+	}
+	assert.ElementsMatch(t, []string{"/docker/a", "/docker/b", "/docker/c"}, cids)
+}
+
+func TestCollectEveryTick(t *testing.T) {
+	col := profilingTestSetup(t, http.StatusOK, profilingTestAPIKey)
+	fake := &profilingTestSession{samples: profilingTestSamples("/docker/a")}
+	profilingTestUseSession(t, fake)
+	profilingTestTicks(t, 3)
+
+	collect()
+
+	_, _, updates, collects := fake.counts()
+	assert.Equal(t, 3, updates)
+	assert.Equal(t, 3, collects)
+	assert.Len(t, col.all(), 3, "fresh builders every interval")
+}
+
+func TestCollectStopsUploadingOnError(t *testing.T) {
+	col := profilingTestSetup(t, http.StatusInternalServerError, profilingTestAPIKey)
+	fake := &profilingTestSession{samples: profilingTestSamples("/docker/a", "/docker/b", "/docker/c")}
+	profilingTestUseSession(t, fake)
+	profilingTestTicks(t, 2)
+
+	collect()
+
+	assert.Len(t, col.all(), 2, "the first failed upload ends the iteration; the next tick tries again")
+}
+
+func TestCollectErrorStillUploadsCollected(t *testing.T) {
+	col := profilingTestSetup(t, http.StatusOK, profilingTestAPIKey)
+	fake := &profilingTestSession{
+		samples:    profilingTestSamples("/docker/a"),
+		collectErr: errors.New("perf map read failed"),
+	}
+	profilingTestUseSession(t, fake)
+	profilingTestTicks(t, 1)
+
+	collect()
+
+	assert.Len(t, col.all(), 1, "a partial collection is still uploaded")
+}
+
+func TestCollectNothingCollected(t *testing.T) {
+	col := profilingTestSetup(t, http.StatusOK, profilingTestAPIKey)
+	fake := &profilingTestSession{}
+	profilingTestUseSession(t, fake)
+	profilingTestTicks(t, 1)
+
+	collect()
+
+	_, _, _, collects := fake.counts()
+	assert.Equal(t, 1, collects)
+	assert.Empty(t, col.all())
+}
+
+func TestStartStopWithSession(t *testing.T) {
+	fake := &profilingTestSession{}
+	profilingTestUseSession(t, fake)
+
+	before := time.Now().UnixNano()
+	Start()
+	assert.GreaterOrEqual(t, targetFinder.now, before, "Start stamps the finder's clock")
+	assert.LessOrEqual(t, targetFinder.now, time.Now().UnixNano())
+	_, stopped, updates, _ := fake.counts()
+	assert.Equal(t, 1, updates)
+	assert.Zero(t, stopped)
+
+	Stop()
+	_, stopped, _, _ = fake.counts()
+	assert.Equal(t, 1, stopped)
+}
+
+type profilingTestNewSessionCall struct {
+	finder  sd.TargetFinder
+	options ebpfspy.SessionOptions
+}
+
+// profilingTestInit wires Init to a fake collector endpoint and a fake session factory.
+// The returned channel receives once when collect() has obtained its ticker.
+func profilingTestInit(t *testing.T, fake ebpfspy.Session, newErr error) (*[]profilingTestNewSessionCall, <-chan struct{}) {
+	u, err := url.Parse("http://collector.test/v1/profiles")
+	require.NoError(t, err)
+	prevEndpoint, prevURL, prevLabels := *flags.ProfilesEndpoint, endpointUrl, constLabels
+	prevSession, prevFinder, prevNewSession, prevNewTicker := session, targetFinder, newSession, newTicker
+	*flags.ProfilesEndpoint = u
+	targetFinder = &TargetFinder{processes: map[uint32]*processInfo{}}
+	t.Cleanup(func() {
+		*flags.ProfilesEndpoint, endpointUrl, constLabels = prevEndpoint, prevURL, prevLabels
+		session, targetFinder, newSession, newTicker = prevSession, prevFinder, prevNewSession, prevNewTicker
+	})
+
+	var calls []profilingTestNewSessionCall
+	newSession = func(_ log.Logger, tf sd.TargetFinder, so ebpfspy.SessionOptions) (ebpfspy.Session, error) {
+		calls = append(calls, profilingTestNewSessionCall{finder: tf, options: so})
+		if newErr != nil {
+			return nil, newErr
+		}
+		return fake, nil
+	}
+	tickerCreated := make(chan struct{}, 1)
+	newTicker = func(time.Duration) *time.Ticker {
+		ch := make(chan time.Time)
+		close(ch) // collect() returns right away
+		tickerCreated <- struct{}{}
+		return &time.Ticker{C: ch}
+	}
+	return &calls, tickerCreated
+}
+
+func TestInitStartsSession(t *testing.T) {
+	fake := &profilingTestSession{}
+	calls, tickerCreated := profilingTestInit(t, fake, nil)
+	finder := targetFinder
+
+	ch := Init("machine-1", "node-1")
+	require.NotNil(t, ch)
+	select {
+	case <-tickerCreated:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "collect() was not started")
+	}
+
+	assert.Equal(t, "http://collector.test/v1/profiles", endpointUrl.String())
+	assert.Equal(t, labels.Labels{
+		{Name: "host.name", Value: "node-1"},
+		{Name: "host.id", Value: "machine-1"},
+	}, constLabels)
+	assert.Same(t, fake, session)
+	started, _, _, _ := fake.counts()
+	assert.Equal(t, 1, started)
+
+	require.Len(t, *calls, 1)
+	c := (*calls)[0]
+	assert.Same(t, finder, c.finder, "the session resolves targets through the package TargetFinder")
+	so := c.options
+	assert.Equal(t, SampleRate, so.SampleRate)
+	assert.True(t, so.CollectUser)
+	assert.False(t, so.CollectKernel)
+	assert.True(t, so.UnknownSymbolModuleOffset)
+	assert.False(t, so.UnknownSymbolAddress)
+	assert.True(t, so.PythonEnabled)
+	for _, o := range []struct {
+		name       string
+		size, keep int
+	}{
+		{"pid", so.CacheOptions.PidCacheOptions.Size, so.CacheOptions.PidCacheOptions.KeepRounds},
+		{"build id", so.CacheOptions.BuildIDCacheOptions.Size, so.CacheOptions.BuildIDCacheOptions.KeepRounds},
+		{"same file", so.CacheOptions.SameFileCacheOptions.Size, so.CacheOptions.SameFileCacheOptions.KeepRounds},
+	} {
+		assert.Equal(t, 256, o.size, o.name)
+		assert.Equal(t, 8, o.keep, o.name)
+	}
+	assert.True(t, so.SymbolOptions.GoTableFallback)
+	assert.True(t, so.SymbolOptions.PythonFullFilePath)
+	assert.Equal(t, demangle.DemangleFull, so.SymbolOptions.DemangleOptions)
+	require.NotNil(t, so.Metrics)
+	assert.NotNil(t, so.Metrics.Symtab)
+	assert.NotNil(t, so.Metrics.Python)
+
+	// the returned channel feeds the TargetFinder
+	ch <- containers.ProcessInfo{Pid: profilingTestPid, ContainerId: profilingTestContainerID, StartedAt: time.Now()}
+	close(ch)
+	profilingTestWaitProcess(t, finder, profilingTestPid)
+}
+
+func TestInitNewSessionError(t *testing.T) {
+	calls, tickerCreated := profilingTestInit(t, nil, errors.New("operation not permitted"))
+	assert.Nil(t, Init("machine-1", "node-1"))
+	assert.Len(t, *calls, 1)
+	assert.Nil(t, session, "no half-initialized session is kept")
+	assert.Empty(t, tickerCreated, "collect() is not started")
+	assert.NotPanics(t, Start)
+	assert.NotPanics(t, Stop)
+}
+
+func TestInitSessionStartError(t *testing.T) {
+	fake := &profilingTestSession{startErr: errors.New("failed to load BPF program")}
+	_, tickerCreated := profilingTestInit(t, fake, nil)
+	assert.Nil(t, Init("machine-1", "node-1"))
+	assert.Nil(t, session, "no half-initialized session is kept")
+	assert.Empty(t, tickerCreated, "collect() is not started")
+	Stop()
+	_, stopped, _, _ := fake.counts()
+	assert.Zero(t, stopped)
+}
+
+// profilingTestJvm stubs /proc/<pid>/cmdline and the JVM perfmap dump.
+type profilingTestJvm struct {
+	lock     sync.Mutex
+	cmdlines int
+	dumps    []uint32
+	dumpErr  error
+}
+
+func (j *profilingTestJvm) dumpCount() int {
+	j.lock.Lock()
+	defer j.lock.Unlock()
+	return len(j.dumps)
+}
+
+func (j *profilingTestJvm) cmdlineCount() int {
+	j.lock.Lock()
+	defer j.lock.Unlock()
+	return j.cmdlines
+}
+
+func profilingTestStubJvm(t *testing.T, cmdline string, dumpErr error) *profilingTestJvm {
+	j := &profilingTestJvm{dumpErr: dumpErr}
+	prevCmdline, prevDump := getCmdline, dumpPerfmap
+	getCmdline = func(uint32) []byte {
+		j.lock.Lock()
+		defer j.lock.Unlock()
+		j.cmdlines++
+		return []byte(cmdline)
+	}
+	dumpPerfmap = func(pid uint32) error {
+		j.lock.Lock()
+		defer j.lock.Unlock()
+		j.dumps = append(j.dumps, pid)
+		return j.dumpErr
+	}
+	t.Cleanup(func() { getCmdline, dumpPerfmap = prevCmdline, prevDump })
+	return j
+}
+
+func profilingTestAdvance(tf *TargetFinder, d time.Duration) {
+	tf.lock.Lock()
+	tf.now += int64(d)
+	tf.lock.Unlock()
+}
+
+func TestTargetFinderJvmPerfmapDump(t *testing.T) {
+	j := profilingTestStubJvm(t, "/usr/lib/jvm/bin/java\x00-XX:+PreserveFramePointer\x00-jar\x00app.jar", nil)
+	tf := profilingTestFinder(t, 2*CollectInterval, proc.Flags{})
+
+	target := tf.FindTarget(profilingTestPid)
+	require.NotNil(t, target)
+	tf.lock.Lock()
+	assert.True(t, tf.processes[profilingTestPid].jvmPerfmapDumpSupported)
+	tf.lock.Unlock()
+	assert.Equal(t, 1, j.dumpCount())
+
+	assert.Same(t, target, tf.FindTarget(profilingTestPid))
+	assert.Equal(t, 1, j.dumpCount(), "one dump per collection round")
+
+	profilingTestAdvance(tf, CollectInterval)
+	assert.Same(t, target, tf.FindTarget(profilingTestPid))
+	assert.Equal(t, 2, j.dumpCount(), "dumped again once the round changes")
+	assert.Equal(t, []uint32{profilingTestPid, profilingTestPid}, j.dumps)
+	assert.Equal(t, 1, j.cmdlineCount(), "the cmdline is read once per process")
+}
+
+func TestTargetFinderJvmWithoutFramePointer(t *testing.T) {
+	j := profilingTestStubJvm(t, "/usr/bin/java\x00-jar\x00app.jar", nil)
+	tf := profilingTestFinder(t, 2*CollectInterval, proc.Flags{})
+
+	require.NotNil(t, tf.FindTarget(profilingTestPid))
+	profilingTestAdvance(tf, CollectInterval)
+	require.NotNil(t, tf.FindTarget(profilingTestPid))
+	tf.lock.Lock()
+	assert.False(t, tf.processes[profilingTestPid].jvmPerfmapDumpSupported)
+	tf.lock.Unlock()
+	assert.Zero(t, j.dumpCount(), "perfmap dump needs -XX:+PreserveFramePointer")
+}
+
+func TestTargetFinderNonJvm(t *testing.T) {
+	j := profilingTestStubJvm(t, "/usr/bin/python3\x00-XX:+PreserveFramePointer", nil)
+	tf := profilingTestFinder(t, 2*CollectInterval, proc.Flags{})
+	require.NotNil(t, tf.FindTarget(profilingTestPid))
+	assert.Equal(t, 1, j.cmdlineCount())
+	assert.Zero(t, j.dumpCount())
+}
+
+func TestTargetFinderJvmPerfmapDumpError(t *testing.T) {
+	j := profilingTestStubJvm(t, "/usr/bin/java\x00-XX:+PreserveFramePointer", errors.New("failed to attach to JVM"))
+	tf := profilingTestFinder(t, 2*CollectInterval, proc.Flags{})
+
+	target := tf.FindTarget(profilingTestPid)
+	assert.NotNil(t, target, "a failed dump only logs; the process is still profiled")
+	assert.Equal(t, 1, j.dumpCount())
+	assert.Same(t, target, tf.FindTarget(profilingTestPid))
+	assert.Equal(t, 1, j.dumpCount(), "no retry within the same round")
+	profilingTestAdvance(tf, CollectInterval)
+	tf.FindTarget(profilingTestPid)
+	assert.Equal(t, 2, j.dumpCount(), "retried next round")
+}
+
+func TestTargetFinderProfilingDisabledSkipsJvmDetection(t *testing.T) {
+	j := profilingTestStubJvm(t, "/usr/bin/java\x00-XX:+PreserveFramePointer", nil)
+	tf := profilingTestFinder(t, 2*CollectInterval, proc.Flags{EbpfProfilingDisabled: true})
+	assert.Nil(t, tf.FindTarget(profilingTestPid))
+	profilingTestAdvance(tf, CollectInterval)
+	assert.Nil(t, tf.FindTarget(profilingTestPid))
+	assert.Zero(t, j.cmdlineCount(), "the process is not inspected at all")
+	assert.Zero(t, j.dumpCount())
 }

@@ -7,8 +7,10 @@ package containers
 import (
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/codifinary/codexray-node-agent/common"
@@ -214,5 +216,70 @@ func TestDockerdInspectMissingHostConfig(t *testing.T) {
 		md, err := DockerdInspect(registryTestContainerID)
 		require.NoError(t, err)
 		assert.Equal(t, "", md.logPath)
+	})
+}
+
+// dockerdTestServeHost runs a fake dockerd on <root>/run/docker.sock answering
+// /_ping with pingStatus and /version with the given API version.
+func dockerdTestServeHost(t *testing.T, root string, pingStatus int, apiVersion string) *[]string {
+	t.Helper()
+	sock := filepath.Join(root, "/run/docker.sock")
+	require.NoError(t, os.MkdirAll(filepath.Dir(sock), 0o755))
+	l, err := net.Listen("unix", sock)
+	require.NoError(t, err)
+	var lock sync.Mutex
+	var paths []string
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lock.Lock()
+		paths = append(paths, r.URL.Path)
+		lock.Unlock()
+		switch {
+		case r.URL.Path == "/_ping":
+			w.WriteHeader(pingStatus)
+		case r.URL.Path == "/version":
+			_, _ = w.Write([]byte(`{"ApiVersion":"` + apiVersion + `"}`))
+		case strings.HasSuffix(r.URL.Path, "/json"):
+			_, _ = w.Write([]byte(`{"Name":"/redis","Config":{"Image":"redis:7"},"HostConfig":{}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})}
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return &paths
+}
+
+func dockerdTestSaveClient(t *testing.T) {
+	saved := dockerdClient
+	dockerdClient = nil
+	t.Cleanup(func() { dockerdClient = saved })
+}
+
+func TestDockerdInit(t *testing.T) {
+	t.Run("negotiates the API version", func(t *testing.T) {
+		dockerdTestSaveClient(t)
+		root := containerTestHostPath(t)
+		paths := dockerdTestServeHost(t, root, http.StatusOK, "1.43")
+		require.NoError(t, DockerdInit())
+		require.NotNil(t, dockerdClient)
+		md, err := DockerdInspect(registryTestContainerID)
+		require.NoError(t, err)
+		assert.Equal(t, "redis", md.name)
+		assert.Equal(t, []string{"/_ping", "/version", "/v1.43/containers/" + registryTestContainerID + "/json"}, *paths)
+	})
+
+	t.Run("unhealthy daemon", func(t *testing.T) {
+		dockerdTestSaveClient(t)
+		root := containerTestHostPath(t)
+		dockerdTestServeHost(t, root, http.StatusInternalServerError, "1.43")
+		assert.ErrorContains(t, DockerdInit(), "500")
+		assert.Nil(t, dockerdClient)
+	})
+
+	t.Run("no docker socket", func(t *testing.T) {
+		dockerdTestSaveClient(t)
+		containerTestHostPath(t)
+		assert.Error(t, DockerdInit())
+		assert.Nil(t, dockerdClient)
 	})
 }

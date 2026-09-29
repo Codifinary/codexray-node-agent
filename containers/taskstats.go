@@ -11,13 +11,19 @@ import (
 	"github.com/mdlayher/taskstats"
 )
 
+type taskstatsSource interface {
+	TGID(pid int) (*taskstats.Stats, error)
+	PID(pid int) (*taskstats.Stats, error)
+}
+
 var (
-	taskstatsClient *taskstats.Client
-	taskstatsLock   sync.Mutex
+	taskstatsClient    taskstatsSource
+	taskstatsLock      sync.Mutex
+	newTaskstatsClient = taskstats.New
 )
 
 func TaskstatsInit() error {
-	c, err := taskstats.New()
+	c, err := newTaskstatsClient()
 	if err != nil {
 		return err
 	}

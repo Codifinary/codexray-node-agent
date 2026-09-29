@@ -38,7 +38,22 @@ var (
 	containerIdRegexp        = regexp.MustCompile(`[a-z0-9]{64}`)
 	cronjobPodName           = regexp.MustCompile(`([a-z0-9-]+)-([0-9]{8})-[bcdfghjklmnpqrstvwxz2456789]{5}`)
 	cronjobPodScheduleWindow = 7 * 24 * time.Hour
+
+	readCgroup                = proc.ReadCgroup
+	getHostNetNs              = proc.GetHostNetNs
+	cgroupInit                = cgroup.Init
+	newGcTicker               = time.NewTicker
+	runTracer                 = (*ebpftracer.Tracer).Run
+	closeTracer               = (*ebpftracer.Tracer).Close
+	activeConnectionsIterator = func(t *ebpftracer.Tracer) ebpfMapIterator { return t.ActiveConnectionsIterator() }
+	nodejsStatsIterator       = func(t *ebpftracer.Tracer) ebpfMapIterator { return t.NodejsStatsIterator() }
+	pythonStatsIterator       = func(t *ebpftracer.Tracer) ebpfMapIterator { return t.PythonStatsIterator() }
 )
+
+type ebpfMapIterator interface {
+	Next(keyOut, valueOut interface{}) bool
+	Err() error
+}
 
 type ProcessInfo struct {
 	Pid         uint32
@@ -77,7 +92,7 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 		return nil, err
 	}
 	selfNetNs = ns
-	hostNetNs, err := proc.GetHostNetNs()
+	hostNetNs, err := getHostNetNs()
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +108,7 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 	if err != nil {
 		return nil, err
 	}
-	if err = cgroup.Init(); err != nil {
+	if err = cgroupInit(); err != nil {
 		return nil, err
 	}
 	if err = DockerdInit(); err != nil {
@@ -132,7 +147,7 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 		return nil, err
 	}
 	go r.handleEvents(r.events)
-	if err = r.tracer.Run(r.events); err != nil {
+	if err = runTracer(r.tracer, r.events); err != nil {
 		close(r.events)
 		return nil, err
 	}
@@ -155,18 +170,18 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (r *Registry) Close() {
-	r.tracer.Close()
+	closeTracer(r.tracer)
 	close(r.events)
 }
 
 func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
-	gcTicker := time.NewTicker(gcInterval)
+	gcTicker := newGcTicker(gcInterval)
 	defer gcTicker.Stop()
 	for {
 		select {
 		case now := <-gcTicker.C:
 			for pid, c := range r.containersByPid {
-				cg, err := proc.ReadCgroup(pid)
+				cg, err := readCgroup(pid)
 				if err != nil {
 					delete(r.containersByPid, pid)
 					if c != nil {
@@ -250,7 +265,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				case c == nil && seen: // ignored
 					delete(r.containersByPid, e.Pid)
 				case c != nil: // revalidating by cgroup
-					cg, err := proc.ReadCgroup(e.Pid)
+					cg, err := readCgroup(e.Pid)
 					if err != nil || cg.Id != c.cgroup.Id {
 						delete(r.containersByPid, e.Pid)
 						c.onProcessExit(e.Pid, false)
@@ -336,7 +351,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 			}
 		}
 	}
-	cg, err := proc.ReadCgroup(pid)
+	cg, err := readCgroup(pid)
 	if err != nil {
 		if !common.IsNotExist(err) {
 			klog.Warningln("failed to read proc cgroup:", err)
@@ -425,7 +440,7 @@ func (r *Registry) updateStatsFromEbpfMapsIfNecessary() {
 }
 
 func (r *Registry) updateTrafficStats() {
-	iter := r.tracer.ActiveConnectionsIterator()
+	iter := activeConnectionsIterator(r.tracer)
 	cid := ebpftracer.ConnectionId{}
 	stats := ebpftracer.Connection{}
 	for iter.Next(&cid, &stats) {
@@ -443,7 +458,7 @@ func (r *Registry) updateTrafficStats() {
 }
 
 func (r *Registry) updateNodejsStats() {
-	iter := r.tracer.NodejsStatsIterator()
+	iter := nodejsStatsIterator(r.tracer)
 	var pid uint64
 	stats := ebpftracer.NodejsStats{}
 
@@ -458,7 +473,7 @@ func (r *Registry) updateNodejsStats() {
 }
 
 func (r *Registry) updatePythonStats() {
-	iter := r.tracer.PythonStatsIterator()
+	iter := pythonStatsIterator(r.tracer)
 	var pid uint64
 	stats := ebpftracer.PythonStats{}
 

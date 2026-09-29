@@ -50,6 +50,11 @@ var (
 	targetFinder = &TargetFinder{
 		processes: map[uint32]*processInfo{},
 	}
+
+	newSession  = ebpfspy.NewSession
+	newTicker   = time.NewTicker
+	getCmdline  = proc.GetCmdline
+	dumpPerfmap = jvm.DumpPerfmap
 )
 
 func Init(hostId, hostName string) chan<- containers.ProcessInfo {
@@ -98,7 +103,7 @@ func Init(hostId, hostName string) chan<- containers.ProcessInfo {
 		SampleRate: SampleRate,
 	}
 	var err error
-	session, err = ebpfspy.NewSession(log.NewNopLogger(), targetFinder, so)
+	session, err = newSession(log.NewNopLogger(), targetFinder, so)
 	if err != nil {
 		klog.Errorln(err)
 		session = nil
@@ -132,7 +137,7 @@ func Stop() {
 }
 
 func collect() {
-	ticker := time.NewTicker(CollectInterval)
+	ticker := newTicker(CollectInterval)
 	defer ticker.Stop()
 	for t := range ticker.C {
 		session.UpdateTargets(sd.TargetsOptions{})
@@ -240,7 +245,7 @@ func (tf *TargetFinder) FindTarget(pid uint32) *sd.Target {
 	if !pi.initialized {
 		pi.initialized = true
 		if !pi.flags.EbpfProfilingDisabled {
-			cmdline := proc.GetCmdline(pid)
+			cmdline := getCmdline(pid)
 			if proc.IsJvm(cmdline) {
 				pi.jvmPerfmapDumpSupported = jvm.IsPerfmapDumpSupported(cmdline)
 				klog.Infof("JVM detected PID: %d, perfmap dump supported: %t", pid, pi.jvmPerfmapDumpSupported)
@@ -252,7 +257,7 @@ func (tf *TargetFinder) FindTarget(pid uint32) *sd.Target {
 	}
 	if pi.jvmPerfmapDumpSupported && pi.lastPerfmapDump != tf.now {
 		pi.lastPerfmapDump = tf.now
-		if err = jvm.DumpPerfmap(pid); err != nil {
+		if err = dumpPerfmap(pid); err != nil {
 			klog.Warningln(err)
 		}
 	}

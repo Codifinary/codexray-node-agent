@@ -187,3 +187,26 @@ func TestCrioClientHasOverallTimeout(t *testing.T) {
 	assert.Greater(t, crioClient.Timeout, time.Duration(0))
 	assert.LessOrEqual(t, crioClient.Timeout, crioTimeout)
 }
+
+func TestCrioInitFindsSocket(t *testing.T) {
+	root := containerTestHostPath(t)
+	crioTestSaveClient(t)
+	crioClient = nil
+
+	// only the second candidate exists: the client must dial it
+	sock := filepath.Join(root, "/run/crio/crio.sock")
+	require.NoError(t, os.MkdirAll(filepath.Dir(sock), 0o755))
+	l, err := net.Listen("unix", sock)
+	require.NoError(t, err)
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"name":"app","image":"nginx:1","crio_annotations":{}}`))
+	})}
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	require.NoError(t, CrioInit())
+	require.NotNil(t, crioClient)
+	md, err := CrioInspect(registryTestContainerID)
+	require.NoError(t, err)
+	assert.Equal(t, "nginx:1", md.image)
+}
