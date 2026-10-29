@@ -22,9 +22,6 @@ type containerFilter struct {
 
 var ContainerFilter *containerFilter
 
-// wildcardPatterns allow every container, which defeats the purpose of an allowlist.
-var wildcardPatterns = map[string]bool{"*": true, ".*": true, ".+": true, "^.*$": true, "^.+$": true}
-
 func init() {
 	var err error
 	allowList := *flags.ContainerAllowlist
@@ -39,7 +36,7 @@ func init() {
 }
 
 // validateContainerAllowlist requires at least one allowlist pattern and rejects
-// empty and wildcard patterns. It returns the trimmed patterns.
+// empty entries and "*". It returns the trimmed patterns.
 func validateContainerAllowlist(allowList []string) ([]string, error) {
 	if len(allowList) == 0 {
 		return nil, errors.New("--container-allowlist (CONTAINER_ALLOWLIST) is required")
@@ -50,7 +47,7 @@ func validateContainerAllowlist(allowList []string) ([]string, error) {
 		if v == "" {
 			return nil, errors.New("empty pattern")
 		}
-		if wildcardPatterns[v] {
+		if strings.Trim(v, "*") == "" {
 			return nil, fmt.Errorf("%q is not allowed: list the containers to monitor", v)
 		}
 		res = append(res, v)

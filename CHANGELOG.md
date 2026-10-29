@@ -4,6 +4,12 @@ All notable changes to the Codexray Node Agent are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] — 2026-10-29
+
+### Changed
+- The container allowlist check now rejects only a missing allowlist, empty
+  entries and `*`. Any other regex, including `.*`, is accepted.
+
 ## [1.4.0] — 2026-10-29
 
 ### Changed

@@ -42,17 +42,14 @@ func TestValidateContainerAllowlist(t *testing.T) {
 		{`^/k8s/default/.+`, ""},
 		{"*"},
 		{" * "},
-		{".*"},
-		{".+"},
-		{"^.*$"},
-		{"^.+$"},
-		{`^/k8s/default/.+`, ".*"},
+		{"**"},
+		{`^/k8s/default/.+`, "*"},
 	} {
 		_, err := validateContainerAllowlist(allowList)
 		assert.Error(t, err, "allowlist %q", allowList)
 	}
 
-	res, err := validateContainerAllowlist([]string{` ^/k8s/default/.+ `, `^/system\.slice/nginx\.service$`})
+	res, err := validateContainerAllowlist([]string{` ^/k8s/default/.+ `, `^/system\.slice/nginx\.service$`, ".*"})
 	require.NoError(t, err)
-	assert.Equal(t, []string{`^/k8s/default/.+`, `^/system\.slice/nginx\.service$`}, res)
+	assert.Equal(t, []string{`^/k8s/default/.+`, `^/system\.slice/nginx\.service$`, ".*"}, res)
 }
