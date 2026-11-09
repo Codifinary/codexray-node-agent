@@ -38,7 +38,8 @@ import (
 )
 
 var (
-	version = flags.Version
+	version   = flags.Version
+	startedAt = time.Now()
 )
 
 func uname() (string, string, error) {
@@ -163,6 +164,7 @@ func main() {
 		klog.Exitln(err)
 	}
 	registerer.MustRegister(info("node_agent_info", version))
+	registerer.MustRegister(uptime("node_agent_uptime_seconds", startedAt))
 
 	if md := nodeCollector.Metadata(); md != nil {
 		region := md.Region
@@ -334,6 +336,14 @@ func info(name, version string) prometheus.Collector {
 	})
 	g.Set(1)
 	return g
+}
+
+// uptime reports elapsed seconds rather than a start timestamp: the backend
+// stores float32, which rounds unix seconds to 128-second steps.
+func uptime(name string, since time.Time) prometheus.Collector {
+	return prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: name}, func() float64 {
+		return time.Since(since).Seconds()
+	})
 }
 
 type logger struct{}
