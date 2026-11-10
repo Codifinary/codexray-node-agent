@@ -90,3 +90,12 @@ func TestCgroupMemoryV2(t *testing.T) {
 	require.Equal(t, uint64(0), l)
 	require.Equal(t, uint64(34), CgroupMemoryStat()["sock"])
 }
+
+func TestPprofDoesNotExposeCmdline(t *testing.T) {
+	rec := httptest.NewRecorder()
+	PprofMux().ServeHTTP(rec, httptest.NewRequest("GET", "/debug/pprof/cmdline", nil))
+	require.NotContains(t, rec.Body.String(), os.Args[0])
+	rec = httptest.NewRecorder()
+	PprofMux().ServeHTTP(rec, httptest.NewRequest("GET", "/debug/pprof/heap?debug=1", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+}

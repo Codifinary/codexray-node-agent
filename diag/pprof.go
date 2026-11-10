@@ -15,12 +15,12 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// PprofMux returns a mux with the standard /debug/pprof/ handlers. It is served on its own
-// listener (never on the metrics listener, which is often exposed through hostPort).
+// PprofMux returns a mux with the standard /debug/pprof/ handlers except /cmdline, which would
+// reveal command-line arguments (deployments have passed --api-key on the command line). It is
+// served on its own listener (never on the metrics listener, which is often exposed through hostPort).
 func PprofMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
