@@ -18,33 +18,47 @@ kind: ClusterRole
 metadata:
   name: codexray-cluster-agent
 rules:
+  # Read-only. No cluster-admin and no write verbs. Grouped by the feature that needs them.
   - apiGroups: [""]
-    resources:
-      - pods
-      - nodes
-      - services
-      - endpoints
-      - namespaces
-      - configmaps
-      - secrets
+    resources: [pods, nodes, services, endpoints, namespaces, configmaps, persistentvolumeclaims, persistentvolumes, events]
+    verbs: ["get", "list", "watch"]
+  # Only needed for exporters that read credentials from Secrets (existing behavior).
+  - apiGroups: [""]
+    resources: [secrets]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
-    resources:
-      - deployments
-      - replicasets
-      - statefulsets
-      - daemonsets
+    resources: [deployments, replicasets, statefulsets, daemonsets]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: [jobs, cronjobs]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: [storageclasses, volumeattachments]
+    verbs: ["get", "list", "watch"]
+  # New kube-state-metrics resources
+  - apiGroups: ["autoscaling"]
+    resources: [horizontalpodautoscalers]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: [poddisruptionbudgets]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: [ingresses]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: [endpointslices]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["metrics.k8s.io"]
-    resources:
-      - nodes
-      - pods
+    resources: [nodes, pods]
     verbs: ["get", "list"]
+  # Pod CPU/memory (kubelet Summary API) and kubelet metrics.
+  # nodes/stats + nodes/metrics suffice for KUBELET_ACCESS_MODE=direct;
+  # nodes/proxy is only needed for KUBELET_ACCESS_MODE=proxy (the default).
   - apiGroups: [""]
-    resources:
-      - nodes/proxy
-      - nodes/stats
-      - nodes/metrics
+    resources: [nodes/stats, nodes/metrics, nodes/proxy]
+    verbs: ["get"]
+  # kube-apiserver / scheduler / controller-manager /metrics (CONTROL_PLANE_METRICS_ENABLED)
+  - nonResourceURLs: ["/metrics"]
     verbs: ["get"]
 
 ---
@@ -77,11 +91,16 @@ spec:
   selector:
     matchLabels:
       app: codexray-node-agent
+  # Canary rollouts: see docs/DEPLOYMENT.md (switch to OnDelete, then replace one pod at a time).
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 1}
   template:
     metadata:
       labels:
         app: codexray-node-agent
     spec:
+      terminationGracePeriodSeconds: 30
       hostNetwork: true
       hostPID: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -92,17 +111,43 @@ spec:
           command:
             - /usr/bin/codexray-node-agent
           args:
+            # --listen kept for compatibility with the Service below. Use 127.0.0.1:10300 if
+            # nothing scrapes the agent over the network (it pushes to the collector).
             - --listen=:10300
             - --collector-endpoint=http://YOUR_CODEXRAY_IP:8080
             - --cgroupfs-root=/host/sys/fs/cgroup
             - --wal-dir=/data
           env:
+            # API key from a Secret, never as a command-line argument (arguments are visible in
+            # the pod spec and /proc/<pid>/cmdline on the node):
+            #   kubectl -n codexray-agents create secret generic codexray-agent --from-literal=api-key=...
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef: {name: codexray-agent, key: api-key}
+            # Telemetry categories (shown explicitly; these are the defaults). See docs/FEATURE-FLAGS.md.
+            - {name: NODE_METRICS_ENABLED, value: "true"}
+            - {name: CONTAINER_RESOURCE_METRICS_ENABLED, value: "true"}
+            - {name: EBPF_L7_METRICS_ENABLED, value: "true"}
+            - {name: EBPF_L7_TRACES_ENABLED, value: "true"}
+            - {name: TRACES_SAMPLING, value: "1.0"}
+            - {name: CONTAINER_LOG_COLLECTION_ENABLED, value: "true"}
+            - {name: CONTAINER_LOG_PARSING_ENABLED, value: "true"}
+            - {name: PROFILING_ENABLED, value: "true"}
+            # Memory safeguards and diagnostics
+            - {name: GO_MEMORY_LIMIT_RATIO, value: "0.7"}
+            - {name: MEMORY_WATCHDOG_THRESHOLD_RATIO, value: "0.8"}
+            - {name: PPROF_LISTEN, value: "127.0.0.1:10302"}
             # Set LD_LIBRARY_PATH to find NVIDIA libraries from host
             - name: LD_LIBRARY_PATH
               value: /host/usr/lib/x86_64-linux-gnu:/host/usr/lib64:/host/usr/local/cuda/lib64:/host/run/nvidia/driver/usr/lib/x86_64-linux-gnu:/host/run/nvidia/driver/usr/lib64:/usr/lib/x86_64-linux-gnu:/usr/lib64
           securityContext:
             privileged: true
             runAsUser: 0
+          resources:
+            # Memory as in the affected production fleet. A 500m CPU limit throttles GC and eBPF
+            # event processing on busy nodes; 1 core (or no CPU limit) is recommended.
+            requests: {cpu: 250m, memory: 2Gi}
+            limits: {cpu: "1", memory: 5Gi}
           ports:
             - containerPort: 10300
               hostPort: 10300
