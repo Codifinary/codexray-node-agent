@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/diag"
 	"github.com/codifinary/codexray-node-agent/ebpftracer/l7"
 	"github.com/codifinary/codexray-node-agent/flags"
 	"go.opentelemetry.io/otel/attribute"
@@ -73,7 +74,7 @@ func Init(machineId, hostname, version string) {
 		klog.Exitln(err)
 	}
 
-	batcher = sdktrace.WithBatcher(exporter)
+	batcher = sdktrace.WithBatcher(countingSpanExporter{exporter})
 	commonResourceAttrs = []attribute.KeyValue{semconv.HostName(hostname), semconv.HostID(machineId)}
 	agentVersion = version
 	initialized = true
@@ -269,4 +270,19 @@ func (t *Trace) ZookeeperRequest(op string, args string, status l7.Status, durat
 		semconv.DBStatementKey.String(statement),
 		attribute.Key("zookeeper.status_code").Int(int(status)),
 	)
+}
+
+// countingSpanExporter makes failed span deliveries visible as
+// node_agent_export_failures_total{signal="traces"} (the SDK only logs them).
+type countingSpanExporter struct {
+	sdktrace.SpanExporter
+}
+
+func (e countingSpanExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
+	err := e.SpanExporter.ExportSpans(ctx, spans)
+	if err != nil {
+		diag.ExportFailures.WithLabelValues("traces").Inc()
+		diag.DroppedTotal.WithLabelValues("traces", "export_failed").Add(float64(len(spans)))
+	}
+	return err
 }

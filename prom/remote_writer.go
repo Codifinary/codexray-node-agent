@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/diag"
 	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/golang/snappy"
 	"github.com/jpillora/backoff"
@@ -61,6 +62,7 @@ func StartAgent(reg *prometheus.Registry, machineId, systemUuid string, sources 
 	up := prometheus.NewGauge(prometheus.GaugeOpts{Name: "up"})
 	up.Set(1)
 	reg.MustRegister(up)
+	reg.MustRegister(spoolBytes)
 
 	sourceLabels := SourceLabels(machineId, systemUuid)
 	labels := map[string]string{
@@ -121,6 +123,11 @@ func SourceLabels(machineId, systemUuid string) map[string]string {
 	return labels
 }
 
+var spoolBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+	Name: "node_agent_metrics_spool_bytes",
+	Help: "Bytes of undelivered metrics in the on-disk spool (bounded by --max-spool-size)",
+})
+
 func (a *Agent) scrapeLoop() {
 	if err := a.scrape(); err != nil {
 		klog.Warningln("failed to scrape metrics:", err)
@@ -151,6 +158,7 @@ func (a *Agent) sendLoop() {
 			return os.Remove(fName)
 		}()
 		if err != nil {
+			diag.ExportFailures.WithLabelValues("metrics").Inc()
 			dur := b.Duration()
 			klog.Warningf(
 				"failed to send metrics to %s, next attempt in %s: %s",
@@ -304,11 +312,13 @@ func (a *Agent) truncateSpoolIfNeeded() error {
 		}
 		totalSize += st.Size()
 	}
+	spoolBytes.Set(float64(totalSize))
 	if totalSize > a.maxSpoolSize {
 		klog.Warningln("spool size exceeded, removing the oldest file:", files[0])
 		if err = os.Remove(files[0]); err != nil {
 			return err
 		}
+		diag.DroppedTotal.WithLabelValues("metrics", "spool_full").Inc()
 	}
 	return nil
 }

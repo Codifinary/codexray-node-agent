@@ -15,6 +15,7 @@ import (
 	otelLogs "github.com/agoda-com/opentelemetry-logs-go/logs"
 	sdk "github.com/agoda-com/opentelemetry-logs-go/sdk/logs"
 	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/diag"
 	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/codifinary/logparser"
 	"go.opentelemetry.io/otel/attribute"
@@ -51,7 +52,7 @@ func Init(machineId, hostname, version string) {
 	exporter, _ := otlplogs.NewExporter(context.Background(), otlplogs.WithClient(client))
 
 	loggerProvider := sdk.NewLoggerProvider(
-		sdk.WithBatcher(exporter),
+		sdk.WithBatcher(countingLogExporter{exporter}),
 		sdk.WithResource(
 			resource.NewWithAttributes(
 				semconv.SchemaURL,
@@ -101,4 +102,19 @@ func OtelLogEmitter(containerId string) logparser.OnMsgCallbackF {
 			}),
 		)
 	}
+}
+
+// countingLogExporter makes failed log deliveries visible as
+// node_agent_export_failures_total{signal="logs"} (the SDK only logs them).
+type countingLogExporter struct {
+	sdk.LogRecordExporter
+}
+
+func (e countingLogExporter) Export(ctx context.Context, batch []sdk.ReadableLogRecord) error {
+	err := e.LogRecordExporter.Export(ctx, batch)
+	if err != nil {
+		diag.ExportFailures.WithLabelValues("logs").Inc()
+		diag.DroppedTotal.WithLabelValues("logs", "export_failed").Add(float64(len(batch)))
+	}
+	return err
 }
