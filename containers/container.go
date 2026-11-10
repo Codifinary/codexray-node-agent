@@ -13,6 +13,7 @@ import (
 
 	"github.com/codifinary/codexray-node-agent/cgroup"
 	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/diag"
 	"github.com/codifinary/codexray-node-agent/ebpftracer"
 	"github.com/codifinary/codexray-node-agent/ebpftracer/l7"
 	"github.com/codifinary/codexray-node-agent/flags"
@@ -63,13 +64,22 @@ type Delays struct {
 type LogParser struct {
 	parser *logparser.Parser
 	stop   func()
+	once   sync.Once
 }
 
 func (p *LogParser) Stop() {
-	if p.stop != nil {
-		p.stop()
-	}
-	p.parser.Stop()
+	p.once.Do(func() {
+		if p.stop != nil {
+			p.stop()
+		}
+		p.parser.Stop()
+		diag.LogParsersActive.Dec()
+	})
+}
+
+func newLogParser(parser *logparser.Parser, stop func()) *LogParser {
+	diag.LogParsersActive.Inc()
+	return &LogParser{parser: parser, stop: stop}
 }
 
 type ConnectionKey struct {
@@ -153,7 +163,8 @@ type Container struct {
 
 	lock sync.Mutex
 
-	done chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid uint32, registry *Registry) (*Container, error) {
@@ -201,7 +212,10 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 
 		done: make(chan struct{}),
 	}
+	diag.ContainersActive.Inc()
+	c.lock.Lock()
 	c.runLogParser("")
+	c.lock.Unlock()
 
 	go func() {
 		ticker := time.NewTicker(gcInterval)
@@ -219,11 +233,26 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 	return c, nil
 }
 
+// Close releases everything the container owns: log parsers (tailers, journald subscriptions and
+// their goroutines), any processes still attached (and their uprobes), and the gc goroutine.
+// It is idempotent and safe to call concurrently with Collect.
 func (c *Container) Close() {
-	for _, p := range c.logParsers {
-		p.Stop()
-	}
-	close(c.done)
+	c.closeOnce.Do(func() {
+		c.lock.Lock()
+		parsers := c.logParsers
+		c.logParsers = map[string]*LogParser{}
+		processes := c.processes
+		c.processes = map[uint32]*Process{}
+		c.lock.Unlock()
+		for _, p := range parsers {
+			p.Stop()
+		}
+		for _, p := range processes {
+			p.Close()
+		}
+		close(c.done)
+		diag.ContainersActive.Dec()
+	})
 }
 
 func (c *Container) Dead(now time.Time) bool {
@@ -466,6 +495,11 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 
 	if p == nil {
 		return nil
+	}
+	// PID reuse within the same cgroup after a missed exit event: release the previous
+	// incarnation's uprobes and cancel its instrumentation instead of orphaning them.
+	if old := c.processes[pid]; old != nil {
+		old.Close()
 	}
 	c.processes[pid] = p
 
@@ -1088,7 +1122,7 @@ func (c *Container) runLogParser(logPath string) {
 			return
 		}
 		klog.InfoS("started varlog logparser", "cg", c.cgroup.Id, "log", logPath)
-		c.logParsers[logPath] = &LogParser{parser: parser, stop: reader.Stop}
+		c.logParsers[logPath] = newLogParser(parser, reader.Stop)
 		return
 	}
 
@@ -1104,7 +1138,7 @@ func (c *Container) runLogParser(logPath string) {
 			JournaldUnsubscribe(c.cgroup)
 		}
 		klog.InfoS("started journald logparser", "cg", c.cgroup.Id)
-		c.logParsers["journald"] = &LogParser{parser: parser, stop: stop}
+		c.logParsers["journald"] = newLogParser(parser, stop)
 
 	case cgroup.ContainerTypeDocker, cgroup.ContainerTypeContainerd, cgroup.ContainerTypeCrio:
 		if c.metadata.logPath == "" {
@@ -1123,7 +1157,7 @@ func (c *Container) runLogParser(logPath string) {
 			return
 		}
 		klog.InfoS("started container logparser", "cg", c.cgroup.Id)
-		c.logParsers["stdout/stderr"] = &LogParser{parser: parser, stop: reader.Stop}
+		c.logParsers["stdout/stderr"] = newLogParser(parser, reader.Stop)
 	}
 }
 
@@ -1262,13 +1296,13 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32) {
 		return
 	}
 	if !p.openSslUprobesChecked {
-		p.uprobes = append(p.uprobes, tracer.AttachOpenSslUprobes(pid)...)
+		p.addUprobes(tracer.AttachOpenSslUprobes(pid))
 		p.openSslUprobesChecked = true
 	}
 	if !p.goTlsUprobesChecked {
 		uprobes, isGolangApp := tracer.AttachGoTlsUprobes(pid)
 		p.isGolangApp = isGolangApp
-		p.uprobes = append(p.uprobes, uprobes...)
+		p.addUprobes(uprobes)
 		p.goTlsUprobesChecked = true
 	}
 }

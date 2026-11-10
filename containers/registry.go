@@ -16,6 +16,7 @@ import (
 
 	"github.com/codifinary/codexray-node-agent/cgroup"
 	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/diag"
 	"github.com/codifinary/codexray-node-agent/ebpftracer"
 	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/codifinary/codexray-node-agent/gpu"
@@ -131,6 +132,7 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 	if err = reg.Register(r); err != nil {
 		return nil, err
 	}
+	diag.SetEventQueue(func() int { return len(r.events) }, func() int { return cap(r.events) })
 	go r.handleEvents(r.events)
 	if err = r.tracer.Run(r.events); err != nil {
 		close(r.events)
@@ -385,9 +387,11 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	if c := r.containersById[id]; c != nil {
 		klog.Warningln("id conflict:", id)
 		if cg.CreatedAt().After(c.cgroup.CreatedAt()) {
+			c.lock.Lock()
 			c.cgroup = cg
 			c.metadata = md
 			c.runLogParser("")
+			c.lock.Unlock()
 		}
 		r.containersByPid[pid] = c
 		r.containersByCgroupId[cg.Id] = c
