@@ -56,7 +56,7 @@ until the soak/canary criteria in [docs/SOAK-TEST.md](docs/SOAK-TEST.md) pass.
 - pprof is no longer reachable on `--listen`. Use `kubectl port-forward <pod> 10302` (the pod
   uses hostNetwork, so the listener is on the node's loopback) or set `PPROF_LISTEN` together
   with `PPROF_AUTH_TOKEN`.
-- About 98 additional self-observability series per agent, plus 6 per filesystem and 3 for
+- About 93 additional self-observability series per agent (histogram buckets included), plus 6 per filesystem and 3 for
   load average.
 
 ## [1.4.1] — 2026-10-29

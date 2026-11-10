@@ -84,4 +84,4 @@ recommended Kubernetes defaults for **new** installs are shown under "Recommende
   session state, perf-map counters
 - `node_agent_feature_enabled{feature}`, `node_agent_memory_watchdog_dumps_total{result}`
 
-Together these add about 98 series per agent (measured in `TestRuntimeDiagnosticsExposed`).
+Together these add about 93 exposition series per agent, histogram buckets included (measured in `TestRuntimeDiagnosticsExposed`). Go GC size-class and scheduler histograms are deliberately not enabled.

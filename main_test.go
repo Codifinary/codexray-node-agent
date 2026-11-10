@@ -18,10 +18,19 @@ func TestRuntimeDiagnosticsExposed(t *testing.T) {
 	mfs, err := registry.Gather()
 	require.NoError(t, err)
 	names := map[string]int{}
-	series := 0
+	series := 0 // exposition lines: each histogram bucket/sum/count and summary quantile counts
 	for _, mf := range mfs {
 		names[mf.GetName()] = len(mf.GetMetric())
-		series += len(mf.GetMetric())
+		for _, m := range mf.GetMetric() {
+			switch {
+			case m.Histogram != nil:
+				series += len(m.Histogram.GetBucket()) + 3 // + Inf, sum, count
+			case m.Summary != nil:
+				series += len(m.Summary.GetQuantile()) + 2
+			default:
+				series++
+			}
+		}
 	}
 	for _, n := range []string{
 		"go_memstats_heap_alloc_bytes", "go_memstats_heap_inuse_bytes", "go_memstats_heap_objects",
@@ -35,5 +44,5 @@ func TestRuntimeDiagnosticsExposed(t *testing.T) {
 		require.True(t, ok, "missing %s", n)
 	}
 	t.Logf("runtime diagnostics: %d metric families, %d series", len(mfs), series)
-	require.Less(t, series, 200, "self-observability must stay small")
+	require.Less(t, series, 150, "self-observability must stay small")
 }

@@ -391,9 +391,10 @@ func main() {
 // the agent cgroup's memory accounting, and the bounded agent health metrics in diag.
 func registerRuntimeDiagnostics(reg prometheus.Registerer) {
 	for _, c := range []prometheus.Collector{
-		collectors.NewGoCollector(collectors.WithGoCollectorRuntimeMetrics(
-			collectors.MetricsGC, collectors.MetricsMemory, collectors.MetricsScheduler,
-		)),
+		// Default Go metrics (memstats, goroutines, GC summary) plus runtime memory classes,
+		// which separate live heap, free-but-unreleased heap, stacks and runtime overhead.
+		// GC size-class and scheduler histograms are left out: ~100 extra bucket series.
+		collectors.NewGoCollector(collectors.WithGoCollectorRuntimeMetrics(collectors.MetricsMemory)),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		diag.NewCgroupMemoryCollector(),
 	} {
