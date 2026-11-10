@@ -9,6 +9,8 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"flag"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -117,8 +119,16 @@ func whitelistNodeExternalNetworks() {
 }
 
 func main() {
-	klog.LogToStderr(false)
-	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
+	// Registered first so it runs after every other deferred cleanup: a fatal runtime error
+	// (e.g. --listen already in use) must end in a non-zero exit, not a "Completed" pod.
+	exitCode := 0
+	defer func() {
+		if exitCode != 0 {
+			klog.Flush()
+			os.Exit(exitCode)
+		}
+	}()
+	setupLogging(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
 
 	klog.Infoln("agent version:", version)
 	diag.ApplyGoMemoryLimit(*flags.GoMemoryLimitRatio)
@@ -372,6 +382,7 @@ func main() {
 	case err := <-serverErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			klog.Errorln("HTTP server failed:", err)
+			exitCode = 1
 		}
 	}
 	if dogStatsDReceiver != nil {
@@ -423,6 +434,18 @@ type logger struct{}
 
 func (l logger) Println(v ...interface{}) {
 	klog.Errorln(v...)
+}
+
+// setupLogging sends klog output to w, writing every message exactly once. By default klog
+// also copies each message into the buffers of all lower severities, and with a single
+// writer an error was printed three times and a warning twice (also using up the
+// --log-per-second budget three times as fast).
+func setupLogging(w io.Writer) {
+	fs := flag.NewFlagSet("klog", flag.ContinueOnError)
+	klog.InitFlags(fs)
+	_ = fs.Set("logtostderr", "false")
+	_ = fs.Set("one_output", "true")
+	klog.SetOutput(w)
 }
 
 type RateLimitedLogOutput struct {
