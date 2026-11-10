@@ -5,7 +5,11 @@
 package common
 
 import (
+	"errors"
+	"fmt"
+	"os"
 	"regexp"
+	"strings"
 
 	"github.com/codifinary/codexray-node-agent/flags"
 	"k8s.io/klog/v2"
@@ -20,9 +24,35 @@ var ContainerFilter *containerFilter
 
 func init() {
 	var err error
-	if ContainerFilter, err = newContainerFilter(*flags.ContainerAllowlist, *flags.ContainerDenylist); err != nil {
+	allowList := *flags.ContainerAllowlist
+	if !strings.HasSuffix(os.Args[0], ".test") {
+		if allowList, err = validateContainerAllowlist(allowList); err != nil {
+			klog.Exitf("invalid container allowlist: %s", err)
+		}
+	}
+	if ContainerFilter, err = newContainerFilter(allowList, *flags.ContainerDenylist); err != nil {
 		klog.Exitf("invalid container filter: %s", err)
 	}
+}
+
+// validateContainerAllowlist requires at least one allowlist pattern and rejects
+// empty entries and "*". It returns the trimmed patterns.
+func validateContainerAllowlist(allowList []string) ([]string, error) {
+	if len(allowList) == 0 {
+		return nil, errors.New("--container-allowlist (CONTAINER_ALLOWLIST) is required")
+	}
+	res := make([]string, 0, len(allowList))
+	for _, v := range allowList {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return nil, errors.New("empty pattern")
+		}
+		if strings.Trim(v, "*") == "" {
+			return nil, fmt.Errorf("%q is not allowed: list the containers to monitor", v)
+		}
+		res = append(res, v)
+	}
+	return res, nil
 }
 
 func newContainerFilter(allowList, denyList []string) (*containerFilter, error) {
