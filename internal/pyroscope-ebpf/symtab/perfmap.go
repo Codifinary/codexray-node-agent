@@ -10,16 +10,42 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 type PerfMap struct {
 	symbols []Symbol
+
+	// identity of the file the symbols were parsed from, to skip re-parsing an unchanged file
+	size  int64
+	mtime int64
 }
 
-func NewPerfMap(pid int) (*PerfMap, error) {
+// Codexray: JVM (Compiler.perfmap) and Node.js perf maps are re-read for every profiled PID
+// on every collection round and parsed fully into memory. For large JIT'd applications the
+// file reaches tens to hundreds of MB, so each JVM could cost several times that in heap,
+// every minute, with the previous table still live during the parse.
+var (
+	// MaxPerfMapSize skips perf map files larger than this (JIT frames then resolve as
+	// unknown). 0 = unlimited.
+	MaxPerfMapSize int64 = 64 << 20
+
+	PerfMapLoads        atomic.Int64 // files parsed
+	PerfMapReused       atomic.Int64 // unchanged files not re-parsed
+	PerfMapSkippedLarge atomic.Int64 // files skipped because of MaxPerfMapSize
+	PerfMapBytesParsed  atomic.Int64
+)
+
+// NewPerfMap loads the perf map of pid. prev, if non-nil, is returned as-is when the file
+// has not changed since it was parsed.
+func NewPerfMap(pid int, prev *PerfMap) (*PerfMap, error) {
 	nsPid := getNsPid(pid)
 
 	perfMapPath := fmt.Sprintf("/proc/%d/root/tmp/perf-%d.map", pid, nsPid)
+	return loadPerfMap(perfMapPath, prev)
+}
+
+func loadPerfMap(perfMapPath string, prev *PerfMap) (*PerfMap, error) {
 	f, err := os.Open(perfMapPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -28,10 +54,26 @@ func NewPerfMap(pid int) (*PerfMap, error) {
 		return nil, err
 	}
 	defer f.Close()
-	pm := &PerfMap{}
-	if pm.symbols, err = parsePerfMap(f); err != nil {
+	fi, err := f.Stat()
+	if err != nil {
 		return nil, err
 	}
+	if prev != nil && prev.size == fi.Size() && prev.mtime == fi.ModTime().UnixNano() {
+		PerfMapReused.Add(1)
+		return prev, nil
+	}
+	if MaxPerfMapSize > 0 && fi.Size() > MaxPerfMapSize {
+		// Not an error: an error would mark the whole ProcTable as failed and stop refreshing
+		// its ELF mappings. Native frames keep resolving; only JIT frames are left unknown.
+		PerfMapSkippedLarge.Add(1)
+		return nil, nil
+	}
+	pm := &PerfMap{size: fi.Size(), mtime: fi.ModTime().UnixNano()}
+	if pm.symbols, err = parsePerfMapSized(f, fi.Size()); err != nil {
+		return nil, err
+	}
+	PerfMapLoads.Add(1)
+	PerfMapBytesParsed.Add(fi.Size())
 	return pm, nil
 }
 
@@ -52,10 +94,19 @@ func (pm *PerfMap) Resolve(pc uint64) Symbol {
 }
 
 func parsePerfMap(reader io.Reader) ([]Symbol, error) {
+	return parsePerfMapSized(reader, 0)
+}
+
+// parsePerfMapSized pre-sizes the symbol slice from the file size (lines are typically
+// 60-200 bytes) so appends don't repeatedly double a large backing array.
+func parsePerfMapSized(reader io.Reader, size int64) ([]Symbol, error) {
 	var (
 		syms []Symbol
 		err  error
 	)
+	if size > 0 {
+		syms = make([]Symbol, 0, size/80+1)
+	}
 	scanner := bufio.NewScanner(reader)
 	for i := 0; scanner.Scan(); i++ {
 		line := scanner.Text()

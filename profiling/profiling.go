@@ -80,6 +80,7 @@ func Init(hostId, hostName string) chan<- containers.ProcessInfo {
 	}
 	elf.MaxMiniDebugInfoSize = int64(*flags.ProfilingMaxMiniDebugInfoSize)
 	elf.MaxStringCacheEntries = *flags.ProfilingSymbolNameCacheEntries
+	symtab.MaxPerfMapSize = int64(*flags.ProfilingMaxPerfMapSize)
 	klog.Infof("profiling symbol cache: size=%d keep_rounds=%d max_minidebuginfo=%d name_cache_entries=%d",
 		cacheOpts.Size, cacheOpts.KeepRounds, elf.MaxMiniDebugInfoSize, elf.MaxStringCacheEntries)
 
@@ -296,7 +297,9 @@ func (tf *TargetFinder) FindTarget(pid uint32) *sd.Target {
 	}
 
 	tf.lock.Lock()
-	dump := pi.jvmPerfmapDumpSupported && pi.lastPerfmapDump != tf.now
+	// Rounds are ~CollectInterval apart with jitter; allow half a round of slack so the
+	// default 1m interval still dumps every round.
+	dump := pi.jvmPerfmapDumpSupported && tf.now-pi.lastPerfmapDump >= int64(jvmPerfmapDumpInterval()-CollectInterval/2)
 	if dump {
 		pi.lastPerfmapDump = tf.now
 	}
@@ -310,6 +313,32 @@ func (tf *TargetFinder) FindTarget(pid uint32) *sd.Target {
 		}
 	}
 	return target
+}
+
+func jvmPerfmapDumpInterval() time.Duration {
+	if flags.ProfilingJvmPerfmapInterval == nil || *flags.ProfilingJvmPerfmapInterval <= 0 {
+		return CollectInterval
+	}
+	return *flags.ProfilingJvmPerfmapInterval
+}
+
+// RegisterMetrics exposes bounded profiler internals that live in the vendored pyroscope code.
+func RegisterMetrics(reg prometheus.Registerer) error {
+	for _, c := range []prometheus.Collector{
+		prometheus.NewCounterFunc(prometheus.CounterOpts{Name: "node_agent_profiling_perfmap_loads_total", Help: "JIT perf map files parsed"},
+			func() float64 { return float64(symtab.PerfMapLoads.Load()) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{Name: "node_agent_profiling_perfmap_reused_total", Help: "Unchanged JIT perf map files not re-parsed"},
+			func() float64 { return float64(symtab.PerfMapReused.Load()) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{Name: "node_agent_profiling_perfmap_skipped_total", Help: "JIT perf map files skipped because they exceed --profiling-max-perfmap-size"},
+			func() float64 { return float64(symtab.PerfMapSkippedLarge.Load()) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{Name: "node_agent_profiling_perfmap_parsed_bytes_total", Help: "Bytes of JIT perf map files parsed"},
+			func() float64 { return float64(symtab.PerfMapBytesParsed.Load()) }),
+	} {
+		if err := reg.Register(c); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (tf *TargetFinder) RemoveDeadPID(pid uint32) {

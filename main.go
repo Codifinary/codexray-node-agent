@@ -374,6 +374,9 @@ func registerRuntimeDiagnostics(reg prometheus.Registerer) {
 	if err := diag.Register(reg); err != nil {
 		klog.Exitln(err)
 	}
+	if err := profiling.RegisterMetrics(reg); err != nil {
+		klog.Exitln(err)
+	}
 }
 
 func info(name, version string) prometheus.Collector {

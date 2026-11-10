@@ -68,6 +68,8 @@ var (
 	ProfilingSymbolCacheSize        = kingpin.Flag("profiling-symbol-cache-size", "Entries in each eBPF profiler symbol cache (per-PID, build-ID and same-file caches)").Default("256").Envar("PROFILING_SYMBOL_CACHE_SIZE").Int()
 	ProfilingSymbolCacheKeepRounds  = kingpin.Flag("profiling-symbol-cache-keep-rounds", "Collection rounds (1 round = 1m) an unused symbol table is kept in cache").Default("8").Envar("PROFILING_SYMBOL_CACHE_KEEP_ROUNDS").Int()
 	ProfilingMaxMiniDebugInfoSize   = kingpin.Flag("profiling-max-minidebuginfo-size", "Maximum decompressed size of an ELF .gnu_debugdata section loaded for symbolization; larger ones are skipped. 0 = unlimited").Default("32MB").Envar("PROFILING_MAX_MINIDEBUGINFO_SIZE").Bytes()
+	ProfilingMaxPerfMapSize         = kingpin.Flag("profiling-max-perfmap-size", "Skip JIT perf map files (/tmp/perf-<pid>.map from JVM/Node.js) larger than this when symbolizing; JIT frames are then left unresolved. 0 = unlimited").Default("64MB").Envar("PROFILING_MAX_PERFMAP_SIZE").Bytes()
+	ProfilingJvmPerfmapInterval     = kingpin.Flag("profiling-jvm-perfmap-dump-interval", "How often to ask each JVM to rewrite its perf map (Compiler.perfmap). Each dump makes the JVM write, and the agent re-parse, the whole map").Default("1m").Envar("PROFILING_JVM_PERFMAP_DUMP_INTERVAL").Duration()
 	ProfilingSymbolNameCacheEntries = kingpin.Flag("profiling-symbol-name-cache-entries", "Maximum cached symbol names per loaded ELF file. 0 = unlimited").Default("16384").Envar("PROFILING_SYMBOL_NAME_CACHE_ENTRIES").Int()
 
 	ScrapeInterval = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("15s").Envar("SCRAPE_INTERVAL").Duration()

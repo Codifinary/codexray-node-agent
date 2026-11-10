@@ -85,7 +85,9 @@ func (p *ProcTable) Refresh() {
 		_ = level.Error(p.logger).Log("err", p.err)
 	}
 
-	p.perfMap, err = NewPerfMap(p.options.Pid)
+	prev := p.perfMap
+	p.perfMap = nil // let the previous table be collected while a new one is parsed
+	p.perfMap, err = NewPerfMap(p.options.Pid, prev)
 	if err != nil {
 		level.Error(p.logger).Log("msg", "failed to read perf map file", "err", err)
 		p.err = err

@@ -10,6 +10,7 @@ import (
 
 	"github.com/codifinary/codexray-node-agent/containers"
 	"github.com/codifinary/codexray-node-agent/diag"
+	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
@@ -45,4 +46,38 @@ func TestTargetFinderFindTargetRespectsMinAgeAndIsConcurrencySafe(t *testing.T) 
 	}
 	wg.Wait()
 	require.Nil(t, tf.FindTarget(2))
+}
+
+func TestJvmPerfmapDumpInterval(t *testing.T) {
+	interval := 5 * time.Minute
+	prev := flagsJvmInterval(interval)
+	defer flagsJvmInterval(prev)
+
+	tf := &TargetFinder{processes: map[uint32]*processInfo{}}
+	start := time.Now()
+	tf.add(containers.ProcessInfo{Pid: 1, ContainerId: "/k8s/ns/pod/c", StartedAt: start.Add(-time.Hour)})
+	pi := tf.processes[1]
+	pi.initialized = true
+	pi.jvmPerfmapDumpSupported = true
+
+	dumps := 0
+	for round := 0; round < 10; round++ { // 10 rounds of ~1m with jitter
+		now := start.Add(time.Duration(round)*CollectInterval - time.Duration(round%2)*time.Second)
+		tf.setNow(now.UnixNano())
+		before := pi.lastPerfmapDump
+		tf.FindTarget(1) // DumpPerfmap fails (no JVM); lastPerfmapDump still advances
+		if pi.lastPerfmapDump != before {
+			dumps++
+		}
+	}
+	require.Equal(t, 2, dumps, "one dump every 5 rounds")
+}
+
+func flagsJvmInterval(d time.Duration) time.Duration {
+	var prev time.Duration
+	if flags.ProfilingJvmPerfmapInterval != nil {
+		prev = *flags.ProfilingJvmPerfmapInterval
+	}
+	*flags.ProfilingJvmPerfmapInterval = d
+	return prev
 }
