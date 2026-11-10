@@ -78,7 +78,7 @@ in the test cluster.
 
 ## What the local benchmark in this repository does *not* cover
 
-The quick benchmark (see the test report) ran on a Docker Desktop VM: 9 containers, synthetic
+The quick benchmark ([PERFORMANCE.md](PERFORMANCE.md)) ran on a Docker Desktop VM: 9 containers, synthetic
 load, 4 minutes per configuration. It cannot reproduce production process counts, JVM
 perf-map sizes or node pressure. It also could not attach uprobes, because the VM's virtiofs
 returns EIO for `perf_uprobe`. Use it only as a relative comparison between builds and flags.
