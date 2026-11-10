@@ -78,9 +78,9 @@ func TestPprofGuard(t *testing.T) {
 
 func TestCgroupMemoryV2(t *testing.T) {
 	dir := t.TempDir()
-	prev := selfCgroupDir
-	selfCgroupDir = dir
-	defer func() { selfCgroupDir = prev }()
+	prev, prevProc := selfCgroupDir, procSelfCgroup
+	selfCgroupDir, procSelfCgroup = dir, filepath.Join(dir, "no-such-file")
+	defer func() { selfCgroupDir, procSelfCgroup = prev, prevProc }()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "memory.current"), []byte("1234\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "memory.max"), []byte("max\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "memory.stat"), []byte("anon 1000\nfile 200\nsock 34\n"), 0o600))
@@ -89,6 +89,31 @@ func TestCgroupMemoryV2(t *testing.T) {
 	require.Equal(t, uint64(1234), u)
 	require.Equal(t, uint64(0), l)
 	require.Equal(t, uint64(34), CgroupMemoryStat()["sock"])
+}
+
+// Privileged/hostPID pods (the node-agent DaemonSet) have no private cgroup namespace:
+// /sys/fs/cgroup is the host hierarchy, whose root has no memory.current, and the agent's
+// cgroup is the path in /proc/self/cgroup. Observed on staging (containerd 2.2, k8s 1.30).
+func TestCgroupMemoryV2HostHierarchy(t *testing.T) {
+	root := t.TempDir()
+	own := filepath.Join(root, "kubepods.slice", "pod1.slice", "cri-containerd-abc.scope")
+	require.NoError(t, os.MkdirAll(own, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "memory.stat"), []byte("anon 999999\n"), 0o600)) // host-wide, must be ignored
+	require.NoError(t, os.WriteFile(filepath.Join(own, "memory.current"), []byte("4096\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(own, "memory.max"), []byte("5368709120\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(own, "memory.stat"), []byte("anon 3000\n"), 0o600))
+	proc := filepath.Join(root, "self-cgroup")
+	require.NoError(t, os.WriteFile(proc, []byte("0::/kubepods.slice/pod1.slice/cri-containerd-abc.scope\n"), 0o600))
+
+	prev, prevProc := selfCgroupDir, procSelfCgroup
+	selfCgroupDir, procSelfCgroup = root, proc
+	defer func() { selfCgroupDir, procSelfCgroup = prev, prevProc }()
+
+	u, l, ok := CgroupMemory()
+	require.True(t, ok)
+	require.Equal(t, uint64(4096), u)
+	require.Equal(t, uint64(5368709120), l)
+	require.Equal(t, uint64(3000), CgroupMemoryStat()["anon"])
 }
 
 func TestPprofDoesNotExposeCmdline(t *testing.T) {

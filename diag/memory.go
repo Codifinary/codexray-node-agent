@@ -16,9 +16,42 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// selfCgroupDir is where the agent's own cgroup is visible. With cgroup namespaces (the
-// default for containers on cgroup v2) the container sees its own cgroup at /sys/fs/cgroup.
-var selfCgroupDir = "/sys/fs/cgroup"
+// selfCgroupDir is the cgroup filesystem mount. With a private cgroup namespace (the default
+// for unprivileged containers on cgroup v2) the agent's own cgroup is the mount root. Without
+// one (privileged pods, hostPID setups such as the node-agent DaemonSet) the mount shows the
+// host hierarchy, and the agent's cgroup is the path listed in /proc/self/cgroup.
+var (
+	selfCgroupDir  = "/sys/fs/cgroup"
+	procSelfCgroup = "/proc/self/cgroup"
+)
+
+// ownCgroupDirs returns candidate directories of the agent's own cgroup for the given
+// controller ("" = cgroup v2 unified hierarchy, "memory" = cgroup v1), most specific first.
+func ownCgroupDirs(controller string) []string {
+	base := selfCgroupDir
+	if controller != "" {
+		base = filepath.Join(selfCgroupDir, controller)
+	}
+	var dirs []string
+	if data, err := os.ReadFile(procSelfCgroup); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			parts := strings.SplitN(line, ":", 3)
+			if len(parts) != 3 {
+				continue
+			}
+			match := controller == "" && parts[0] == "0" && parts[1] == ""
+			if controller != "" {
+				for _, c := range strings.Split(parts[1], ",") {
+					match = match || c == controller
+				}
+			}
+			if match && parts[2] != "/" && parts[2] != "" {
+				dirs = append(dirs, filepath.Join(base, filepath.Clean(parts[2])))
+			}
+		}
+	}
+	return append(dirs, base)
+}
 
 // CgroupMemory returns the agent container's memory usage and limit as charged by the
 // kernel. This is what the OOM killer acts on: it includes the process RSS plus kernel
@@ -26,18 +59,23 @@ var selfCgroupDir = "/sys/fs/cgroup"
 // buffers, BPF maps on kernels that account them), which process RSS does not show.
 // limit is 0 when unlimited or unknown.
 func CgroupMemory() (usage, limit uint64, ok bool) {
-	// cgroup v2
-	if u, err := readUint(filepath.Join(selfCgroupDir, "memory.current")); err == nil {
-		l, _ := readUint(filepath.Join(selfCgroupDir, "memory.max")) // "max" -> error -> 0
-		return u, l, true
+	// cgroup v2. The root of the hierarchy has no memory.current, so a directory that has
+	// one is a real (non-root) cgroup.
+	for _, d := range ownCgroupDirs("") {
+		if u, err := readUint(filepath.Join(d, "memory.current")); err == nil {
+			l, _ := readUint(filepath.Join(d, "memory.max")) // "max" -> error -> 0
+			return u, l, true
+		}
 	}
 	// cgroup v1
-	if u, err := readUint(filepath.Join(selfCgroupDir, "memory", "memory.usage_in_bytes")); err == nil {
-		l, _ := readUint(filepath.Join(selfCgroupDir, "memory", "memory.limit_in_bytes"))
-		if l >= 1<<62 { // "unlimited" on v1 is a huge page-aligned number
-			l = 0
+	for _, d := range ownCgroupDirs("memory") {
+		if u, err := readUint(filepath.Join(d, "memory.usage_in_bytes")); err == nil {
+			l, _ := readUint(filepath.Join(d, "memory.limit_in_bytes"))
+			if l >= 1<<62 { // "unlimited" on v1 is a huge page-aligned number
+				l = 0
+			}
+			return u, l, true
 		}
-		return u, l, true
 	}
 	return 0, 0, false
 }
@@ -45,8 +83,20 @@ func CgroupMemory() (usage, limit uint64, ok bool) {
 // CgroupMemoryStat returns selected fields of memory.stat (bytes), used to attribute
 // cgroup memory: anon, file, kernel, sock, shmem, ...
 func CgroupMemoryStat() map[string]uint64 {
-	for _, p := range []string{filepath.Join(selfCgroupDir, "memory.stat"), filepath.Join(selfCgroupDir, "memory", "memory.stat")} {
-		data, err := os.ReadFile(p)
+	var paths []string
+	for _, d := range ownCgroupDirs("") {
+		paths = append(paths, filepath.Join(d, "memory.current"))
+	}
+	for _, d := range ownCgroupDirs("memory") {
+		paths = append(paths, filepath.Join(d, "memory.usage_in_bytes"))
+	}
+	for _, p := range paths {
+		// Only use memory.stat of a directory that is a real cgroup (has a usage file);
+		// the v2 root's memory.stat describes the whole host.
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(filepath.Dir(p), "memory.stat"))
 		if err != nil {
 			continue
 		}
