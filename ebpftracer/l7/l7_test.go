@@ -275,3 +275,37 @@ func TestParseZookeeper(t *testing.T) {
 	assert.Equal(t, "getData", op)
 	assert.Equal(t, "/clickhouse/tables/shard-1/coroot_3kuq8b3z/otel_t...<TRUNCATED>", arg)
 }
+
+// A captured packet that looks like a ClickHouse Query but declares huge string lengths must
+// be rejected without allocating the declared size (observed OOM driver on staging, 2026-11).
+func TestParseClickhouseHugeLengthsDoNotAllocate(t *testing.T) {
+	huge := []byte{0xff, 0xff, 0xff, 0xff, 0x0f} // uvarint 4 GiB - 1
+	cases := map[string][]byte{
+		"query id":      append([]byte{0x01}, huge...),
+		"initial user":  append([]byte{0x01, 0x00, 0x01}, huge...),
+		"setting value": nil,
+	}
+	// Valid header up to the settings, then a setting whose value claims 4 GiB.
+	settings := []byte{0x01, 0x00, 0x01, 0x00, 0x00, 0x00}
+	settings = append(settings, make([]byte, 8)...)                                         // query start time
+	settings = append(settings, 0x01, 0x00, 0x00, 0x00)                                     // TCP, os user, hostname, client name
+	settings = append(settings, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // versions, quota, depth, patch, otel=0, 3x replicas
+	settings = append(settings, 0x01, 'k', 0x00)                                            // key "k", flags
+	cases["setting value"] = append(settings, huge...)
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(10, func() { _ = ParseClickhouse(payload) })
+			assert.Equal(t, "", ParseClickhouse(payload))
+			assert.LessOrEqual(t, allocs, float64(1))
+		})
+	}
+}
+
+func FuzzParseClickhouse(f *testing.F) {
+	f.Add([]byte{0x01, 0x00, 0x01, 0x00, 0x00, 0x00})
+	f.Fuzz(func(t *testing.T, payload []byte) {
+		if q := ParseClickhouse(payload); len(q) > 1024+len("...<TRUNCATED>") {
+			t.Fatalf("query longer than the cap: %d", len(q))
+		}
+	})
+}
