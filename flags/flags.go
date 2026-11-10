@@ -128,6 +128,7 @@ func init() {
 	kingpin.HelpFlag.Short('h').Hidden()
 	normalizeLegacyStatsDConfig()
 	kingpin.Parse()
+	resolveTelemetryFromFlags()
 
 	if *agentVersion {
 		fmt.Println("Version:", Version)

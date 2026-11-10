@@ -221,3 +221,8 @@ func containerByCgroup(cgroupPath string) (ContainerType, string, error) {
 
 	return ContainerTypeUnknown, "", fmt.Errorf("unknown container: %s", cgroupPath)
 }
+
+// SetRootsForTesting points cgroup readers at a fixture tree. Tests only.
+func SetRootsForTesting(v1, v2 string) {
+	cgRoot, cg2Root = v1, v2
+}

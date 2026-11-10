@@ -296,6 +296,20 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 
 	ch <- counter(metrics.Restarts, float64(c.restarts))
 
+	if c.oomKills > 0 {
+		ch <- counter(metrics.OOMKills, float64(c.oomKills))
+	}
+
+	if flags.Telemetry.ContainerResourceMetrics {
+		c.collectResourceMetrics(ch)
+	}
+
+	c.collectNonResourceMetrics(ch)
+}
+
+// collectResourceMetrics exports container CPU, memory, throttling, pressure, disk and GPU
+// usage (CONTAINER_RESOURCE_METRICS_ENABLED). Must be called with c.lock held.
+func (c *Container) collectResourceMetrics(ch chan<- prometheus.Metric) {
 	if cpu := c.cgroup.CpuStat(); cpu != nil {
 		if cpu.LimitCores > 0 {
 			ch <- gauge(metrics.CPULimit, cpu.LimitCores)
@@ -327,10 +341,6 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		ch <- counter(metrics.PsiIO, psi.IOSecondsFull, "full")
 	}
 
-	if c.oomKills > 0 {
-		ch <- counter(metrics.OOMKills, float64(c.oomKills))
-	}
-
 	if disks, err := node.GetDisks(); err == nil {
 		ioStat := c.cgroup.IOStat()
 		for majorMinor, mounts := range c.getMounts() {
@@ -355,6 +365,12 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
+	c.collectGpuUsage(ch)
+}
+
+// collectNonResourceMetrics exports network, L7, logs, runtime and application metrics,
+// which do not depend on CONTAINER_RESOURCE_METRICS_ENABLED. Must be called with c.lock held.
+func (c *Container) collectNonResourceMetrics(ch chan<- prometheus.Metric) {
 	for addr, open := range c.getListens() {
 		ch <- gauge(metrics.NetListenInfo, float64(open), addr.String(), "")
 	}
@@ -389,6 +405,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	for source, p := range c.logParsers {
+		if !flags.Telemetry.LogParsing {
+			break
+		}
 		for _, c := range p.parser.GetCounters() {
 			ch <- counter(metrics.LogMessages, float64(c.Messages), source, c.Level.String(), c.Hash, common.TruncateUtf8(c.Sample, *flags.MaxLabelLength))
 		}
@@ -438,24 +457,6 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 
-		for _, usage := range c.gpuStats {
-			usage.Reset()
-		}
-		if usage := process.getGPUUsage(); usage != nil {
-			for uuid, u := range usage {
-				tu := c.gpuStats[uuid]
-				if tu == nil {
-					tu = &GpuUsage{}
-					c.gpuStats[uuid] = tu
-				}
-				tu.GPU += u.GPU
-				tu.Memory += u.Memory
-			}
-		}
-	}
-	for uuid, usage := range c.gpuStats {
-		ch <- gauge(metrics.GpuUsagePercent, usage.GPU, uuid)
-		ch <- gauge(metrics.GpuMemoryUsagePercent, usage.Memory, uuid)
 	}
 
 	for appType := range appTypes {
@@ -480,6 +481,30 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		for ip, rtt := range c.ping() {
 			ch <- gauge(metrics.NetLatency, rtt, ip.String())
 		}
+	}
+}
+
+// collectGpuUsage aggregates per-process GPU samples into per-GPU container usage.
+// Must be called with c.lock held.
+func (c *Container) collectGpuUsage(ch chan<- prometheus.Metric) {
+	for _, usage := range c.gpuStats {
+		usage.Reset()
+	}
+	for _, process := range c.processes {
+		usage := process.getGPUUsage()
+		for uuid, u := range usage {
+			tu := c.gpuStats[uuid]
+			if tu == nil {
+				tu = &GpuUsage{}
+				c.gpuStats[uuid] = tu
+			}
+			tu.GPU += u.GPU
+			tu.Memory += u.Memory
+		}
+	}
+	for uuid, usage := range c.gpuStats {
+		ch <- gauge(metrics.GpuUsagePercent, usage.GPU, uuid)
+		ch <- gauge(metrics.GpuMemoryUsagePercent, usage.Memory, uuid)
 	}
 }
 
@@ -784,9 +809,12 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	if timestamp != 0 && conn.Timestamp != timestamp {
 		return nil
 	}
-	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey)
+	var stats *L7Metrics // nil-safe: observe is a no-op when L7 metrics are disabled
+	if flags.Telemetry.L7Metrics {
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey)
+	}
 
-	ebpfTracesDisabled := false
+	ebpfTracesDisabled := !flags.Telemetry.L7Traces
 	for _, p := range c.processes {
 		if p.Flags.EbpfTracesDisabled {
 			ebpfTracesDisabled = true
@@ -1096,7 +1124,7 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 }
 
 func (c *Container) runLogParser(logPath string) {
-	if *flags.DisableLogParsing {
+	if !flags.Telemetry.LogPipeline() {
 		return
 	}
 

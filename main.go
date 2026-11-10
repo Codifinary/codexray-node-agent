@@ -161,8 +161,21 @@ func main() {
 		MaxSampleLen: *flags.MaxLabelLength, // the exported sample label is truncated to this anyway
 	}
 
-	tracing.Init(machineId, hostname, version)
-	logs.Init(machineId, hostname, version)
+	tm := flags.Telemetry
+	klog.Infof("telemetry: node_metrics=%t container_resource_metrics=%t l7_metrics=%t l7_traces=%t log_collection=%t log_parsing=%t profiling=%t",
+		tm.NodeMetrics, tm.ContainerResourceMetrics, tm.L7Metrics, tm.L7Traces, tm.LogCollection, tm.LogParsing, tm.Profiling)
+	logparser.DefaultOptions.DisablePatterns = !tm.LogParsing
+
+	if tm.L7Traces {
+		tracing.Init(machineId, hostname, version)
+	} else {
+		klog.Infoln("eBPF L7 traces disabled")
+	}
+	if tm.LogCollection {
+		logs.Init(machineId, hostname, version)
+	} else {
+		klog.Infoln("container log collection (export) disabled")
+	}
 
 	nodeCollector := node.NewCollector(hostname, kv)
 
@@ -173,8 +186,20 @@ func main() {
 		registry,
 	)
 	registerRuntimeDiagnostics(registerer)
-	if err := registerer.Register(nodeCollector); err != nil {
-		klog.Exitln(err)
+	for name, enabled := range map[string]bool{
+		"node_metrics": tm.NodeMetrics, "container_resource_metrics": tm.ContainerResourceMetrics,
+		"ebpf_l7_metrics": tm.L7Metrics, "ebpf_l7_traces": tm.L7Traces,
+		"container_log_collection": tm.LogCollection, "container_log_parsing": tm.LogParsing,
+		"profiling": tm.Profiling,
+	} {
+		diag.SetFeature(name, enabled)
+	}
+	if tm.NodeMetrics {
+		if err := registerer.Register(nodeCollector); err != nil {
+			klog.Exitln(err)
+		}
+	} else {
+		klog.Infoln("node metrics disabled")
 	}
 
 	gpuCollector, err := gpu.NewCollector()
@@ -193,7 +218,12 @@ func main() {
 			registerer = prometheus.WrapRegistererWith(prometheus.Labels{"az": az, "region": region}, registerer)
 		}
 	}
-	processInfoCh := profiling.Init(machineId, hostname)
+	var processInfoCh chan<- containers.ProcessInfo
+	if tm.Profiling {
+		processInfoCh = profiling.Init(machineId, hostname)
+	} else {
+		klog.Infoln("profiling disabled")
+	}
 	cr, err := containers.NewRegistry(registerer, processInfoCh, gpuCollector.ProcessUsageSampleCh)
 	if err != nil {
 		klog.Exitln(err)

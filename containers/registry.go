@@ -106,8 +106,10 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 	if err = CrioInit(); err != nil {
 		klog.Warningln(err)
 	}
-	if err = JournaldInit(); err != nil {
-		klog.Warningln(err)
+	if flags.Telemetry.LogPipeline() {
+		if err = JournaldInit(); err != nil {
+			klog.Warningln(err)
+		}
 	}
 
 	r := &Registry{
@@ -121,7 +123,8 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 
 		processInfoCh: processInfoCh,
 
-		tracer: ebpftracer.NewTracer(hostNetNs, selfNetNs, *flags.DisableL7Tracing),
+		// L7 eBPF programs and TLS uprobes are needed for either L7 metrics or L7 traces.
+		tracer: ebpftracer.NewTracer(hostNetNs, selfNetNs, !flags.Telemetry.L7Probes()),
 
 		trafficStatsUpdateCh: make(chan *TrafficStatsUpdate),
 		nodejsStatsUpdateCh:  make(chan *NodejsStatsUpdate),

@@ -19,6 +19,9 @@ type L7Metrics struct {
 }
 
 func (m *L7Metrics) observe(status, method string, duration time.Duration) {
+	if m == nil {
+		return
+	}
 	if m.Requests != nil {
 		var err error
 		var c prometheus.Counter
