@@ -7,6 +7,7 @@ package flags
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"gopkg.in/alecthomas/kingpin.v2"
@@ -46,8 +47,9 @@ var (
 					Strings()
 	EphemeralPortRange = kingpin.Flag("ephemeral-port-range", "Destination and Listen TCP ports from this range will be skipped").Default("32768-60999").Envar("EPHEMERAL_PORT_RANGE").String()
 
-	MinContainerAge      = kingpin.Flag("min-container-age", "Don't report metrics for containers younger than this. Suppresses short-lived job/cronjob pods that produce high-cardinality series. 0 disables.").Default("30s").Envar("MIN_CONTAINER_AGE").Duration()
-	InstrumentationDelay = kingpin.Flag("instrumentation-delay", "Delay before attaching language-runtime instrumentation (Python GIL, Node.js event loop, etc.) to a newly started process.").Default("30s").Envar("INSTRUMENTATION_DELAY").Duration()
+	MinContainerAge          = kingpin.Flag("min-container-age", "Don't report metrics for containers younger than this. Suppresses short-lived job/cronjob pods that produce high-cardinality series. Logs and traces of young containers are still exported unless --min-container-age-applies-to=all. 0 disables.").Default("30s").Envar("MIN_CONTAINER_AGE").Duration()
+	MinContainerAgeAppliesTo = kingpin.Flag("min-container-age-applies-to", "metrics: --min-container-age suppresses metrics only, so crash logs and traces of short-lived pods stay available (default). all: also drop logs and eBPF traces of containers younger than --min-container-age").Default("metrics").Envar("MIN_CONTAINER_AGE_APPLIES_TO").Enum("metrics", "all")
+	InstrumentationDelay     = kingpin.Flag("instrumentation-delay", "Delay before attaching language-runtime instrumentation (Python GIL, Node.js event loop, etc.) to a newly started process.").Default("30s").Envar("INSTRUMENTATION_DELAY").Duration()
 
 	Provider          = kingpin.Flag("provider", "`provider` label for `node_cloud_info` metric").Envar("PROVIDER").String()
 	Region            = kingpin.Flag("region", "`region` label for `node_cloud_info` metric").Envar("REGION").String()
@@ -136,6 +138,7 @@ func init() {
 
 	kingpin.HelpFlag.Short('h').Hidden()
 	normalizeLegacyStatsDConfig()
+	os.Args = append(os.Args[:1], NormalizeBoolArgs(kingpin.CommandLine.Model(), os.Args[1:])...)
 	kingpin.Parse()
 	resolveTelemetryFromFlags()
 
@@ -198,4 +201,35 @@ func listenExplicitlyConfigured() bool {
 		}
 	}
 	return false
+}
+
+// NormalizeBoolArgs rewrites --flag=false to --no-flag and --flag=true to --flag for boolean
+// flags, which kingpin otherwise rejects ("unexpected false"). Other arguments are unchanged;
+// an unparsable value is left for kingpin to report.
+func NormalizeBoolArgs(model *kingpin.ApplicationModel, args []string) []string {
+	isBool := map[string]bool{}
+	for _, f := range model.Flags {
+		isBool[f.Name] = f.IsBoolFlag()
+	}
+	out := make([]string, 0, len(args))
+	for i, a := range args {
+		if a == "--" {
+			return append(out, args[i:]...)
+		}
+		name, val, ok := strings.Cut(strings.TrimPrefix(a, "--"), "=")
+		if !ok || !strings.HasPrefix(a, "--") || !isBool[name] {
+			out = append(out, a)
+			continue
+		}
+		b, err := strconv.ParseBool(val)
+		switch {
+		case err != nil:
+			out = append(out, a)
+		case b:
+			out = append(out, "--"+name)
+		default:
+			out = append(out, "--no-"+name)
+		}
+	}
+	return out
 }

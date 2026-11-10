@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed (breaking default)
+- **`CONTAINER_RESOURCE_METRICS_ENABLED` now defaults to `false`.** Pod CPU/memory comes from
+  the cluster agent. Set it to `true` to keep `container_resources_*`; the CodeXray UI node
+  disk panels currently depend on them.
+- **`MIN_CONTAINER_AGE`** behavior is now explicit: it gates metrics only (unchanged);
+  `MIN_CONTAINER_AGE_APPLIES_TO=all` also drops logs and traces of young containers.
+
+### Added (cardinality and guard rails)
+- `L7_ACTUAL_DESTINATION` (`keep`), `L7_LATENCY_BUCKETS`, `DNS_MAX_DOMAINS_PER_CONTAINER` (500).
+- Boolean flags accept `--flag=false` / `--flag=true`.
+- Startup warnings for an `EPHEMERAL_PORT_RANGE` that covers service ports and an error for a
+  `CGROUPFS_ROOT` that is not a cgroup filesystem.
+
 Stabilization for the repeated OOM kills, independent telemetry controls, and node
 filesystem metrics. The root cause analysis is in
 [docs/RCA-NODE-AGENT-OOM.md](docs/RCA-NODE-AGENT-OOM.md); the OOMs are **not** declared fixed

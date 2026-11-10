@@ -6,9 +6,11 @@ package containers
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/ebpftracer/l7"
+	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
@@ -80,4 +82,26 @@ func TestL7ActualDestinationDrop(t *testing.T) {
 	assert.Equal(t, 6, count()) // 3 backends x (requests + latency)
 	common.DropActualDestination = true
 	assert.Equal(t, 2, count())
+}
+
+func TestMinContainerAgeScope(t *testing.T) {
+	prevAge, prevScope := *flags.MinContainerAge, *flags.MinContainerAgeAppliesTo
+	defer func() { *flags.MinContainerAge, *flags.MinContainerAgeAppliesTo = prevAge, prevScope }()
+
+	now := time.Now()
+	young := &Container{id: "/k8s/job", startedAt: now.Add(-5 * time.Second)}
+	old := &Container{id: "/k8s/web", startedAt: now.Add(-time.Hour)}
+
+	*flags.MinContainerAge = 30 * time.Second
+	assert.True(t, young.youngerThanMinAge(now))
+	assert.False(t, old.youngerThanMinAge(now))
+
+	*flags.MinContainerAgeAppliesTo = "metrics"
+	assert.False(t, minAgeGatesLogsAndTraces(), "default: logs and traces of young containers are kept")
+	*flags.MinContainerAgeAppliesTo = "all"
+	assert.True(t, minAgeGatesLogsAndTraces())
+
+	*flags.MinContainerAge = 0
+	assert.False(t, young.youngerThanMinAge(now))
+	assert.False(t, minAgeGatesLogsAndTraces(), "no gating when min-container-age is disabled")
 }

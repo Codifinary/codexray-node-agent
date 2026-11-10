@@ -5,6 +5,7 @@
 package cgroup
 
 import (
+	"fmt"
 	"os"
 	"path"
 	"runtime"
@@ -53,5 +54,23 @@ func Init() error {
 		}
 	}
 	klog.Infoln("cgroup v2 root is", cg2Root)
+	if err := checkCgroupRoot(cgRoot); err != nil {
+		klog.Errorf("--cgroupfs-root %q does not look like a cgroup filesystem (%s): container CPU/memory/IO metrics will be missing", cgRoot, err)
+	}
 	return nil
+}
+
+// checkCgroupRoot reports whether root holds a cgroup v2 hierarchy (cgroup.controllers) or a
+// v1 hierarchy (cpu or memory controller directories). A wrong --cgroupfs-root used to drop
+// container resource metrics silently.
+func checkCgroupRoot(root string) error {
+	if _, err := os.Stat(root); err != nil {
+		return err
+	}
+	for _, p := range []string{"cgroup.controllers", "unified/cgroup.controllers", "cpu", "memory", "cpu,cpuacct"} {
+		if _, err := os.Stat(path.Join(root, p)); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("no cgroup.controllers and no cpu/memory controller directories")
 }

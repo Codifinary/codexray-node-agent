@@ -48,3 +48,11 @@ func TestDestinationKeyForMetrics(t *testing.T) {
 	// The original key, used for traces and the pinger, is unchanged.
 	assert.Equal(t, "10.42.1.5:8080", a.ActualDestinationLabelValue())
 }
+
+func TestEphemeralRangeWarning(t *testing.T) {
+	assert.Equal(t, "", EphemeralRangeWarning(32768, 60999))
+	assert.Equal(t, "", EphemeralRangeWarning(10000, 65535))
+	w := EphemeralRangeWarning(1, 65535)
+	assert.Contains(t, w, "1-9999")
+	assert.Contains(t, w, "will NOT be tracked")
+}

@@ -58,8 +58,8 @@ var (
 		"Collect node-level CPU, memory, disk, filesystem and network metrics").
 		Default("true").Envar("NODE_METRICS_ENABLED").Bool()
 	ContainerResourceMetricsEnabled = kingpin.Flag("container-resource-metrics-enabled",
-		"Export container-level CPU, memory, throttling, pressure, disk I/O and GPU usage series. Container discovery, process attribution, network, L7, logs, traces and profiling are not affected").
-		Default("true").Envar("CONTAINER_RESOURCE_METRICS_ENABLED").Bool()
+		"Export container-level CPU, memory, throttling, pressure, disk I/O and GPU usage series. Off by default since this release: pod-level CPU/memory comes from the cluster agent. Container discovery, process attribution, network, L7, logs, traces and profiling are not affected").
+		Default("false").Envar("CONTAINER_RESOURCE_METRICS_ENABLED").Bool()
 	EbpfL7MetricsEnabled = optionalBool("ebpf-l7-metrics-enabled",
 		"Export eBPF L7 RED metrics (container_<protocol>_requests_total/_duration). Default: true unless --disable-l7-tracing", "EBPF_L7_METRICS_ENABLED")
 	EbpfL7TracesEnabled = optionalBool("ebpf-l7-traces-enabled",
@@ -109,10 +109,10 @@ func ResolveTelemetry(in TelemetryInputs) TelemetryConfig {
 	}
 }
 
-// Telemetry is resolved after flag parsing. Before that (and in tests) everything is enabled,
-// which matches the defaults.
+// Telemetry is resolved after flag parsing. Before that (and in tests) it matches the defaults:
+// everything enabled except container resource metrics.
 var Telemetry = TelemetryConfig{
-	NodeMetrics: true, ContainerResourceMetrics: true, L7Metrics: true, L7Traces: true,
+	NodeMetrics: true, ContainerResourceMetrics: false, L7Metrics: true, L7Traces: true,
 	LogCollection: true, LogParsing: true, Profiling: true,
 }
 

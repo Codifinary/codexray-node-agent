@@ -129,7 +129,9 @@ spec:
                 secretKeyRef: {name: codexray-agent, key: api-key}
             # Telemetry categories (shown explicitly; these are the defaults). See docs/FEATURE-FLAGS.md.
             - {name: NODE_METRICS_ENABLED, value: "true"}
-            - {name: CONTAINER_RESOURCE_METRICS_ENABLED, value: "true"}
+            # Off by default: pod CPU/memory comes from the cluster agent. Set "true" if dashboards
+            # use container_resources_* (the CodeXray UI node disk panels currently do).
+            - {name: CONTAINER_RESOURCE_METRICS_ENABLED, value: "false"}
             - {name: EBPF_L7_METRICS_ENABLED, value: "true"}
             - {name: EBPF_L7_TRACES_ENABLED, value: "true"}
             - {name: TRACES_SAMPLING, value: "1.0"}

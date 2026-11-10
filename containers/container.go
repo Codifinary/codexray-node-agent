@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/codifinary/codexray-node-agent/cgroup"
@@ -268,30 +269,74 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 	ch <- prometheus.NewDesc("container", "", nil, nil)
 }
 
+// youngerThanMinAge reports whether the container is younger than --min-container-age.
+// Must be called with c.lock held.
+func (c *Container) youngerThanMinAge(now time.Time) bool {
+	minAge := minContainerAge()
+	if minAge <= 0 {
+		return false
+	}
+	// Fall back to cgroup mtime when taskstats hasn't populated startedAt
+	// (PID-vs-TGID races, restricted netlink caps, missing CONFIG_TASKSTATS_NETLINK).
+	// Without this, every container whose first taskstats lookup failed would be
+	// permanently filtered, dropping all of its metrics — not just for ~30s.
+	started := c.startedAt
+	if started.IsZero() && c.cgroup != nil {
+		started = c.cgroup.CreatedAt()
+	}
+	if started.IsZero() {
+		return false
+	}
+	end := now
+	if !c.zombieAt.IsZero() && c.zombieAt.Before(end) {
+		end = c.zombieAt
+	}
+	return end.Sub(started) < minAge
+}
+
+func minContainerAge() time.Duration {
+	if flags.MinContainerAge == nil {
+		return 0
+	}
+	return *flags.MinContainerAge
+}
+
+// minAgeGatesLogsAndTraces reports whether --min-container-age-applies-to=all.
+func minAgeGatesLogsAndTraces() bool {
+	return flags.MinContainerAgeAppliesTo != nil && *flags.MinContainerAgeAppliesTo == "all" && minContainerAge() > 0
+}
+
+// logEmitter wraps the OTLP log emitter so that, with --min-container-age-applies-to=all,
+// lines from containers younger than --min-container-age are not exported. Once a container is
+// old enough the check is skipped without taking the container lock.
+func (c *Container) logEmitter(containerId string) logparser.OnMsgCallbackF {
+	emit := logs.OtelLogEmitter(containerId)
+	if emit == nil || !minAgeGatesLogsAndTraces() {
+		return emit
+	}
+	var mature atomic.Bool
+	return func(ts time.Time, level logparser.Level, patternHash string, msg string) {
+		if !mature.Load() {
+			c.lock.Lock()
+			young := c.youngerThanMinAge(time.Now())
+			c.lock.Unlock()
+			if young {
+				return
+			}
+			mature.Store(true)
+		}
+		emit(ts, level, patternHash, msg)
+	}
+}
+
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	c.registry.updateStatsFromEbpfMapsIfNecessary()
 
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if minAge := *flags.MinContainerAge; minAge > 0 {
-		// Fall back to cgroup mtime when taskstats hasn't populated startedAt
-		// (PID-vs-TGID races, restricted netlink caps, missing CONFIG_TASKSTATS_NETLINK).
-		// Without this, every container whose first taskstats lookup failed would be
-		// permanently filtered, dropping all of its metrics — not just for ~30s.
-		started := c.startedAt
-		if started.IsZero() {
-			started = c.cgroup.CreatedAt()
-		}
-		if !started.IsZero() {
-			end := time.Now()
-			if !c.zombieAt.IsZero() && c.zombieAt.Before(end) {
-				end = c.zombieAt
-			}
-			if end.Sub(started) < minAge {
-				return
-			}
-		}
+	if c.youngerThanMinAge(time.Now()) {
+		return
 	}
 
 	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
@@ -841,7 +886,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey.ForMetrics())
 	}
 
-	ebpfTracesDisabled := !flags.Telemetry.L7Traces
+	ebpfTracesDisabled := !flags.Telemetry.L7Traces || (minAgeGatesLogsAndTraces() && c.youngerThanMinAge(time.Now()))
 	for _, p := range c.processes {
 		if p.Flags.EbpfTracesDisabled {
 			ebpfTracesDisabled = true
@@ -1177,7 +1222,7 @@ func (c *Container) runLogParser(logPath string) {
 			return
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout)
+		parser := logparser.NewParser(ch, nil, c.logEmitter(containerId), multilineCollectorTimeout)
 		reader, err := logs.NewTailReader(proc.HostPath(logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
@@ -1196,7 +1241,7 @@ func (c *Container) runLogParser(logPath string) {
 			klog.Warningln(err)
 			return
 		}
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout)
+		parser := logparser.NewParser(ch, nil, c.logEmitter(containerId), multilineCollectorTimeout)
 		stop := func() {
 			JournaldUnsubscribe(c.cgroup)
 		}
@@ -1212,7 +1257,7 @@ func (c *Container) runLogParser(logPath string) {
 			delete(c.logParsers, "stdout/stderr")
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout)
+		parser := logparser.NewParser(ch, c.metadata.logDecoder, c.logEmitter(containerId), multilineCollectorTimeout)
 		reader, err := logs.NewTailReader(proc.HostPath(c.metadata.logPath), ch)
 		if err != nil {
 			klog.Warningln(err)

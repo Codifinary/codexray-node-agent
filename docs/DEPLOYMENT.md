@@ -110,8 +110,8 @@ consumers (port-forward targets) if you changed them.
 
 ## 5. Recommended settings for new Kubernetes installs
 
-These are the target defaults once pod-level coverage is verified (§4). They are **not**
-code defaults; upgrades keep everything on.
+`CONTAINER_RESOURCE_METRICS_ENABLED=false` is now the code default (see
+[FEATURE-FLAGS.md](FEATURE-FLAGS.md)); the other rows are recommendations, not code defaults.
 
 | Setting | Value | Why |
 |---|---|---|
