@@ -19,9 +19,14 @@ const (
 	journaldPollTimeout = 100 * time.Millisecond
 )
 
+type journaldSubscriber struct {
+	ch   chan<- logparser.LogEntry
+	done chan struct{}
+}
+
 type JournaldReader struct {
 	journal     *sdjournal.Journal
-	subscribers map[string]chan<- logparser.LogEntry
+	subscribers map[string]*journaldSubscriber
 	until       chan time.Time
 	lock        sync.Mutex
 }
@@ -29,7 +34,7 @@ type JournaldReader struct {
 func NewJournaldReader(journalPaths ...string) (*JournaldReader, error) {
 	r := &JournaldReader{
 		until:       make(chan time.Time),
-		subscribers: map[string]chan<- logparser.LogEntry{},
+		subscribers: map[string]*journaldSubscriber{},
 	}
 	var err error
 	for _, journalPath := range journalPaths {
@@ -90,12 +95,17 @@ func (r *JournaldReader) follow() {
 			Level:     logparser.LevelByPriority(e.Fields[sdjournal.SD_JOURNAL_FIELD_PRIORITY]),
 		}
 		r.lock.Lock()
-		ch, ok := r.subscribers[e.Fields[sdjournal.SD_JOURNAL_FIELD_SYSTEMD_CGROUP]]
+		sub, ok := r.subscribers[e.Fields[sdjournal.SD_JOURNAL_FIELD_SYSTEMD_CGROUP]]
 		r.lock.Unlock()
 		if !ok {
 			continue
 		}
-		ch <- le
+		// A subscriber can be removed (its parser stopped) between the lookup and the send;
+		// without the done case this goroutine, and with it every journald log, would block forever.
+		select {
+		case sub.ch <- le:
+		case <-sub.done:
+		}
 	}
 }
 
@@ -105,17 +115,19 @@ func (r *JournaldReader) Subscribe(cgroup string, ch chan<- logparser.LogEntry) 
 	if _, ok := r.subscribers[cgroup]; ok {
 		return fmt.Errorf(`duplicate subscriber for cgroup %s`, cgroup)
 	}
-	r.subscribers[cgroup] = ch
+	r.subscribers[cgroup] = &journaldSubscriber{ch: ch, done: make(chan struct{})}
 	return nil
 }
 
 func (r *JournaldReader) Unsubscribe(cgroup string) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
-	if _, ok := r.subscribers[cgroup]; !ok {
+	sub, ok := r.subscribers[cgroup]
+	if !ok {
 		klog.Warning("unknown subscriber for cgroup", cgroup)
 		return
 	}
+	close(sub.done)
 	delete(r.subscribers, cgroup)
 }
 

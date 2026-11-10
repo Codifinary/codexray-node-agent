@@ -21,6 +21,10 @@ type Message struct {
 type MultilineCollector struct {
 	Messages chan Message
 
+	// ctx is the owner's lifetime. Sends on Messages select on it so that a stopped
+	// parser never leaves a goroutine blocked (holding lock) on a channel nobody reads.
+	ctx context.Context
+
 	timeout time.Duration
 	limit   int
 
@@ -40,6 +44,7 @@ type MultilineCollector struct {
 
 func NewMultilineCollector(ctx context.Context, timeout time.Duration, limit int) *MultilineCollector {
 	m := &MultilineCollector{
+		ctx:      ctx,
 		timeout:  timeout,
 		limit:    limit,
 		Messages: make(chan Message, 1),
@@ -51,12 +56,17 @@ func NewMultilineCollector(ctx context.Context, timeout time.Duration, limit int
 func (m *MultilineCollector) dispatch(ctx context.Context) {
 	ticker := time.NewTicker(m.timeout)
 	defer ticker.Stop()
-	defer close(m.Messages)
+	// Messages is intentionally never closed: Add may run concurrently on another goroutine,
+	// and closing would turn its pending send into a "send on closed channel" panic.
+	// Consumers stop via ctx instead.
 
 	for {
 		select {
 		case <-ctx.Done():
+			m.lock.Lock()
 			m.closed = true
+			m.lines = nil
+			m.lock.Unlock()
 			return
 		case t := <-ticker.C:
 			m.lock.Lock()
@@ -75,6 +85,9 @@ func (m *MultilineCollector) Add(entry LogEntry) {
 
 	m.lock.Lock()
 	defer m.lock.Unlock()
+	if m.closed {
+		return
+	}
 
 	entry.Content = strings.TrimSuffix(entry.Content, "\n")
 	if entry.Content == "" {
@@ -170,7 +183,11 @@ func (m *MultilineCollector) flushMessage() {
 		Level:     m.level,
 	}
 	m.reset()
-	m.Messages <- msg
+	select {
+	case m.Messages <- msg:
+	case <-m.ctx.Done():
+		m.closed = true
+	}
 }
 
 func (m *MultilineCollector) reset() {

@@ -43,6 +43,7 @@ var (
 	LogBurst          = kingpin.Flag("log-burst", "The maximum number of tokens that can be consumed in a single call to allow").Default("100").Envar("LOG_BURST").Int()
 
 	MaxLabelLength = kingpin.Flag("max-label-length", "Maximum length of a metric label value").Default("4096").Envar("MAX_LABEL_LENGTH").Int()
+	LogPatternsMax = kingpin.Flag("log-patterns-max", "Maximum distinct warning/error log patterns tracked per log source; further new patterns are counted under pattern_hash=\"overflow\". 0 = unlimited").Default("512").Envar("LOG_PATTERNS_MAX").Int()
 
 	CollectorEndpoint  = kingpin.Flag("collector-endpoint", "A base endpoint URL for metrics, traces, logs, and profiles").Envar("COLLECTOR_ENDPOINT").URL()
 	ApiKey             = kingpin.Flag("api-key", "Codexray API key").Envar("API_KEY").String()

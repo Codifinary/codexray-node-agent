@@ -30,6 +30,7 @@ import (
 	"github.com/codifinary/codexray-node-agent/profiling"
 	"github.com/codifinary/codexray-node-agent/prom"
 	"github.com/codifinary/codexray-node-agent/tracing"
+	"github.com/codifinary/logparser"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sys/unix"
@@ -139,6 +140,11 @@ func main() {
 
 	machineId := machineID()
 	systemUuid := systemUUID()
+
+	logparser.DefaultOptions = logparser.Options{
+		MaxPatterns:  *flags.LogPatternsMax,
+		MaxSampleLen: *flags.MaxLabelLength, // the exported sample label is truncated to this anyway
+	}
 
 	tracing.Init(machineId, hostname, version)
 	logs.Init(machineId, hostname, version)
