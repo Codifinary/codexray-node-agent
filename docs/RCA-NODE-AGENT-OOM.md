@@ -1,9 +1,40 @@
 # Node Agent OOM kills: root cause analysis
 
-Status: **the root cause is not yet confirmed in production.** This document separates
-code-confirmed defects from hypotheses. It lists the fixes made, the evidence still
-missing, and how to obtain it. Do not treat the OOMs as fixed until the soak and canary
-criteria in [SOAK-TEST.md](SOAK-TEST.md) pass.
+Status (2026-11-10): **a primary root cause was confirmed on staging (R-0, ClickHouse L7
+parser) and fixed in code.** The fix is not yet verified in a running cluster. The other
+causes below remain valid contributors. Do not treat the OOMs as fixed until the canary
+and soak criteria in [SOAK-TEST.md](SOAK-TEST.md) pass.
+
+## 0. Staging evidence (v1.4.1, 2026-11-10)
+
+Cluster: kubeadm v1.30.14, 1 control-plane + 3 workers, flannel, node agent limit 5Gi.
+
+| Node | ClickHouse L7 series | Agent restarts (4d21h) | Last termination |
+|---|---|---|---|
+| worker 1 | 92 | 56 | OOMKilled (137) |
+| worker 2 | 30 | 68 | OOMKilled (137) |
+| worker 3 | 90 | 108 | OOMKilled (137) |
+| master | 0 | 0 | n/a |
+
+- Heap profile of the worker 1 agent (RSS 1.1 GiB at the time): **87 % of in-use heap,
+  217 MB, under `l7.ParseClickhouse` -> `ch-go proto.(*Setting).Decode` -> `Reader.Str` ->
+  `Buffer.Ensure`**, reached from `Registry.handleEvents` -> `Container.onL7Request`.
+- Series per node were 804-2,293. Cardinality is not the driver.
+
+### R-0 ClickHouse L7 parser allocates attacker/garbage-controlled lengths (confirmed; fixed)
+
+- `ebpftracer/l7/clickhouse.go` decoded eBPF-captured TCP payloads with ch-go's
+  `proto.Reader`. `Reader.StrRaw` calls `Buffer.Ensure(n)`, which allocates `n` bytes **before**
+  reading, where `n` is a uvarint taken from the packet. Any packet on a ClickHouse
+  connection that is misread as a Query (pipelined data, a mid-stream capture, a corrupted
+  payload) can declare a length up to 2^63 and trigger a single multi-GB allocation. This
+  matches sudden OOM kills from a low steady-state heap (~40 MB live on worker 3).
+- **Fixed** (commit `fix(l7): bounds-checked ClickHouse query parser`): a zero-copy decoder
+  walks the same wire format and validation, and rejects any length beyond the captured
+  bytes. Existing test vectors pass. A regression test asserts at most 1 allocation for
+  4 GiB declared lengths. A fuzz target ran 4.2M inputs clean.
+- **Verify:** canary on one worker; `node_agent_cgroup_memory_usage_bytes` stays flat, and
+  no OOMKilled for 24 h while ClickHouse L7 series keep updating.
 
 ## 1. What the incident data says
 
