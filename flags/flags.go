@@ -13,7 +13,18 @@ import (
 )
 
 var (
-	ListenAddress     = kingpin.Flag("listen", "Listen address - ip:port or :port").Default("0.0.0.0:80").Envar("LISTEN").String()
+	ListenAddress  = kingpin.Flag("listen", "Listen address - ip:port or :port").Default("0.0.0.0:80").Envar("LISTEN").String()
+	PprofListen    = kingpin.Flag("pprof-listen", "Listen address for /debug/pprof/ (separate from --listen). Loopback by default; a non-loopback address requires --pprof-auth-token. Empty disables pprof").Default("127.0.0.1:10302").Envar("PPROF_LISTEN").String()
+	PprofAuthToken = kingpin.Flag("pprof-auth-token", "Bearer token required by the pprof listener (prefer the PPROF_AUTH_TOKEN env var from a Secret)").Envar("PPROF_AUTH_TOKEN").String()
+
+	GoMemoryLimitRatio = kingpin.Flag("go-memory-limit-ratio", "Set the Go soft memory limit to this fraction of the container memory limit (e.g. 0.7). Ignored if GOMEMLIMIT is set. 0 disables").Default("0").Envar("GO_MEMORY_LIMIT_RATIO").Float64()
+
+	MemoryWatchdogThreshold      = kingpin.Flag("memory-watchdog-threshold", "Write a diagnostic bundle when the agent's cgroup memory usage reaches this size (e.g. 3GB). 0 disables").Default("0").Envar("MEMORY_WATCHDOG_THRESHOLD").Bytes()
+	MemoryWatchdogThresholdRatio = kingpin.Flag("memory-watchdog-threshold-ratio", "Write a diagnostic bundle at this fraction of the cgroup memory limit (e.g. 0.8). 0 disables").Default("0").Envar("MEMORY_WATCHDOG_THRESHOLD_RATIO").Float64()
+	MemoryWatchdogMinInterval    = kingpin.Flag("memory-watchdog-min-interval", "Minimum time between diagnostic bundles").Default("15m").Envar("MEMORY_WATCHDOG_MIN_INTERVAL").Duration()
+	MemoryWatchdogMaxDumps       = kingpin.Flag("memory-watchdog-max-dumps", "Diagnostic bundles kept on disk").Default("3").Envar("MEMORY_WATCHDOG_MAX_DUMPS").Int()
+	MemoryWatchdogDir            = kingpin.Flag("memory-watchdog-dir", "Directory for diagnostic bundles (defaults to <wal-dir>/diagnostics)").Envar("MEMORY_WATCHDOG_DIR").String()
+
 	CgroupRoot        = kingpin.Flag("cgroupfs-root", "The mount point of the host cgroupfs root").Default("/sys/fs/cgroup").Envar("CGROUPFS_ROOT").String()
 	DisableLogParsing = kingpin.Flag("disable-log-parsing", "Disable container log parsing").Default("false").Envar("DISABLE_LOG_PARSING").Bool()
 	DisablePinger     = kingpin.Flag("disable-pinger", "Don't ping upstreams").Default("false").Envar("DISABLE_PINGER").Bool()

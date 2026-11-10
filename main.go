@@ -10,7 +10,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/containers"
+	"github.com/codifinary/codexray-node-agent/diag"
 	"github.com/codifinary/codexray-node-agent/dogstatsd"
 	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/codifinary/codexray-node-agent/gpu"
@@ -32,6 +32,7 @@ import (
 	"github.com/codifinary/codexray-node-agent/tracing"
 	"github.com/codifinary/logparser"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"
@@ -120,6 +121,20 @@ func main() {
 	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
 
 	klog.Infoln("agent version:", version)
+	diag.ApplyGoMemoryLimit(*flags.GoMemoryLimitRatio)
+	watchdogDir := *flags.MemoryWatchdogDir
+	if watchdogDir == "" {
+		watchdogDir = filepath.Join(*flags.WalDir, "diagnostics")
+	}
+	watchdog := diag.NewWatchdog(diag.WatchdogConfig{
+		Dir:            watchdogDir,
+		ThresholdBytes: uint64(*flags.MemoryWatchdogThreshold),
+		ThresholdRatio: *flags.MemoryWatchdogThresholdRatio,
+		MinInterval:    *flags.MemoryWatchdogMinInterval,
+		MaxDumps:       *flags.MemoryWatchdogMaxDumps,
+	})
+	watchdog.Start()
+	defer watchdog.Stop()
 
 	hostname, kv, err := uname()
 	if err != nil {
@@ -157,6 +172,7 @@ func main() {
 		prometheus.Labels{"machine_id": machineId, "system_uuid": systemUuid},
 		registry,
 	)
+	registerRuntimeDiagnostics(registerer)
 	if err := registerer.Register(nodeCollector); err != nil {
 		klog.Exitln(err)
 	}
@@ -281,12 +297,15 @@ func main() {
 		klog.Exitln(err)
 	}
 
-	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	// A dedicated mux: the metrics listener is commonly reachable through hostPort, so it must
+	// not inherit handlers registered on http.DefaultServeMux (net/http/pprof used to be).
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	http.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if *flags.DogStatsDEnabled && (dogStatsDReceiver == nil || !dogStatsDReceiver.Ready() || dogStatsDPipeline == nil || !dogStatsDPipeline.Healthy()) {
 			http.Error(w, "dogstatsd pipeline not ready", http.StatusServiceUnavailable)
 			return
@@ -294,8 +313,12 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready\n"))
 	})
+	if err := diag.StartPprof(*flags.PprofListen, *flags.PprofAuthToken); err != nil {
+		klog.Errorln(err)
+	}
 	server := &http.Server{
 		Addr:              *flags.ListenAddress,
+		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
@@ -330,6 +353,26 @@ func main() {
 		if err := dogStatsDPipeline.Close(); err != nil {
 			klog.Warningln("DogStatsD final spool flush failed:", err)
 		}
+	}
+}
+
+// registerRuntimeDiagnostics exposes the agent's own resource usage: Go heap and runtime
+// memory classes (to separate Go heap from RSS), GC, goroutines, process RSS/FDs/CPU,
+// the agent cgroup's memory accounting, and the bounded agent health metrics in diag.
+func registerRuntimeDiagnostics(reg prometheus.Registerer) {
+	for _, c := range []prometheus.Collector{
+		collectors.NewGoCollector(collectors.WithGoCollectorRuntimeMetrics(
+			collectors.MetricsGC, collectors.MetricsMemory, collectors.MetricsScheduler,
+		)),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		diag.NewCgroupMemoryCollector(),
+	} {
+		if err := reg.Register(c); err != nil {
+			klog.Warningln("failed to register runtime collector:", err)
+		}
+	}
+	if err := diag.Register(reg); err != nil {
+		klog.Exitln(err)
 	}
 }
 
