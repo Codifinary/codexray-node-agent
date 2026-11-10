@@ -219,3 +219,6 @@ replace (
 replace github.com/prometheus/prometheus => ./internal/prom
 
 replace github.com/grafana/pyroscope/ebpf => ./internal/pyroscope-ebpf
+
+// Local fork: safe shutdown and bounded pattern table (see internal/logparser/FORK.md).
+replace github.com/codifinary/logparser => ./internal/logparser
