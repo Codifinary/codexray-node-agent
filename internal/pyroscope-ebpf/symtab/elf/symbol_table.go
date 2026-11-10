@@ -13,6 +13,11 @@ import (
 	"github.com/ulikunitz/xz"
 )
 
+// MaxMiniDebugInfoSize caps the decompressed size of a .gnu_debugdata section. 0 = unbounded.
+var MaxMiniDebugInfoSize int64 = 32 << 20
+
+var ErrMiniDebugInfoTooLarge = errors.New("mini debug info exceeds size limit")
+
 // symbols from .symtab, .dynsym
 
 type SymbolTableInterface interface {
@@ -177,10 +182,26 @@ func (f *MMapedElfFile) NewMiniDebugInfoSymbolTable(opt *SymbolsOptions) (*Symbo
 	if readErr != nil {
 		return nil, readErr
 	}
+	// Codexray: the decompressed image is retained for the lifetime of the cached symbol
+	// table, and growing an unsized bytes.Buffer doubles its backing array repeatedly
+	// (bytes.growSlice bursts). Pre-size it and refuse images above a configurable cap;
+	// symbolization then falls back to the regular tables or module+offset.
 	var uncompressed bytes.Buffer
-	_, ioErr := io.Copy(&uncompressed, reader)
+	initial := len(data) * 4
+	if MaxMiniDebugInfoSize > 0 && int64(initial) > MaxMiniDebugInfoSize {
+		initial = int(MaxMiniDebugInfoSize)
+	}
+	uncompressed.Grow(initial)
+	var src io.Reader = reader
+	if MaxMiniDebugInfoSize > 0 {
+		src = io.LimitReader(reader, MaxMiniDebugInfoSize+1)
+	}
+	n, ioErr := io.Copy(&uncompressed, src)
 	if ioErr != nil {
 		return nil, ioErr
+	}
+	if MaxMiniDebugInfoSize > 0 && n > MaxMiniDebugInfoSize {
+		return nil, ErrMiniDebugInfoTooLarge
 	}
 	miniDebugElf, miniDebugElfErr := NewInMemElfFile(bytes.NewReader(uncompressed.Bytes()))
 	if miniDebugElfErr != nil {

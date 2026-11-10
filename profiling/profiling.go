@@ -11,11 +11,13 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/containers"
+	"github.com/codifinary/codexray-node-agent/diag"
 	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/codifinary/codexray-node-agent/jvm"
 	"github.com/codifinary/codexray-node-agent/proc"
@@ -26,15 +28,17 @@ import (
 	"github.com/grafana/pyroscope/ebpf/pprof"
 	"github.com/grafana/pyroscope/ebpf/sd"
 	"github.com/grafana/pyroscope/ebpf/symtab"
+	"github.com/grafana/pyroscope/ebpf/symtab/elf"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
 	"k8s.io/klog/v2"
 )
 
 const (
-	CollectInterval = time.Minute
-	SampleRate      = 100
-	UploadTimeout   = 10 * time.Second
+	CollectInterval      = time.Minute
+	SampleRate           = 100
+	UploadTimeout        = 10 * time.Second
+	ProcessInfoQueueSize = 4096
 )
 
 var (
@@ -65,6 +69,22 @@ func Init(hostId, hostName string) chan<- containers.ProcessInfo {
 		{Name: "host.id", Value: hostId},
 	}
 
+	// Symbol tables are the largest memory owner in the profiler: every distinct binary and
+	// shared library seen in a stack has its tables loaded and cached for KeepRounds
+	// collection rounds. These limits are configurable so a node with many distinct
+	// binaries can trade symbolization hit rate for memory. Defaults match the previous
+	// hard-coded values.
+	cacheOpts := symtab.GCacheOptions{
+		Size:       *flags.ProfilingSymbolCacheSize,
+		KeepRounds: *flags.ProfilingSymbolCacheKeepRounds,
+	}
+	elf.MaxMiniDebugInfoSize = int64(*flags.ProfilingMaxMiniDebugInfoSize)
+	elf.MaxStringCacheEntries = *flags.ProfilingSymbolNameCacheEntries
+	klog.Infof("profiling symbol cache: size=%d keep_rounds=%d max_minidebuginfo=%d name_cache_entries=%d",
+		cacheOpts.Size, cacheOpts.KeepRounds, elf.MaxMiniDebugInfoSize, elf.MaxStringCacheEntries)
+
+	// pyroscope's own metrics carry a service_name label (per-workload cardinality), so they
+	// stay in a private registry; bounded equivalents are exported via the diag package.
 	reg := prometheus.NewRegistry()
 	so := ebpfspy.SessionOptions{
 		CollectUser:               true,
@@ -73,18 +93,9 @@ func Init(hostId, hostName string) chan<- containers.ProcessInfo {
 		UnknownSymbolAddress:      false,
 		PythonEnabled:             true,
 		CacheOptions: symtab.CacheOptions{
-			PidCacheOptions: symtab.GCacheOptions{
-				Size:       256,
-				KeepRounds: 8,
-			},
-			BuildIDCacheOptions: symtab.GCacheOptions{
-				Size:       256,
-				KeepRounds: 8,
-			},
-			SameFileCacheOptions: symtab.GCacheOptions{
-				Size:       256,
-				KeepRounds: 8,
-			},
+			PidCacheOptions:      cacheOpts,
+			BuildIDCacheOptions:  cacheOpts,
+			SameFileCacheOptions: cacheOpts,
 		},
 		SymbolOptions: symtab.SymbolOptions{
 			GoTableFallback:    true,
@@ -101,18 +112,23 @@ func Init(hostId, hostName string) chan<- containers.ProcessInfo {
 	session, err = ebpfspy.NewSession(log.NewNopLogger(), targetFinder, so)
 	if err != nil {
 		klog.Errorln(err)
+		diag.ProfilingErrors.WithLabelValues("session_init").Inc()
 		session = nil
 		return nil
 	}
 	err = session.Start()
 	if err != nil {
 		klog.Errorln(err)
+		diag.ProfilingErrors.WithLabelValues("session_start").Inc()
 		session = nil
 		return nil
 	}
+	diag.ProfilingSessionActive.Set(1)
 	go collect()
 
-	processInfoCh := make(chan containers.ProcessInfo)
+	// Buffered: the registry hands processes over without blocking its event loop
+	// (it drops and counts when the buffer is full, see containers.Registry).
+	processInfoCh := make(chan containers.ProcessInfo, ProcessInfoQueueSize)
 	targetFinder.start(processInfoCh)
 	return processInfoCh
 }
@@ -121,13 +137,14 @@ func Start() {
 	if session == nil {
 		return
 	}
-	targetFinder.now = time.Now().UnixNano()
+	targetFinder.setNow(time.Now().UnixNano())
 	session.UpdateTargets(sd.TargetsOptions{})
 }
 
 func Stop() {
 	if session != nil {
 		session.Stop()
+		diag.ProfilingSessionActive.Set(0)
 	}
 }
 
@@ -139,16 +156,26 @@ func collect() {
 		bs := pprof.NewProfileBuilders(pprof.BuildersOptions{SampleRate: SampleRate, PerPIDProfile: false})
 		if err := pprof.Collect(bs, session); err != nil {
 			klog.Errorln(err)
+			diag.ProfilingErrors.WithLabelValues("collect").Inc()
 		}
-		klog.Infof("collected %d profiles in %s", len(bs.Builders), time.Since(t).Truncate(time.Millisecond))
+		collectDuration := time.Since(t)
+		diag.ProfilingCollectDuration.Observe(collectDuration.Seconds())
+		klog.Infof("collected %d profiles in %s", len(bs.Builders), collectDuration.Truncate(time.Millisecond))
 		t = time.Now()
 		var uploaded int
 		for _, b := range bs.Builders {
 			if err := upload(b); err != nil {
 				klog.Errorln(err)
+				diag.ProfilingErrors.WithLabelValues("upload").Inc()
+				diag.ExportFailures.WithLabelValues("profiles").Inc()
+				// The collector is likely unavailable; skip the rest of this round rather than
+				// retrying (profiles are not spooled), but account for what was discarded.
+				diag.ProfilingProfiles.WithLabelValues("failed").Inc()
+				diag.ProfilingProfiles.WithLabelValues("skipped").Add(float64(len(bs.Builders) - uploaded - 1))
 				break
 			}
 			uploaded++
+			diag.ProfilingProfiles.WithLabelValues("uploaded").Inc()
 		}
 		klog.Infof("uploaded %d profiles in %s", uploaded, time.Since(t).Truncate(time.Millisecond))
 	}
@@ -209,68 +236,131 @@ type TargetFinder struct {
 	now       int64
 }
 
+func (tf *TargetFinder) setNow(now int64) {
+	tf.lock.Lock()
+	tf.now = now
+	tf.lock.Unlock()
+}
+
 func (tf *TargetFinder) start(processInfoCh <-chan containers.ProcessInfo) {
 	go func() {
 		for pi := range processInfoCh {
-			tf.lock.Lock()
-			cid := string(pi.ContainerId)
-			tf.processes[pi.Pid] = &processInfo{
-				startedAt: pi.StartedAt.UnixNano(),
-				target: sd.NewTargetForTesting(cid, 0, sd.DiscoveryTarget{
-					"service_name": common.ContainerIdToOtelServiceName(cid),
-				}),
-				flags: pi.Flags,
-			}
-			tf.lock.Unlock()
+			tf.add(pi)
 		}
 	}()
 }
 
+func (tf *TargetFinder) add(pi containers.ProcessInfo) {
+	cid := string(pi.ContainerId)
+	info := &processInfo{
+		startedAt: pi.StartedAt.UnixNano(),
+		target: sd.NewTargetForTesting(cid, 0, sd.DiscoveryTarget{
+			"service_name": common.ContainerIdToOtelServiceName(cid),
+		}),
+		flags: pi.Flags,
+	}
+	tf.lock.Lock()
+	tf.processes[pi.Pid] = info
+	n := len(tf.processes)
+	tf.lock.Unlock()
+	diag.ProfilingTargets.Set(float64(n))
+}
+
+// FindTarget is called by the profiling session for PIDs seen in samples. Slow work (reading
+// the cmdline, triggering a JVM perf-map dump through the attach API) runs without holding
+// tf.lock, so it never stalls the registry's process handoff or other lookups.
 func (tf *TargetFinder) FindTarget(pid uint32) *sd.Target {
 	tf.lock.Lock()
-	defer tf.lock.Unlock()
 	pi := tf.processes[pid]
-	if pi == nil {
+	if pi == nil || tf.now-pi.startedAt < int64(CollectInterval) {
+		tf.lock.Unlock()
 		return nil
 	}
-	if tf.now-pi.startedAt < int64(CollectInterval) {
+	needsInit := !pi.initialized
+	pi.initialized = true
+	pflags := pi.flags
+	tf.lock.Unlock()
+
+	if pflags.EbpfProfilingDisabled {
 		return nil
 	}
-	var err error
-	if !pi.initialized {
-		pi.initialized = true
-		if !pi.flags.EbpfProfilingDisabled {
-			cmdline := proc.GetCmdline(pid)
-			if proc.IsJvm(cmdline) {
-				pi.jvmPerfmapDumpSupported = jvm.IsPerfmapDumpSupported(cmdline)
-				klog.Infof("JVM detected PID: %d, perfmap dump supported: %t", pid, pi.jvmPerfmapDumpSupported)
-			}
+	if needsInit {
+		cmdline := proc.GetCmdline(pid)
+		if proc.IsJvm(cmdline) {
+			supported := jvm.IsPerfmapDumpSupported(cmdline)
+			klog.Infof("JVM detected PID: %d, perfmap dump supported: %t", pid, supported)
+			tf.lock.Lock()
+			pi.jvmPerfmapDumpSupported = supported
+			tf.lock.Unlock()
 		}
 	}
-	if pi.flags.EbpfProfilingDisabled {
-		return nil
-	}
-	if pi.jvmPerfmapDumpSupported && pi.lastPerfmapDump != tf.now {
+
+	tf.lock.Lock()
+	dump := pi.jvmPerfmapDumpSupported && pi.lastPerfmapDump != tf.now
+	if dump {
 		pi.lastPerfmapDump = tf.now
-		if err = jvm.DumpPerfmap(pid); err != nil {
+	}
+	target := pi.target
+	tf.lock.Unlock()
+
+	if dump {
+		if err := jvm.DumpPerfmap(pid); err != nil {
 			klog.Warningln(err)
+			diag.ProfilingErrors.WithLabelValues("jvm_perfmap").Inc()
 		}
 	}
-	return pi.target
+	return target
 }
 
 func (tf *TargetFinder) RemoveDeadPID(pid uint32) {
 	tf.lock.Lock()
-	defer tf.lock.Unlock()
 	delete(tf.processes, pid)
+	n := len(tf.processes)
+	tf.lock.Unlock()
+	diag.ProfilingTargets.Set(float64(n))
 }
 
 func (tf *TargetFinder) DebugInfo() []map[string]string {
 	return nil
 }
 
+// Update is called by the session once per collection round.
 func (tf *TargetFinder) Update(_ sd.TargetsOptions) {
-	tf.now = time.Now().UnixNano()
+	tf.setNow(time.Now().UnixNano())
+	tf.reconcile(pidExists)
+}
+
+// reconcile removes processes that no longer exist. The session only reports a PID as dead
+// through a perf-buffer event that is dropped when its queue is full, and processes handed
+// over after their exit event was processed were never removed at all, so without this the
+// map grew with process churn (exec probes, cron jobs, short-lived tools).
+func (tf *TargetFinder) reconcile(exists func(pid uint32) bool) {
+	tf.lock.Lock()
+	pids := make([]uint32, 0, len(tf.processes))
+	for pid := range tf.processes {
+		pids = append(pids, pid)
+	}
+	tf.lock.Unlock()
+
+	var dead []uint32
+	for _, pid := range pids {
+		if !exists(pid) {
+			dead = append(dead, pid)
+		}
+	}
+
+	tf.lock.Lock()
+	for _, pid := range dead {
+		delete(tf.processes, pid)
+	}
+	n := len(tf.processes)
+	tf.lock.Unlock()
+	diag.ProfilingTargets.Set(float64(n))
+}
+
+func pidExists(pid uint32) bool {
+	_, err := os.Stat(proc.Path(pid))
+	return err == nil || !os.IsNotExist(err)
 }
 
 type processInfo struct {

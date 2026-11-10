@@ -54,6 +54,11 @@ var (
 	ProfilesEndpoint   = kingpin.Flag("profiles-endpoint", "The URL of the endpoint to send profiles to").Envar("PROFILES_ENDPOINT").URL()
 	InsecureSkipVerify = kingpin.Flag("insecure-skip-verify", "whether to skip verifying the certificate or not").Envar("INSECURE_SKIP_VERIFY").Default("false").Bool()
 
+	ProfilingSymbolCacheSize        = kingpin.Flag("profiling-symbol-cache-size", "Entries in each eBPF profiler symbol cache (per-PID, build-ID and same-file caches)").Default("256").Envar("PROFILING_SYMBOL_CACHE_SIZE").Int()
+	ProfilingSymbolCacheKeepRounds  = kingpin.Flag("profiling-symbol-cache-keep-rounds", "Collection rounds (1 round = 1m) an unused symbol table is kept in cache").Default("8").Envar("PROFILING_SYMBOL_CACHE_KEEP_ROUNDS").Int()
+	ProfilingMaxMiniDebugInfoSize   = kingpin.Flag("profiling-max-minidebuginfo-size", "Maximum decompressed size of an ELF .gnu_debugdata section loaded for symbolization; larger ones are skipped. 0 = unlimited").Default("32MB").Envar("PROFILING_MAX_MINIDEBUGINFO_SIZE").Bytes()
+	ProfilingSymbolNameCacheEntries = kingpin.Flag("profiling-symbol-name-cache-entries", "Maximum cached symbol names per loaded ELF file. 0 = unlimited").Default("16384").Envar("PROFILING_SYMBOL_NAME_CACHE_ENTRIES").Int()
+
 	ScrapeInterval = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("15s").Envar("SCRAPE_INTERVAL").Duration()
 	WalDir         = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/Codexray-node-agent").Envar("WAL_DIR").String()
 	MaxSpoolSize   = kingpin.Flag("max-spool-size", "Maximum size of the on-disk spool used to buffer data when it cannot be sent to collector. Supports size suffixes like KB, MB, or GB.").Default("500MB").Envar("MAX_SPOOL_SIZE").Bytes()

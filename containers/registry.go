@@ -261,7 +261,13 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					p := c.onProcessStart(e.Pid)
 					if r.processInfoCh != nil && p != nil {
-						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}
+						// Never block the event loop on the profiler: a stalled handoff used to
+						// back up every eBPF event (and, through Collect, every scrape).
+						select {
+						case r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}:
+						default:
+							diag.DroppedTotal.WithLabelValues("profiling", "process_handoff_queue_full").Inc()
+						}
 					}
 				}
 			case ebpftracer.EventTypeProcessExit:
