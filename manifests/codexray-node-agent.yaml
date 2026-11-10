@@ -48,6 +48,9 @@ rules:
   - apiGroups: ["discovery.k8s.io"]
     resources: [endpointslices]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["apiextensions.k8s.io"]  # KSM custom-resource discovery (lists CRDs at startup)
+    resources: [customresourcedefinitions]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["metrics.k8s.io"]
     resources: [nodes, pods]
     verbs: ["get", "list"]
