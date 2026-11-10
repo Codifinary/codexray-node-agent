@@ -154,6 +154,7 @@ type Collector struct {
 	hostname         string
 	kernelVersion    string
 	instanceMetadata *metadata.CloudMetadata
+	fs               *fsCollector
 }
 
 func NewCollector(hostname, kernelVersion string) *Collector {
@@ -181,6 +182,7 @@ func NewCollector(hostname, kernelVersion string) *Collector {
 		hostname:         hostname,
 		kernelVersion:    kernelVersion,
 		instanceMetadata: md,
+		fs:               newFSCollector(),
 	}
 }
 
@@ -196,6 +198,15 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		klog.Errorln(err)
 	} else {
 		ch <- gauge(uptimeDesc, v)
+	}
+
+	if la, err := loadAverage(procRoot); err == nil {
+		ch <- gauge(loadDesc, la[0], "1m")
+		ch <- gauge(loadDesc, la[1], "5m")
+		ch <- gauge(loadDesc, la[2], "15m")
+	}
+	if c.fs != nil {
+		c.fs.collect(ch)
 	}
 
 	cpu, err := cpuStat(procRoot)
@@ -288,6 +299,10 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- netTxPacketsDesc
 	ch <- netIfaceUpDesc
 	ch <- ipDesc
+	ch <- loadDesc
+	for _, d := range []*prometheus.Desc{fsSizeDesc, fsAvailDesc, fsFreeDesc, fsFilesDesc, fsFilesFreeDesc, fsReadonlyDesc} {
+		ch <- d
+	}
 }
 
 func counter(desc *prometheus.Desc, value float64, labelValues ...string) prometheus.Metric {

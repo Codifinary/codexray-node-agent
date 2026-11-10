@@ -25,6 +25,10 @@ var (
 	MemoryWatchdogMaxDumps       = kingpin.Flag("memory-watchdog-max-dumps", "Diagnostic bundles kept on disk").Default("3").Envar("MEMORY_WATCHDOG_MAX_DUMPS").Int()
 	MemoryWatchdogDir            = kingpin.Flag("memory-watchdog-dir", "Directory for diagnostic bundles (defaults to <wal-dir>/diagnostics)").Envar("MEMORY_WATCHDOG_DIR").String()
 
+	NodeFSExcludeTypes       = kingpin.Flag("node-fs-exclude-types", "Regex of filesystem types excluded from node_filesystem_* (default excludes virtual/pseudo/overlay/tmpfs)").Envar("NODE_FS_EXCLUDE_TYPES").String()
+	NodeFSExcludeMountPoints = kingpin.Flag("node-fs-exclude-mount-points", "Regex of mount points excluded from node_filesystem_* (default excludes /dev, /proc, /sys, /run, runtime and pod volume mounts)").Envar("NODE_FS_EXCLUDE_MOUNT_POINTS").String()
+	NodeFSMaxMounts          = kingpin.Flag("node-fs-max-mounts", "Maximum filesystems reported per node (cardinality cap)").Default("64").Envar("NODE_FS_MAX_MOUNTS").Int()
+
 	CgroupRoot        = kingpin.Flag("cgroupfs-root", "The mount point of the host cgroupfs root").Default("/sys/fs/cgroup").Envar("CGROUPFS_ROOT").String()
 	DisableLogParsing = kingpin.Flag("disable-log-parsing", "Disable container log parsing").Default("false").Envar("DISABLE_LOG_PARSING").Bool()
 	DisablePinger     = kingpin.Flag("disable-pinger", "Don't ping upstreams").Default("false").Envar("DISABLE_PINGER").Bool()
