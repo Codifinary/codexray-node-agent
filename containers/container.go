@@ -145,6 +145,9 @@ type Container struct {
 
 	l7Stats  L7Stats
 	dnsStats *L7Metrics
+	// dnsDomains holds the domain label values seen by this container, for DNS_MAX_DOMAINS_PER_CONTAINER.
+	dnsDomains        map[string]struct{}
+	dnsOverflowLogged bool
 
 	gpuStats map[string]*GpuUsage
 
@@ -198,6 +201,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
 		l7Stats:                  L7Stats{},
 		dnsStats:                 &L7Metrics{},
+		dnsDomains:               map[string]struct{}{},
 
 		gpuStats: map[string]*GpuUsage{},
 
@@ -398,7 +402,7 @@ func (c *Container) collectNonResourceMetrics(ch chan<- prometheus.Metric) {
 		if !conn.Closed.IsZero() {
 			continue
 		}
-		connections[conn.DestinationKey]++
+		connections[conn.DestinationKey.ForMetrics()]++
 	}
 	for d, count := range connections {
 		ch <- gauge(metrics.NetConnectionsActive, float64(count), d.DestinationLabelValue(), d.ActualDestinationLabelValue())
@@ -678,10 +682,10 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	if failed {
 		c.failedConnectionAttempts[key.Destination()]++
 	} else {
-		stats := c.connectionStats[key]
+		stats := c.connectionStats[key.ForMetrics()]
 		if stats == nil {
 			stats = &ConnectionStats{}
-			c.connectionStats[key] = stats
+			c.connectionStats[key.ForMetrics()] = stats
 		}
 		stats.Count++
 		stats.TotalTime += duration
@@ -734,10 +738,11 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 	if ac == nil {
 		return
 	}
-	stats := c.connectionStats[ac.DestinationKey]
+	mk := ac.DestinationKey.ForMetrics()
+	stats := c.connectionStats[mk]
 	if stats == nil {
 		stats = &ConnectionStats{}
-		c.connectionStats[ac.DestinationKey] = stats
+		c.connectionStats[mk] = stats
 	}
 	if sent > ac.BytesSent {
 		stats.BytesSent += sent - ac.BytesSent
@@ -774,13 +779,13 @@ func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]*common.Domai
 			[]string{"request_type", "domain", "status"},
 		)
 	}
-	if m, _ := c.dnsStats.Requests.GetMetricWithLabelValues(t, fqdn, status); m != nil {
+	if m, _ := c.dnsStats.Requests.GetMetricWithLabelValues(t, c.dnsDomainLabel(fqdn), status); m != nil {
 		m.Inc()
 	}
 	if r.Duration != 0 {
 		if c.dnsStats.Latency == nil {
 			dnsLatency := L7Latency[l7.ProtocolDNS]
-			c.dnsStats.Latency = prometheus.NewHistogram(prometheus.HistogramOpts{Name: dnsLatency.Name, Help: dnsLatency.Help})
+			c.dnsStats.Latency = prometheus.NewHistogram(prometheus.HistogramOpts{Name: dnsLatency.Name, Help: dnsLatency.Help, Buckets: common.L7LatencyBuckets})
 		}
 		c.dnsStats.Latency.Observe(r.Duration.Seconds())
 	}
@@ -792,6 +797,28 @@ func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]*common.Domai
 		}
 	}
 	return ip2fqdn
+}
+
+// dnsDomainLabel returns fqdn, or DNSOverflowDomain once the container has used up its
+// DNS_MAX_DOMAINS_PER_CONTAINER distinct domains. Domains already seen keep their own series.
+// Must be called with c.lock held.
+func (c *Container) dnsDomainLabel(fqdn string) string {
+	if c.dnsDomains == nil {
+		c.dnsDomains = map[string]struct{}{}
+	}
+	if _, ok := c.dnsDomains[fqdn]; ok {
+		return fqdn
+	}
+	max := common.DNSMaxDomainsPerContainer
+	if max > 0 && len(c.dnsDomains) >= max {
+		if !c.dnsOverflowLogged {
+			c.dnsOverflowLogged = true
+			klog.Warningf("container %s: more than %d distinct DNS domains, counting new ones as domain=%q", c.id, max, common.DNSOverflowDomain)
+		}
+		return common.DNSOverflowDomain
+	}
+	c.dnsDomains[fqdn] = struct{}{}
+	return fqdn
 }
 
 func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) map[netaddr.IP]*common.Domain {
@@ -811,7 +838,7 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	}
 	var stats *L7Metrics // nil-safe: observe is a no-op when L7 metrics are disabled
 	if flags.Telemetry.L7Metrics {
-		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey)
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey.ForMetrics())
 	}
 
 	ebpfTracesDisabled := !flags.Telemetry.L7Traces
@@ -904,10 +931,11 @@ func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) boo
 	if !ok {
 		return false
 	}
-	stats := c.connectionStats[conn.DestinationKey]
+	mk := conn.DestinationKey.ForMetrics()
+	stats := c.connectionStats[mk]
 	if stats == nil {
 		stats = &ConnectionStats{}
-		c.connectionStats[conn.DestinationKey] = stats
+		c.connectionStats[mk] = stats
 	}
 	stats.Retransmissions++
 	return true
@@ -1094,6 +1122,13 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 	ips := map[netaddr.IP]struct{}{}
 	for d := range c.connectionStats {
 		if ip := d.ActualDestination().IP(); !ip.IsZero() {
+			ips[ip] = struct{}{}
+		}
+	}
+	// With L7_ACTUAL_DESTINATION=drop the stats keys carry no actual destination,
+	// so take the upstream IPs from the live connections instead.
+	for _, conn := range c.activeConnections {
+		if ip := conn.DestinationKey.ActualDestination().IP(); !ip.IsZero() {
 			ips[ip] = struct{}{}
 		}
 	}

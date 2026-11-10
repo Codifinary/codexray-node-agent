@@ -64,6 +64,22 @@ func init() {
 	if HttpFilter, err = newHttpFilter(*flags.ExcludeHTTPMetricsByPath); err != nil {
 		klog.Exitf("invalid HTTP filter: %s", err)
 	}
+	if v := flags.L7ActualDestination; v != nil && *v == "drop" {
+		DropActualDestination = true
+		klog.Infoln("l7-actual-destination: drop (network and L7 metrics aggregated by destination)")
+	}
+	if v := flags.L7LatencyBuckets; v != nil && *v != "" {
+		if L7LatencyBuckets, err = ParseLatencyBuckets(*v); err != nil {
+			klog.Exitf("invalid l7-latency-buckets: %s", err)
+		}
+		klog.Infoln("l7-latency-buckets:", L7LatencyBuckets)
+	}
+	if v := flags.DNSMaxDomainsPerContainer; v != nil {
+		if *v < 0 {
+			klog.Exitf("invalid dns-max-domains-per-container: %d", *v)
+		}
+		DNSMaxDomainsPerContainer = *v
+	}
 }
 
 func IsIpPrivate(ip netaddr.IP) bool {

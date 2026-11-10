@@ -58,7 +58,12 @@ var (
 	LogBurst          = kingpin.Flag("log-burst", "The maximum number of tokens that can be consumed in a single call to allow").Default("100").Envar("LOG_BURST").Int()
 
 	MaxLabelLength = kingpin.Flag("max-label-length", "Maximum length of a metric label value").Default("4096").Envar("MAX_LABEL_LENGTH").Int()
-	LogPatternsMax = kingpin.Flag("log-patterns-max", "Maximum distinct warning/error log patterns tracked per log source; further new patterns are counted under pattern_hash=\"overflow\". 0 = unlimited").Default("512").Envar("LOG_PATTERNS_MAX").Int()
+
+	// Cardinality controls. Defaults keep the existing output; see docs/cardinality.md.
+	L7ActualDestination       = kingpin.Flag("l7-actual-destination", "keep: label network/L7 metrics with both destination and actual_destination (default). drop: aggregate by destination only, which removes per-backend-pod series behind a Service").Default("keep").Envar("L7_ACTUAL_DESTINATION").Enum("keep", "drop")
+	L7LatencyBuckets          = kingpin.Flag("l7-latency-buckets", "Comma-separated upper bounds in seconds for L7 and DNS latency histograms, e.g. 0.01,0.05,0.1,0.5,1,5. Empty keeps the Prometheus default buckets (11 bounds)").Envar("L7_LATENCY_BUCKETS").String()
+	DNSMaxDomainsPerContainer = kingpin.Flag("dns-max-domains-per-container", "Maximum distinct DNS domains tracked per container; further domains are counted under domain=\"overflow\". 0 disables the cap").Default("500").Envar("DNS_MAX_DOMAINS_PER_CONTAINER").Int()
+	LogPatternsMax            = kingpin.Flag("log-patterns-max", "Maximum distinct warning/error log patterns tracked per log source; further new patterns are counted under pattern_hash=\"overflow\". 0 = unlimited").Default("512").Envar("LOG_PATTERNS_MAX").Int()
 
 	CollectorEndpoint  = kingpin.Flag("collector-endpoint", "A base endpoint URL for metrics, traces, logs, and profiles").Envar("COLLECTOR_ENDPOINT").URL()
 	ApiKey             = kingpin.Flag("api-key", "Codexray API key").Envar("API_KEY").String()
