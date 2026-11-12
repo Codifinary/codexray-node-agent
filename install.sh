@@ -16,7 +16,12 @@ SYSTEMD_SERVICE=${SYSTEM_NAME}.service
 UNINSTALL_SH=${BIN_DIR}/${SYSTEM_NAME}-uninstall.sh
 FILE_SERVICE=${SYSTEMD_DIR}/${SYSTEMD_SERVICE}
 FILE_ENV=${SYSTEMD_DIR}/${SYSTEMD_SERVICE}.env
-ENV_VARS="^(LISTEN|CGROUPFS_ROOT|DISABLE_LOG_PARSING|DISABLE_PINGER|DISABLE_L7_TRACING|TRACK_PUBLIC_NETWORK|EPHEMERAL_PORT_RANGE|PROVIDER|REGION|AVAILABILITY_ZONE|INSTANCE_TYPE|INSTANCE_LIFE_CYCLE|LOG_PER_SECOND|LOG_BURST|COLLECTOR_ENDPOINT|API_KEY|METRICS_ENDPOINT|TRACES_ENDPOINT|LOGS_ENDPOINT|PROFILES_ENDPOINT|SCRAPE_INTERVAL|WAL_DIR)"
+STATE_DIR=/var/lib/codexray-node-agent
+BINARY=
+MEMORY_MAX=${MEMORY_MAX:-2G}
+# Agent settings copied from the installer's environment into ${FILE_ENV}. Matched as
+# prefixes of NAME=value, so e.g. STATSD_ covers every STATSD_* setting.
+ENV_VARS="^(LISTEN|CGROUPFS_ROOT|DISABLE_LOG_PARSING|DISABLE_PINGER|DISABLE_L7_TRACING|TRACK_PUBLIC_NETWORK|EPHEMERAL_PORT_RANGE|PROVIDER|REGION|AVAILABILITY_ZONE|INSTANCE_TYPE|INSTANCE_LIFE_CYCLE|LOG_PER_SECOND|LOG_BURST|COLLECTOR_ENDPOINT|API_KEY|METRICS_ENDPOINT|TRACES_ENDPOINT|LOGS_ENDPOINT|PROFILES_ENDPOINT|SCRAPE_INTERVAL|WAL_DIR|INSECURE_SKIP_VERIFY|NODE_METRICS_ENABLED|CONTAINER_|EBPF_L7_|PROFILING_|TRACES_|GO_MEMORY_LIMIT_RATIO|GOMEMLIMIT|MEMORY_WATCHDOG_|PPROF_|STATSD_|NODE_FS_|DNS_MAX_DOMAINS_PER_CONTAINER|EXCLUDE_HTTP_REQUESTS_BY_PATH|INSTRUMENTATION_DELAY|LOG_PATTERNS_MAX|MAX_LABEL_LENGTH|MAX_SPOOL_SIZE|MIN_CONTAINER_AGE)"
 
 info()
 {
@@ -35,6 +40,12 @@ show_help() {
     echo "Options:"
     echo "  -h, --help                        Show this help message and exit"
     echo "  -v v1.22.2, --version v1.22.2     Specify the version to install (default: latest)"
+    echo "  -b PATH, --binary PATH            Install this local binary instead of downloading a release"
+    echo "  -m 2G, --memory-max 2G            systemd MemoryMax for the agent (default: 2G; 'infinity' for no cap)"
+    echo ""
+    echo "Agent settings (COLLECTOR_ENDPOINT, API_KEY, EBPF_L7_TRACES_ENABLED, ...) are read from the"
+    echo "environment, e.g.: sudo COLLECTOR_ENDPOINT=http://host:8182/ingest API_KEY=... sh install.sh"
+    echo "On upgrade, settings already in ${FILE_ENV} are kept unless set again."
 }
 
 verify_system() {
@@ -140,6 +151,14 @@ setup_binary() {
 }
 
 download() {
+    if [ -n "$BINARY" ]; then
+        [ -f "$BINARY" ] || fatal "Binary not found: $BINARY"
+        setup_tmp
+        cp "$BINARY" ${TMP_BIN}
+        info "Using local binary $BINARY"
+        setup_binary
+        return
+    fi
     verify_arch
     verify_downloader curl || verify_downloader wget || fatal 'Can not find curl or wget for downloading files'
     setup_tmp
@@ -178,14 +197,28 @@ EOF
 systemd_disable() {
     $SUDO systemctl disable ${SYSTEM_NAME} >/dev/null 2>&1 || true
     $SUDO rm -f ${FILE_SERVICE} || true
-    $SUDO rm -f ${FILE_ENV} || true
 }
 
+# Writes ${FILE_ENV}: settings exported to this script replace the same names in the
+# existing file; everything else in the existing file is kept, so an upgrade does not
+# drop the API key or endpoint. The file is root-only (0600) because it holds API_KEY.
 create_env_file() {
-    info "env: Creating environment file ${FILE_ENV}"
-    $SUDO touch ${FILE_ENV}
+    info "env: Updating environment file ${FILE_ENV}"
+    NEW_ENV=$(sh -c export | while read x v; do echo "$v"; done | grep -E "${ENV_VARS}" || true)
+    OLD_ENV=$($SUDO cat ${FILE_ENV} 2>/dev/null || true)
+    {
+        echo "$OLD_ENV" | while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            name=${line%%=*}
+            echo "$NEW_ENV" | grep -q "^${name}=" || echo "$line"
+        done
+        [ -z "$NEW_ENV" ] || echo "$NEW_ENV"
+    } | $SUDO sh -c "umask 077; cat > ${FILE_ENV}.tmp && mv -f ${FILE_ENV}.tmp ${FILE_ENV}"
     $SUDO chmod 0600 ${FILE_ENV}
-    sh -c export | while read x v; do echo $v; done | grep -E ${ENV_VARS} | $SUDO tee ${FILE_ENV} >/dev/null
+    if $SUDO grep -qE '^(DISABLE_L7_TRACING|DISABLE_LOG_PARSING)=' ${FILE_ENV}; then
+        info "env: DISABLE_L7_TRACING/DISABLE_LOG_PARSING no longer have an effect: L7 traces and"
+        info "     log parsing are off by default. Set EBPF_L7_TRACES_ENABLED / CONTAINER_LOG_PARSING_ENABLED instead."
+    fi
 }
 
 create_systemd_service_file() {
@@ -216,6 +249,17 @@ TasksMax=infinity
 TimeoutStartSec=0
 Restart=always
 RestartSec=5s
+# Memory cap. The agent sizes its Go soft limit and diagnostic watchdog from this
+# cgroup limit; without a cap neither takes effect. Override with --memory-max.
+MemoryMax=${MEMORY_MAX}
+MemorySwapMax=0
+# Defaults; the EnvironmentFile entries above take precedence.
+Environment=LISTEN=0.0.0.0:10300
+Environment=WAL_DIR=${STATE_DIR}
+Environment=GO_MEMORY_LIMIT_RATIO=0.7
+Environment=MEMORY_WATCHDOG_THRESHOLD_RATIO=0.8
+Environment=PPROF_LISTEN=127.0.0.1:10302
+StateDirectory=codexray-node-agent
 ExecStart=${BIN_DIR}/codexray-node-agent
 EOF
 }
@@ -262,6 +306,14 @@ while [ $# -gt 0 ]; do
             ;;
         -v|--version)
             VERSION="$2"
+            shift 2
+            ;;
+        -b|--binary)
+            BINARY="$2"
+            shift 2
+            ;;
+        -m|--memory-max)
+            MEMORY_MAX="$2"
             shift 2
             ;;
         *)

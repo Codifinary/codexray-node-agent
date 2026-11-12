@@ -11,6 +11,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   error span and every span longer than `TRACES_SLOW_THRESHOLD` (default `500ms`) and samples the
   rest at `TRACES_SAMPLING`. Decisions are counted in
   `node_agent_traces_sampling_decisions_total{decision,reason}`.
+- **systemd installer (`install.sh`)**:
+  - `--binary PATH` installs a local binary.
+  - `--memory-max` sets the service's `MemoryMax`, default `2G`, with `MemorySwapMax=0`.
+  - The unit sets these defaults: `GO_MEMORY_LIMIT_RATIO=0.7` and `MEMORY_WATCHDOG_THRESHOLD_RATIO=0.8`, so the OOM safeguards work outside Kubernetes; `LISTEN=0.0.0.0:10300` (was `:80`); `PPROF_LISTEN=127.0.0.1:10302`; `WAL_DIR=/var/lib/codexray-node-agent` (was `/tmp`).
+  - All current settings are passed through, including the switches, trace sampling, memory, StatsD and pprof settings.
+  - Re-running the installer keeps the existing env file and only replaces the settings passed again. It used to delete the file, which dropped the API key and endpoint on upgrade.
+  - Under a 400M cap with L7, traces and logs on, the agent is OOM-killed at startup: it peaks at about 513 MiB, about 232 MiB of that kernel memory, mostly eBPF maps. Use at least 1G when L7 is on.
 
 ### Changed (breaking default)
 - **Only node metrics are on by default.** `EBPF_L7_METRICS_ENABLED`, `EBPF_L7_TRACES_ENABLED`,
