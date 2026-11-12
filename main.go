@@ -9,6 +9,8 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"flag"
+	"io"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -116,8 +118,7 @@ func whitelistNodeExternalNetworks() {
 }
 
 func main() {
-	klog.LogToStderr(false)
-	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
+	configureLogging(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
 
 	klog.Infoln("agent version:", version)
 
@@ -350,6 +351,20 @@ type logger struct{}
 
 func (l logger) Println(v ...interface{}) {
 	klog.Errorln(v...)
+}
+
+// configureLogging sends every klog message to w once: by default klog repeats a message
+// for each lower severity and also copies errors straight to stderr, which w already writes to.
+func configureLogging(w io.Writer) {
+	klogFlags := flag.NewFlagSet("klog", flag.ContinueOnError)
+	klog.InitFlags(klogFlags)
+	for name, value := range map[string]string{"one_output": "true", "stderrthreshold": "FATAL"} {
+		if err := klogFlags.Set(name, value); err != nil {
+			klog.Warningf("failed to set klog flag %s: %v", name, err)
+		}
+	}
+	klog.LogToStderr(false)
+	klog.SetOutput(w)
 }
 
 type RateLimitedLogOutput struct {
