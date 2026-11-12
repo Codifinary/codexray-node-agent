@@ -14,53 +14,56 @@ func ob(v bool) *OptionalBool { return &OptionalBool{set: true, value: v} }
 
 func TestResolveTelemetryDefaultsAndLegacy(t *testing.T) {
 	unset := func() *OptionalBool { return &OptionalBool{} }
-	base := TelemetryInputs{NodeMetrics: true, ContainerResourceMetrics: true, Profiling: true,
+	// Kingpin defaults: node metrics on, container resource metrics and profiling off.
+	base := TelemetryInputs{NodeMetrics: true,
 		L7Metrics: unset(), L7Traces: unset(), LogCollection: unset(), LogParsing: unset()}
 
-	// Upgrade with no new settings: everything stays on.
+	// No settings: node metrics only.
 	got := ResolveTelemetry(base)
-	require.Equal(t, TelemetryConfig{true, true, true, true, true, true, true}, got)
-
-	// Legacy DISABLE_L7_TRACING keeps meaning "no L7 at all".
-	in := base
-	in.LegacyDisableL7Tracing = true
-	got = ResolveTelemetry(in)
-	require.False(t, got.L7Metrics)
-	require.False(t, got.L7Traces)
+	require.Equal(t, TelemetryConfig{NodeMetrics: true}, got)
 	require.False(t, got.L7Probes())
+	require.False(t, got.LogPipeline())
 
-	// ...unless the new, finer setting is explicit: metrics without traces.
+	// Legacy DISABLE_* settings change nothing on top of the off defaults.
+	in := base
+	in.LegacyDisableL7Tracing, in.LegacyDisableLogParsing = true, true
+	require.Equal(t, TelemetryConfig{NodeMetrics: true}, ResolveTelemetry(in))
+
+	// An explicit new setting wins over the legacy one: metrics without traces.
 	in.L7Metrics = ob(true)
 	got = ResolveTelemetry(in)
 	require.True(t, got.L7Metrics)
 	require.False(t, got.L7Traces)
-	require.True(t, got.L7Probes(), "L7 eBPF programs stay loaded for metrics")
+	require.True(t, got.L7Probes(), "L7 eBPF programs load for metrics")
 
-	// Legacy DISABLE_LOG_PARSING keeps meaning "no log pipeline".
+	// Each feature turns on independently.
 	in = base
-	in.LegacyDisableLogParsing = true
+	in.L7Traces = ob(true)
 	got = ResolveTelemetry(in)
-	require.False(t, got.LogPipeline())
-
-	// Collection without parsing, and parsing without collection.
+	require.False(t, got.L7Metrics)
+	require.True(t, got.L7Traces)
 	in = base
-	in.LogParsing = ob(false)
-	got = ResolveTelemetry(in)
-	require.True(t, got.LogCollection)
-	require.False(t, got.LogParsing)
-	require.True(t, got.LogPipeline())
-	in = base
-	in.LogCollection = ob(false)
+	in.LogParsing = ob(true)
 	got = ResolveTelemetry(in)
 	require.False(t, got.LogCollection)
 	require.True(t, got.LogParsing)
-
-	// Traces off does not affect L7 metrics.
+	require.True(t, got.LogPipeline())
 	in = base
-	in.L7Traces = ob(false)
+	in.LogCollection = ob(true)
 	got = ResolveTelemetry(in)
-	require.True(t, got.L7Metrics)
-	require.False(t, got.L7Traces)
+	require.True(t, got.LogCollection)
+	require.False(t, got.LogParsing)
+}
+
+func TestTelemetryFlagDefaults(t *testing.T) {
+	for name, want := range map[string]string{
+		"node-metrics-enabled": "true", "container-resource-metrics-enabled": "false", "profiling-enabled": "false",
+	} {
+		f := kingpin.CommandLine.GetFlag(name)
+		require.NotNil(t, f, name)
+		require.Equal(t, []string{want}, f.Model().Default, name)
+	}
+	require.Equal(t, TelemetryConfig{NodeMetrics: true}, Telemetry)
 }
 
 // Exhaustive: every combination of the boolean features resolves independently.

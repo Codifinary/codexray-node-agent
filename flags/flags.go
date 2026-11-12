@@ -67,14 +67,17 @@ var (
 	DNSMaxDomainsPerContainer = kingpin.Flag("dns-max-domains-per-container", "Maximum distinct DNS domains tracked per container; further domains are counted under domain=\"overflow\". 0 disables the cap").Default("500").Envar("DNS_MAX_DOMAINS_PER_CONTAINER").Int()
 	LogPatternsMax            = kingpin.Flag("log-patterns-max", "Maximum distinct warning/error log patterns tracked per log source; further new patterns are counted under pattern_hash=\"overflow\". 0 = unlimited").Default("512").Envar("LOG_PATTERNS_MAX").Int()
 
-	CollectorEndpoint  = kingpin.Flag("collector-endpoint", "A base endpoint URL for metrics, traces, logs, and profiles").Envar("COLLECTOR_ENDPOINT").URL()
-	ApiKey             = kingpin.Flag("api-key", "Codexray API key").Envar("API_KEY").String()
-	MetricsEndpoint    = kingpin.Flag("metrics-endpoint", "The URL of the endpoint to send metrics to").Envar("METRICS_ENDPOINT").URL()
-	TracesEndpoint     = kingpin.Flag("traces-endpoint", "The URL of the endpoint to send traces to").Envar("TRACES_ENDPOINT").URL()
-	TracesSampling     = kingpin.Flag("traces-sampling", "Trace sampling rate (0.0 to 1.0)").Default("1.0").Envar("TRACES_SAMPLING").Float64()
-	LogsEndpoint       = kingpin.Flag("logs-endpoint", "The URL of the endpoint to send logs to").Envar("LOGS_ENDPOINT").URL()
-	ProfilesEndpoint   = kingpin.Flag("profiles-endpoint", "The URL of the endpoint to send profiles to").Envar("PROFILES_ENDPOINT").URL()
-	InsecureSkipVerify = kingpin.Flag("insecure-skip-verify", "whether to skip verifying the certificate or not").Envar("INSECURE_SKIP_VERIFY").Default("false").Bool()
+	CollectorEndpoint = kingpin.Flag("collector-endpoint", "A base endpoint URL for metrics, traces, logs, and profiles").Envar("COLLECTOR_ENDPOINT").URL()
+	ApiKey            = kingpin.Flag("api-key", "Codexray API key").Envar("API_KEY").String()
+	MetricsEndpoint   = kingpin.Flag("metrics-endpoint", "The URL of the endpoint to send metrics to").Envar("METRICS_ENDPOINT").URL()
+	TracesEndpoint    = kingpin.Flag("traces-endpoint", "The URL of the endpoint to send traces to").Envar("TRACES_ENDPOINT").URL()
+	TracesSampling    = kingpin.Flag("traces-sampling", "Trace sampling rate (0.0 to 1.0). With adaptive sampling, the rate for spans that are neither errors nor slow").Default("1.0").Envar("TRACES_SAMPLING").Float64()
+
+	TracesAdaptiveSampling = kingpin.Flag("traces-adaptive-sampling-enabled", "Adaptive trace sampling: keep every error span and every span slower than --traces-slow-threshold, and sample the rest at --traces-sampling").Default("false").Envar("TRACES_ADAPTIVE_SAMPLING_ENABLED").Bool()
+	TracesSlowThreshold    = kingpin.Flag("traces-slow-threshold", "With adaptive sampling, spans longer than this are always kept").Default("500ms").Envar("TRACES_SLOW_THRESHOLD").Duration()
+	LogsEndpoint           = kingpin.Flag("logs-endpoint", "The URL of the endpoint to send logs to").Envar("LOGS_ENDPOINT").URL()
+	ProfilesEndpoint       = kingpin.Flag("profiles-endpoint", "The URL of the endpoint to send profiles to").Envar("PROFILES_ENDPOINT").URL()
+	InsecureSkipVerify     = kingpin.Flag("insecure-skip-verify", "whether to skip verifying the certificate or not").Envar("INSECURE_SKIP_VERIFY").Default("false").Bool()
 
 	ProfilingSymbolCacheSize        = kingpin.Flag("profiling-symbol-cache-size", "Entries in each eBPF profiler symbol cache (per-PID, build-ID and same-file caches)").Default("256").Envar("PROFILING_SYMBOL_CACHE_SIZE").Int()
 	ProfilingSymbolCacheKeepRounds  = kingpin.Flag("profiling-symbol-cache-keep-rounds", "Collection rounds (1 round = 1m) an unused symbol table is kept in cache").Default("8").Envar("PROFILING_SYMBOL_CACHE_KEEP_ROUNDS").Int()
@@ -83,7 +86,7 @@ var (
 	ProfilingJvmPerfmapInterval     = kingpin.Flag("profiling-jvm-perfmap-dump-interval", "How often to ask each JVM to rewrite its perf map (Compiler.perfmap). Each dump makes the JVM write, and the agent re-parse, the whole map").Default("1m").Envar("PROFILING_JVM_PERFMAP_DUMP_INTERVAL").Duration()
 	ProfilingSymbolNameCacheEntries = kingpin.Flag("profiling-symbol-name-cache-entries", "Maximum cached symbol names per loaded ELF file. 0 = unlimited").Default("16384").Envar("PROFILING_SYMBOL_NAME_CACHE_ENTRIES").Int()
 
-	ScrapeInterval = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("15s").Envar("SCRAPE_INTERVAL").Duration()
+	ScrapeInterval = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("20s").Envar("SCRAPE_INTERVAL").Duration()
 	WalDir         = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/Codexray-node-agent").Envar("WAL_DIR").String()
 	MaxSpoolSize   = kingpin.Flag("max-spool-size", "Maximum size of the on-disk spool used to buffer data when it cannot be sent to collector. Supports size suffixes like KB, MB, or GB.").Default("500MB").Envar("MAX_SPOOL_SIZE").Bytes()
 

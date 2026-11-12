@@ -35,7 +35,7 @@ var (
 	commonResourceAttrs []attribute.KeyValue
 	agentVersion        string
 	initialized         bool
-	samplingRate        float64
+	traceSampler        = sampler{rate: 1.0, rnd: rand.Float64}
 )
 
 func Init(machineId, hostname, version string) {
@@ -45,14 +45,7 @@ func Init(machineId, hostname, version string) {
 		return
 	}
 
-	samplingRate = *flags.TracesSampling
-	if samplingRate < 0.0 || samplingRate > 1.0 {
-		klog.Warningf("invalid traces-sampling value %f, must be between 0.0 and 1.0, using default 1.0", samplingRate)
-		samplingRate = 1.0
-	}
-	if samplingRate < 1.0 {
-		klog.Infof("trace sampling rate set to %f", samplingRate)
-	}
+	traceSampler = newSampler(*flags.TracesSampling, *flags.TracesAdaptiveSampling, *flags.TracesSlowThreshold)
 	klog.Infoln("OpenTelemetry traces collector endpoint:", endpointUrl.String())
 	path := endpointUrl.Path
 	if path == "" {
@@ -84,15 +77,47 @@ type Tracer struct {
 	otel trace.Tracer
 }
 
-func shouldSample() bool {
-	if samplingRate >= 1.0 {
-		return true
-	}
-	if samplingRate <= 0.0 {
-		return false
-	}
+// sampler decides which L7 spans are exported. Without adaptive sampling every span is kept with
+// probability rate. With it, error spans and spans slower than slow are always kept, and only the
+// rest are sampled at rate, so the traces worth looking at survive a low rate.
+type sampler struct {
+	rate     float64
+	adaptive bool
+	slow     time.Duration
+	rnd      func() float64
+}
 
-	return rand.Float64() < samplingRate
+func newSampler(rate float64, adaptive bool, slow time.Duration) sampler {
+	if rate < 0.0 || rate > 1.0 {
+		klog.Warningf("invalid traces-sampling value %f, must be between 0.0 and 1.0, using default 1.0", rate)
+		rate = 1.0
+	}
+	if slow <= 0 {
+		klog.Warningf("invalid traces-slow-threshold %s, must be positive, using 500ms", slow)
+		slow = 500 * time.Millisecond
+	}
+	if adaptive {
+		klog.Infof("adaptive trace sampling: keeping all error spans and spans slower than %s, sampling the rest at %g", slow, rate)
+	} else if rate < 1.0 {
+		klog.Infof("trace sampling rate set to %g", rate)
+	}
+	return sampler{rate: rate, adaptive: adaptive, slow: slow, rnd: rand.Float64}
+}
+
+// decide returns whether to keep a span and why ("error", "slow", "rate" or "sampled_out").
+func (s sampler) decide(duration time.Duration, isError bool) (bool, string) {
+	if s.adaptive {
+		if isError {
+			return true, "error"
+		}
+		if duration > s.slow {
+			return true, "slow"
+		}
+	}
+	if s.rate >= 1.0 || (s.rate > 0.0 && s.rnd() < s.rate) {
+		return true, "rate"
+	}
+	return false, "sampled_out"
 }
 
 func GetContainerTracer(containerId string) *Tracer {
@@ -132,9 +157,12 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, attr
 	}
 	end := time.Now()
 
-	if !shouldSample() {
+	keep, reason := traceSampler.decide(duration, error)
+	if !keep {
+		diag.TracesSampled.WithLabelValues("dropped", reason).Inc()
 		return
 	}
+	diag.TracesSampled.WithLabelValues("kept", reason).Inc()
 
 	start := end.Add(-duration)
 	_, span := t.tracer.otel.Start(nil, name, trace.WithTimestamp(start), trace.WithSpanKind(trace.SpanKindClient))

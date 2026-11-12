@@ -94,6 +94,12 @@ var (
 		Help: "1 if a telemetry feature is enabled by configuration",
 	}, []string{"feature"})
 
+	// Trace sampling decisions (reason: error, slow, rate; dropped spans use reason sampled_out).
+	TracesSampled = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "traces_sampling_decisions_total",
+		Help: "L7 spans kept or dropped by trace sampling, by decision and reason",
+	}, []string{"decision", "reason"})
+
 	// Memory watchdog
 	WatchdogDumps = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "memory_watchdog_dumps_total",
@@ -118,7 +124,7 @@ func Register(reg prometheus.Registerer) error {
 		ContainersActive, ProcessesActive, UprobesActive, UprobesLeakedOnClose, LogParsersActive,
 		EventQueueLength, EventQueueCapacity, PerfLostSamples, DroppedTotal, ExportFailures,
 		ProfilingCollectDuration, ProfilingProfiles, ProfilingErrors, ProfilingTargets, ProfilingSessionActive,
-		FeatureEnabled, WatchdogDumps,
+		FeatureEnabled, WatchdogDumps, TracesSampled,
 	} {
 		if err := reg.Register(c); err != nil {
 			return err

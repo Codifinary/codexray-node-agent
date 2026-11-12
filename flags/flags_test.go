@@ -112,3 +112,9 @@ func TestContainerResourceMetricsDefaultOff(t *testing.T) {
 	assert.Equal(t, []string{"false"}, f.Model().Default)
 	assert.False(t, Telemetry.ContainerResourceMetrics)
 }
+
+func TestScrapeIntervalDefault(t *testing.T) {
+	f := kingpin.CommandLine.GetFlag("scrape-interval")
+	assert.NotNil(t, f)
+	assert.Equal(t, []string{"20s"}, f.Model().Default)
+}

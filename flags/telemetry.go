@@ -61,16 +61,16 @@ var (
 		"Export container-level CPU, memory, throttling, pressure, disk I/O and GPU usage series. Off by default since this release: pod-level CPU/memory comes from the cluster agent. Container discovery, process attribution, network, L7, logs, traces and profiling are not affected").
 		Default("false").Envar("CONTAINER_RESOURCE_METRICS_ENABLED").Bool()
 	EbpfL7MetricsEnabled = optionalBool("ebpf-l7-metrics-enabled",
-		"Export eBPF L7 RED metrics (container_<protocol>_requests_total/_duration). Default: true unless --disable-l7-tracing", "EBPF_L7_METRICS_ENABLED")
+		"Export eBPF L7 RED metrics (container_<protocol>_requests_total/_duration). Default: false", "EBPF_L7_METRICS_ENABLED")
 	EbpfL7TracesEnabled = optionalBool("ebpf-l7-traces-enabled",
-		"Export eBPF L7 spans (sampled with --traces-sampling). Default: true unless --disable-l7-tracing", "EBPF_L7_TRACES_ENABLED")
+		"Export eBPF L7 spans (sampled with --traces-sampling, or adaptively with --traces-adaptive-sampling-enabled). Default: false", "EBPF_L7_TRACES_ENABLED")
 	ContainerLogCollectionEnabled = optionalBool("container-log-collection-enabled",
-		"Tail container/journald logs and export them via OTLP. Default: true unless --disable-log-parsing", "CONTAINER_LOG_COLLECTION_ENABLED")
+		"Tail container/journald logs and export them via OTLP. Default: false", "CONTAINER_LOG_COLLECTION_ENABLED")
 	ContainerLogParsingEnabled = optionalBool("container-log-parsing-enabled",
-		"Extract log patterns and export container_log_messages_total. Default: true unless --disable-log-parsing", "CONTAINER_LOG_PARSING_ENABLED")
+		"Extract log patterns and export container_log_messages_total. Default: false", "CONTAINER_LOG_PARSING_ENABLED")
 	ProfilingEnabled = kingpin.Flag("profiling-enabled",
-		"Run the eBPF CPU profiler (requires a profiles endpoint). Disabling it does not affect L7 tracing or dependency detection").
-		Default("true").Envar("PROFILING_ENABLED").Bool()
+		"Run the eBPF CPU profiler (requires a profiles endpoint). Default: false. Disabling it does not affect L7 tracing or dependency detection").
+		Default("false").Envar("PROFILING_ENABLED").Bool()
 )
 
 // TelemetryConfig is the resolved, effective set of telemetry features.
@@ -97,24 +97,24 @@ type TelemetryInputs struct {
 	LegacyDisableL7Tracing, LegacyDisableLogParsing  bool
 }
 
+// ResolveTelemetry applies the defaults: only node metrics are on unless a setting turns a feature
+// on. The legacy --disable-l7-tracing / --disable-log-parsing can only turn features off, which is
+// now the default anyway; an explicit new setting still wins over them.
 func ResolveTelemetry(in TelemetryInputs) TelemetryConfig {
 	return TelemetryConfig{
 		NodeMetrics:              in.NodeMetrics,
 		ContainerResourceMetrics: in.ContainerResourceMetrics,
-		L7Metrics:                in.L7Metrics.Or(!in.LegacyDisableL7Tracing),
-		L7Traces:                 in.L7Traces.Or(!in.LegacyDisableL7Tracing),
-		LogCollection:            in.LogCollection.Or(!in.LegacyDisableLogParsing),
-		LogParsing:               in.LogParsing.Or(!in.LegacyDisableLogParsing),
+		L7Metrics:                in.L7Metrics.Or(false),
+		L7Traces:                 in.L7Traces.Or(false),
+		LogCollection:            in.LogCollection.Or(false),
+		LogParsing:               in.LogParsing.Or(false),
 		Profiling:                in.Profiling,
 	}
 }
 
 // Telemetry is resolved after flag parsing. Before that (and in tests) it matches the defaults:
-// everything enabled except container resource metrics.
-var Telemetry = TelemetryConfig{
-	NodeMetrics: true, ContainerResourceMetrics: false, L7Metrics: true, L7Traces: true,
-	LogCollection: true, LogParsing: true, Profiling: true,
-}
+// node metrics only.
+var Telemetry = TelemetryConfig{NodeMetrics: true}
 
 func resolveTelemetryFromFlags() {
 	Telemetry = ResolveTelemetry(TelemetryInputs{

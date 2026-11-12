@@ -6,7 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- **Adaptive trace sampling** (`TRACES_ADAPTIVE_SAMPLING_ENABLED`, default `false`): keeps every
+  error span and every span longer than `TRACES_SLOW_THRESHOLD` (default `500ms`) and samples the
+  rest at `TRACES_SAMPLING`. Decisions are counted in
+  `node_agent_traces_sampling_decisions_total{decision,reason}`.
+
 ### Changed (breaking default)
+- **Only node metrics are on by default.** `EBPF_L7_METRICS_ENABLED`, `EBPF_L7_TRACES_ENABLED`,
+  `CONTAINER_LOG_COLLECTION_ENABLED`, `CONTAINER_LOG_PARSING_ENABLED` and `PROFILING_ENABLED` now
+  default to `false`, like `CONTAINER_RESOURCE_METRICS_ENABLED`. Set each to `true` to keep it.
+  The legacy `DISABLE_L7_TRACING` / `DISABLE_LOG_PARSING` no longer change anything on top of
+  these defaults. TCP connection metrics (service map, network connectivity) are unaffected.
+- **`SCRAPE_INTERVAL` now defaults to `20s`** (was `15s`): the agent gathers and sends its metrics
+  every 20 s. Set `SCRAPE_INTERVAL=15s` to keep the old rate.
 - **`CONTAINER_RESOURCE_METRICS_ENABLED` now defaults to `false`.** Pod CPU/memory comes from
   the cluster agent. Set it to `true` to keep `container_resources_*`; the CodeXray UI node
   disk panels currently depend on them.
