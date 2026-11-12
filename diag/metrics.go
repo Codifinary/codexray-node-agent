@@ -100,6 +100,14 @@ var (
 		Help: "L7 spans kept or dropped by trace sampling, by decision and reason",
 	}, []string{"decision", "reason"})
 
+	// L7 events that could not be matched to a tracked connection, by result:
+	// matched_replaced = matched to a connection whose pid/fd had already been reused,
+	// unmatched = dropped.
+	L7EventsMatched = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "l7_events_connection_match_total",
+		Help: "L7 events by how they were matched to a connection (current, matched_replaced, unmatched)",
+	}, []string{"result"})
+
 	// Memory watchdog
 	WatchdogDumps = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "memory_watchdog_dumps_total",
@@ -124,7 +132,7 @@ func Register(reg prometheus.Registerer) error {
 		ContainersActive, ProcessesActive, UprobesActive, UprobesLeakedOnClose, LogParsersActive,
 		EventQueueLength, EventQueueCapacity, PerfLostSamples, DroppedTotal, ExportFailures,
 		ProfilingCollectDuration, ProfilingProfiles, ProfilingErrors, ProfilingTargets, ProfilingSessionActive,
-		FeatureEnabled, WatchdogDumps, TracesSampled,
+		FeatureEnabled, WatchdogDumps, TracesSampled, L7EventsMatched,
 	} {
 		if err := reg.Register(c); err != nil {
 			return err

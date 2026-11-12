@@ -315,6 +315,9 @@ func newHttpFilter(patterns []string) (*httpFilter, error) {
 }
 
 func (f *httpFilter) ShouldBeSkipped(path string) bool {
+	if f == nil {
+		return false
+	}
 	for _, g := range f.globs {
 		if g.Match(path) {
 			return true

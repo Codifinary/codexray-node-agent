@@ -19,6 +19,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Re-running the installer keeps the existing env file and only replaces the settings passed again. It used to delete the file, which dropped the API key and endpoint on upgrade.
   - Under a 400M cap with L7, traces and logs on, the agent is OOM-killed at startup: it peaks at about 513 MiB, about 232 MiB of that kernel memory, mostly eBPF maps. Use at least 1G when L7 is on.
 
+### Fixed
+- **Missing L7 requests and spans on short-lived connections.** Clients that open a new connection per request (Python urllib/requests without a session, curl, many scripts) lost most successful requests: about 5% of 2xx responses were recorded, against 95% of errors. Connection events and L7 events are read from different perf buffers. An L7 event could therefore be processed after the next connection had reused the same pid/fd, which failed the timestamp check, or before its own connection's open event.
+  - Replaced connections are now indexed by pid/fd/timestamp.
+  - Events that arrive early are held for up to 5 s (at most 1000 per container) and replayed when the connection opens.
+  - Measured on a host with HTTP/1.0 traffic, one connection per request: 2xx capture went from about 5% to about 95% over a 3-minute window, and the remaining gap is within the load generator's 10 s count granularity. Slow-span capture now equals error capture, and 0 events were left unmatched.
+  - New metric: `node_agent_l7_events_connection_match_total{result="current|matched_replaced|matched_deferred|unmatched"}`.
+
 ### Changed (breaking default)
 - **Only node metrics are on by default.** `EBPF_L7_METRICS_ENABLED`, `EBPF_L7_TRACES_ENABLED`,
   `CONTAINER_LOG_COLLECTION_ENABLED`, `CONTAINER_LOG_PARSING_ENABLED` and `PROFILING_ENABLED` now

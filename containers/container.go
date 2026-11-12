@@ -113,6 +113,24 @@ type PidFd struct {
 	Fd  uint64
 }
 
+const (
+	pendingL7TTL             = 5 * time.Second
+	maxPendingL7PerContainer = 1000
+)
+
+type pendingL7Events struct {
+	added    time.Time
+	requests []*l7.RequestData
+}
+
+// pidFdTs identifies one connection: the same pid/fd pair is reused by every new
+// connection a process opens after closing the previous one.
+type pidFdTs struct {
+	Pid uint32
+	Fd  uint64
+	Ts  uint64
+}
+
 type ConnectionStats struct {
 	Count           uint64
 	TotalTime       time.Duration
@@ -143,6 +161,17 @@ type Container struct {
 	lastConnectionAttempts   map[common.HostPort]time.Time
 	activeConnections        map[ConnectionKey]*ActiveConnection
 	connectionsByPidFd       map[PidFd]*ActiveConnection
+	// replacedConnections holds connections whose pid/fd has been taken over by a newer
+	// connection. L7 events are read from a separate perf buffer than connection events
+	// and can arrive after the next connection on the same fd has been opened; without
+	// this index such events (typical for clients that open one connection per request)
+	// failed the timestamp check and were dropped.
+	replacedConnections map[pidFdTs]*ActiveConnection
+	// pendingL7 holds L7 events that arrived before their connection's open event.
+	pendingL7      map[pidFdTs]*pendingL7Events
+	pendingL7Count int
+	// pendingL7Expired is when expirePendingL7 last ran.
+	pendingL7Expired time.Time
 
 	l7Stats  L7Stats
 	dnsStats *L7Metrics
@@ -200,6 +229,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		lastConnectionAttempts:   map[common.HostPort]time.Time{},
 		activeConnections:        map[ConnectionKey]*ActiveConnection{},
 		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
+		replacedConnections:      map[pidFdTs]*ActiveConnection{},
 		l7Stats:                  L7Stats{},
 		dnsStats:                 &L7Metrics{},
 		dnsDomains:               map[string]struct{}{},
@@ -744,21 +774,38 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 		k := PidFd{Pid: pid, Fd: fd}
 		prev := c.connectionsByPidFd[k]
 		if prev != nil {
-			prev.Closed = time.Now()
+			if prev.Closed.IsZero() {
+				prev.Closed = time.Now()
+			}
+			if prev.Timestamp != 0 && prev.Timestamp != timestamp {
+				c.replacedConnections[pidFdTs{Pid: pid, Fd: fd, Ts: prev.Timestamp}] = prev
+			}
 		}
 		c.connectionsByPidFd[k] = connection
+		c.replayPendingL7(pidFdTs{Pid: pid, Fd: fd, Ts: timestamp}, connection)
 	}
 	c.lastConnectionAttempts[key.Destination()] = time.Now()
 }
 
+// lookupConnection returns the connection identified by pid, fd and the kernel connection
+// timestamp: the current connection on pid/fd if its timestamp matches (or timestamp is 0),
+// otherwise a connection that was replaced on that pid/fd. c.lock must be held.
+func (c *Container) lookupConnection(pid uint32, fd uint64, timestamp uint64) *ActiveConnection {
+	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
+	if conn != nil && (timestamp == 0 || conn.Timestamp == timestamp) {
+		return conn
+	}
+	if timestamp == 0 {
+		return nil
+	}
+	return c.replacedConnections[pidFdTs{Pid: pid, Fd: fd, Ts: timestamp}]
+}
+
 func (c *Container) onConnectionClose(e ebpftracer.Event) {
 	c.lock.Lock()
-	conn := c.connectionsByPidFd[PidFd{Pid: e.Pid, Fd: e.Fd}]
+	conn := c.lookupConnection(e.Pid, e.Fd, e.Timestamp)
 	c.lock.Unlock()
 	if conn != nil {
-		if conn.Timestamp != 0 && conn.Timestamp != e.Timestamp {
-			return
-		}
 		if conn.Closed.IsZero() {
 			if e.TrafficStats != nil {
 				c.lock.Lock()
@@ -874,13 +921,73 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		return c.onDNSRequest(r)
 	}
 
-	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
+	conn := c.lookupConnection(pid, fd, timestamp)
 	if conn == nil {
+		c.deferL7(pidFdTs{Pid: pid, Fd: fd, Ts: timestamp}, r)
 		return nil
 	}
-	if timestamp != 0 && conn.Timestamp != timestamp {
-		return nil
+	if timestamp != 0 && conn != c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}] {
+		diag.L7EventsMatched.WithLabelValues("matched_replaced").Inc()
+	} else {
+		diag.L7EventsMatched.WithLabelValues("current").Inc()
 	}
+	c.observeL7(conn, r)
+	return nil
+}
+
+// deferL7 keeps an L7 event whose connection is not known yet. Connection events and L7
+// events are read from different perf buffers (10 ms vs 100 ms read deadline), so for a
+// short-lived connection the L7 event can be processed before the connection's open
+// event. The event is replayed by onConnectionOpen, or dropped after pendingL7TTL.
+// c.lock must be held.
+func (c *Container) deferL7(k pidFdTs, r *l7.RequestData) {
+	if now := time.Now(); now.Sub(c.pendingL7Expired) > time.Second {
+		c.pendingL7Expired = now
+		c.expirePendingL7(now)
+	}
+	if k.Ts == 0 || c.pendingL7Count >= maxPendingL7PerContainer {
+		diag.L7EventsMatched.WithLabelValues("unmatched").Inc()
+		return
+	}
+	if c.pendingL7 == nil {
+		c.pendingL7 = map[pidFdTs]*pendingL7Events{}
+	}
+	p := c.pendingL7[k]
+	if p == nil {
+		p = &pendingL7Events{added: time.Now()}
+		c.pendingL7[k] = p
+	}
+	p.requests = append(p.requests, r)
+	c.pendingL7Count++
+}
+
+// replayPendingL7 processes L7 events that arrived before conn's open event. c.lock must be held.
+func (c *Container) replayPendingL7(k pidFdTs, conn *ActiveConnection) {
+	p := c.pendingL7[k]
+	if p == nil {
+		return
+	}
+	delete(c.pendingL7, k)
+	c.pendingL7Count -= len(p.requests)
+	for _, r := range p.requests {
+		diag.L7EventsMatched.WithLabelValues("matched_deferred").Inc()
+		c.observeL7(conn, r)
+	}
+}
+
+// expirePendingL7 drops deferred L7 events whose connection never showed up. c.lock must be held.
+func (c *Container) expirePendingL7(now time.Time) {
+	for k, p := range c.pendingL7 {
+		if now.Sub(p.added) > pendingL7TTL {
+			delete(c.pendingL7, k)
+			c.pendingL7Count -= len(p.requests)
+			diag.L7EventsMatched.WithLabelValues("unmatched").Add(float64(len(p.requests)))
+		}
+	}
+}
+
+// observeL7 records metrics and traces for an L7 event on conn. c.lock must be held.
+func (c *Container) observeL7(conn *ActiveConnection, r *l7.RequestData) {
 	var stats *L7Metrics // nil-safe: observe is a no-op when L7 metrics are disabled
 	if flags.Telemetry.L7Metrics {
 		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey.ForMetrics())
@@ -966,7 +1073,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	case l7.ProtocolFoundationDB:
 		stats.observe(r.Status.String(), "", r.Duration)
 	}
-	return nil
 }
 
 func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) bool {
@@ -1313,6 +1419,12 @@ func (c *Container) gc(now time.Time) {
 			if conn == c.connectionsByPidFd[pidFd] {
 				delete(c.connectionsByPidFd, pidFd)
 			}
+		}
+	}
+	c.expirePendingL7(now)
+	for k, conn := range c.replacedConnections {
+		if now.Sub(conn.Closed) > gcInterval {
+			delete(c.replacedConnections, k)
 		}
 	}
 	for dst, at := range c.lastConnectionAttempts {
