@@ -9,6 +9,8 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"flag"
+	"io"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -38,7 +40,8 @@ import (
 )
 
 var (
-	version = flags.Version
+	version   = flags.Version
+	startedAt = time.Now()
 )
 
 func uname() (string, string, error) {
@@ -115,8 +118,7 @@ func whitelistNodeExternalNetworks() {
 }
 
 func main() {
-	klog.LogToStderr(false)
-	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
+	configureLogging(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
 
 	klog.Infoln("agent version:", version)
 
@@ -163,6 +165,7 @@ func main() {
 		klog.Exitln(err)
 	}
 	registerer.MustRegister(info("node_agent_info", version))
+	registerer.MustRegister(uptime("node_agent_uptime_seconds", startedAt))
 
 	if md := nodeCollector.Metadata(); md != nil {
 		region := md.Region
@@ -336,10 +339,32 @@ func info(name, version string) prometheus.Collector {
 	return g
 }
 
+// uptime reports elapsed seconds rather than a start timestamp: the backend
+// stores float32, which rounds unix seconds to 128-second steps.
+func uptime(name string, since time.Time) prometheus.Collector {
+	return prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: name}, func() float64 {
+		return time.Since(since).Seconds()
+	})
+}
+
 type logger struct{}
 
 func (l logger) Println(v ...interface{}) {
 	klog.Errorln(v...)
+}
+
+// configureLogging sends every klog message to w once: by default klog repeats a message
+// for each lower severity and also copies errors straight to stderr, which w already writes to.
+func configureLogging(w io.Writer) {
+	klogFlags := flag.NewFlagSet("klog", flag.ContinueOnError)
+	klog.InitFlags(klogFlags)
+	for name, value := range map[string]string{"one_output": "true", "stderrthreshold": "FATAL"} {
+		if err := klogFlags.Set(name, value); err != nil {
+			klog.Warningf("failed to set klog flag %s: %v", name, err)
+		}
+	}
+	klog.LogToStderr(false)
+	klog.SetOutput(w)
 }
 
 type RateLimitedLogOutput struct {
