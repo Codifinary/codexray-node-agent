@@ -122,3 +122,26 @@ func TestPendingL7Cap(t *testing.T) {
 	}
 	require.Equal(t, maxPendingL7PerContainer, c.pendingL7Count)
 }
+
+// L7 events of a connection the agent deliberately does not track (here: unknown process)
+// are counted as ignored, not deferred, both when they arrive after and before the open event.
+func TestL7EventOnIgnoredConnection(t *testing.T) {
+	c := connTestContainer()
+	src := netaddr.MustParseIPPort("10.0.0.1:40001")
+	dst := netaddr.MustParseIPPort("10.0.0.2:8080")
+	req := &l7.RequestData{Protocol: l7.ProtocolHTTP, Status: 200}
+
+	c.onConnectionOpen(99, 3, src, dst, dst, 7000, false, time.Millisecond) // pid 99 is not tracked
+	c.onL7Request(99, 3, 7000, req)
+	require.Zero(t, c.pendingL7Count)
+
+	c.onL7Request(99, 4, 8000, req) // before its open event: deferred ...
+	require.Equal(t, 1, c.pendingL7Count)
+	c.onConnectionOpen(99, 4, src, dst, dst, 8000, false, time.Millisecond)
+	require.Zero(t, c.pendingL7Count) // ... and dropped as ignored once the open event arrives
+	require.Empty(t, c.l7Stats)
+
+	c.onConnectionClose(ebpftracer.Event{Pid: 99, Fd: 3, Timestamp: 7000})
+	c.expireIgnoredConnections(time.Now().Add(ignoredConnectionTTL + time.Second))
+	require.Empty(t, c.ignoredConnections) // closed and expired, and pid 99 has no process
+}

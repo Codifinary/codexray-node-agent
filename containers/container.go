@@ -118,6 +118,15 @@ const (
 	maxPendingL7PerContainer = 1000
 )
 
+const (
+	ignoredConnectionTTL        = 30 * time.Second // kept after close for late L7 events
+	maxIgnoredConnsPerContainer = 100000
+)
+
+type ignoredConnection struct {
+	closed time.Time
+}
+
 type pendingL7Events struct {
 	added    time.Time
 	requests []*l7.RequestData
@@ -172,6 +181,10 @@ type Container struct {
 	pendingL7Count int
 	// pendingL7Expired is when expirePendingL7 last ran.
 	pendingL7Expired time.Time
+	// ignoredConnections holds connections deliberately not tracked (port/IP filters,
+	// loopback inside a pod network namespace, unknown process), so that their L7 events
+	// are counted as ignored instead of being deferred and then reported as unmatched.
+	ignoredConnections map[pidFdTs]*ignoredConnection
 
 	l7Stats  L7Stats
 	dnsStats *L7Metrics
@@ -595,6 +608,11 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 		return nil
 	}
 	c.zombieAt = time.Time{}
+	// Already registered on demand by a connection event that was processed before this
+	// process-start event (see ensureProcess): same incarnation, nothing to do.
+	if old := c.processes[pid]; old != nil && old.StartedAt.Equal(stats.BeginTime) {
+		return nil
+	}
 	p := NewProcess(pid, stats, c.registry.tracer)
 
 	if p == nil {
@@ -729,13 +747,16 @@ func (c *Container) onListenClose(pid uint32, addr netaddr.IPPort) {
 
 func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst netaddr.IPPort, timestamp uint64, failed bool, duration time.Duration) {
 	if common.PortFilter.ShouldBeSkipped(dst.Port()) {
+		c.markIgnored(pid, fd, timestamp, failed)
 		return
 	}
 	p := c.processes[pid]
 	if p == nil {
+		c.markIgnored(pid, fd, timestamp, failed)
 		return
 	}
 	if dst.IP().IsLoopback() && !p.isHostNs() {
+		c.markIgnored(pid, fd, timestamp, failed)
 		return
 	}
 	if actualDst.Port() == 0 {
@@ -746,9 +767,11 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 		}
 	}
 	if actualDst.IP().IsLoopback() && !p.isHostNs() {
+		c.markIgnored(pid, fd, timestamp, failed)
 		return
 	}
 	if common.ConnectionFilter.ShouldBeSkipped(dst.IP(), actualDst.IP()) {
+		c.markIgnored(pid, fd, timestamp, failed)
 		return
 	}
 	key := common.NewDestinationKey(dst, actualDst, c.registry.getDomain(dst.IP()))
@@ -801,9 +824,45 @@ func (c *Container) lookupConnection(pid uint32, fd uint64, timestamp uint64) *A
 	return c.replacedConnections[pidFdTs{Pid: pid, Fd: fd, Ts: timestamp}]
 }
 
+// markIgnored records a connection that is deliberately not tracked and drops any of its
+// L7 events that arrived before the open event.
+func (c *Container) markIgnored(pid uint32, fd uint64, timestamp uint64, failed bool) {
+	if failed || timestamp == 0 {
+		return
+	}
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	k := pidFdTs{Pid: pid, Fd: fd, Ts: timestamp}
+	if p := c.pendingL7[k]; p != nil {
+		delete(c.pendingL7, k)
+		c.pendingL7Count -= len(p.requests)
+		diag.L7EventsMatched.WithLabelValues("ignored").Add(float64(len(p.requests)))
+	}
+	if c.ignoredConnections == nil {
+		c.ignoredConnections = map[pidFdTs]*ignoredConnection{}
+	}
+	if len(c.ignoredConnections) >= maxIgnoredConnsPerContainer {
+		return
+	}
+	c.ignoredConnections[k] = &ignoredConnection{}
+}
+
+// expireIgnoredConnections removes ignored connections closed more than
+// ignoredConnectionTTL ago, and those of processes that are gone. c.lock must be held.
+func (c *Container) expireIgnoredConnections(now time.Time) {
+	for k, ic := range c.ignoredConnections {
+		if (!ic.closed.IsZero() && now.Sub(ic.closed) > ignoredConnectionTTL) || c.processes[k.Pid] == nil {
+			delete(c.ignoredConnections, k)
+		}
+	}
+}
+
 func (c *Container) onConnectionClose(e ebpftracer.Event) {
 	c.lock.Lock()
 	conn := c.lookupConnection(e.Pid, e.Fd, e.Timestamp)
+	if ic := c.ignoredConnections[pidFdTs{Pid: e.Pid, Fd: e.Fd, Ts: e.Timestamp}]; ic != nil && ic.closed.IsZero() {
+		ic.closed = time.Now()
+	}
 	c.lock.Unlock()
 	if conn != nil {
 		if conn.Closed.IsZero() {
@@ -923,7 +982,12 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 
 	conn := c.lookupConnection(pid, fd, timestamp)
 	if conn == nil {
-		c.deferL7(pidFdTs{Pid: pid, Fd: fd, Ts: timestamp}, r)
+		k := pidFdTs{Pid: pid, Fd: fd, Ts: timestamp}
+		if c.ignoredConnections[k] != nil {
+			diag.L7EventsMatched.WithLabelValues("ignored").Inc()
+			return nil
+		}
+		c.deferL7(k, r)
 		return nil
 	}
 	if timestamp != 0 && conn != c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}] {
@@ -944,6 +1008,7 @@ func (c *Container) deferL7(k pidFdTs, r *l7.RequestData) {
 	if now := time.Now(); now.Sub(c.pendingL7Expired) > time.Second {
 		c.pendingL7Expired = now
 		c.expirePendingL7(now)
+		c.expireIgnoredConnections(now)
 	}
 	if k.Ts == 0 || c.pendingL7Count >= maxPendingL7PerContainer {
 		diag.L7EventsMatched.WithLabelValues("unmatched").Inc()
@@ -1422,6 +1487,7 @@ func (c *Container) gc(now time.Time) {
 		}
 	}
 	c.expirePendingL7(now)
+	c.expireIgnoredConnections(now)
 	for k, conn := range c.replacedConnections {
 		if now.Sub(conn.Closed) > gcInterval {
 			delete(c.replacedConnections, k)

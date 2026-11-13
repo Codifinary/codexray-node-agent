@@ -100,12 +100,14 @@ var (
 		Help: "L7 spans kept or dropped by trace sampling, by decision and reason",
 	}, []string{"decision", "reason"})
 
-	// L7 events that could not be matched to a tracked connection, by result:
-	// matched_replaced = matched to a connection whose pid/fd had already been reused,
-	// unmatched = dropped.
+	// L7 events by how they were matched to a connection:
+	// current = the connection currently on the pid/fd; matched_replaced = a connection whose
+	// pid/fd had already been reused; matched_deferred = the event arrived before the
+	// connection's open event and was replayed; ignored = the connection is deliberately not
+	// tracked (filters, loopback inside a pod netns); unmatched = dropped, no connection found.
 	L7EventsMatched = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "l7_events_connection_match_total",
-		Help: "L7 events by how they were matched to a connection (current, matched_replaced, unmatched)",
+		Help: "L7 events by how they were matched to a connection (current, matched_replaced, matched_deferred, ignored, unmatched)",
 	}, []string{"result"})
 
 	// Memory watchdog

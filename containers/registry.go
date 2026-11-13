@@ -262,16 +262,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					}
 				}
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
-					p := c.onProcessStart(e.Pid)
-					if r.processInfoCh != nil && p != nil {
-						// Never block the event loop on the profiler: a stalled handoff used to
-						// back up every eBPF event (and, through Collect, every scrape).
-						select {
-						case r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}:
-						default:
-							diag.DroppedTotal.WithLabelValues("profiling", "process_handoff_queue_full").Inc()
-						}
-					}
+					r.handoffProcess(c, c.onProcessStart(e.Pid))
 				}
 			case ebpftracer.EventTypeProcessExit:
 				if c := r.containersByPid[e.Pid]; c != nil {
@@ -297,6 +288,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 
 			case ebpftracer.EventTypeConnectionOpen:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					r.ensureProcess(c, e.Pid)
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, e.Timestamp, false, e.Duration)
 					c.attachTlsUprobes(r.tracer, e.Pid)
 				} else {
@@ -304,6 +296,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 			case ebpftracer.EventTypeConnectionError:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					r.ensureProcess(c, e.Pid)
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, 0, true, e.Duration)
 				} else {
 					klog.Infoln("TCP connection error from unknown container", e)
@@ -332,6 +325,33 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 			}
 		}
+	}
+}
+
+// handoffProcess passes a newly registered process to the profiler.
+func (r *Registry) handoffProcess(c *Container, p *Process) {
+	if r.processInfoCh == nil || p == nil {
+		return
+	}
+	// Never block the event loop on the profiler: a stalled handoff used to
+	// back up every eBPF event (and, through Collect, every scrape).
+	select {
+	case r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}:
+	default:
+		diag.DroppedTotal.WithLabelValues("profiling", "process_handoff_queue_full").Inc()
+	}
+}
+
+// ensureProcess registers pid in c if its process-start event has not been processed yet.
+// Process events are read from a separate perf buffer with a longer read deadline than
+// connection events, so the first connections of a just-started process (CLI tools, cron
+// jobs, benchmark phases) used to be dropped as coming from an unknown process.
+func (r *Registry) ensureProcess(c *Container, pid uint32) {
+	c.lock.Lock()
+	known := c.processes[pid] != nil
+	c.lock.Unlock()
+	if !known {
+		r.handoffProcess(c, c.onProcessStart(pid))
 	}
 }
 
