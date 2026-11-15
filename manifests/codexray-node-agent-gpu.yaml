@@ -140,6 +140,9 @@ spec:
             - {name: TRACES_ADAPTIVE_SAMPLING_ENABLED, value: "false"}
             - {name: TRACES_SLOW_THRESHOLD, value: "500ms"}
             - {name: CONTAINER_LOG_COLLECTION_ENABLED, value: "false"}
+            # With log collection on: export only this level and above (all|debug|info|warning|error|critical).
+            - {name: CONTAINER_LOG_MIN_LEVEL, value: "all"}
+            - {name: CONTAINER_LOG_KEEP_UNKNOWN_LEVEL, value: "false"}
             - {name: CONTAINER_LOG_PARSING_ENABLED, value: "false"}
             - {name: PROFILING_ENABLED, value: "false"}
             # Memory safeguards and diagnostics

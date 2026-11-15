@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Added
+- **Log level filter for exported logs** (`CONTAINER_LOG_MIN_LEVEL`, default `all`): with log
+  collection on, export only lines at or above `debug`, `info`, `warning`, `error` or `critical`.
+  `warning` exports warning, error and critical lines. Lines whose level cannot be detected are
+  dropped unless `CONTAINER_LOG_KEEP_UNKNOWN_LEVEL=true`. Dropped lines are counted in
+  `node_agent_dropped_total{component="logs",reason="below_min_level"|"unknown_level"}`. The level
+  comes from the message text (`ERROR`, `level=warn`, glog `E1115`, etc.); for journald, the
+  syslog priority is used when the text has none. Multiline messages (stack traces) keep the level
+  of their first line. `container_log_messages_total` is not affected.
 - **Adaptive trace sampling** (`TRACES_ADAPTIVE_SAMPLING_ENABLED`, default `false`): keeps every
   error span and every span longer than `TRACES_SLOW_THRESHOLD` (default `500ms`) and samples the
   rest at `TRACES_SAMPLING`. Decisions are counted in

@@ -16,6 +16,7 @@ is never silently defaulted.
 | `--ebpf-l7-metrics-enabled` / `EBPF_L7_METRICS_ENABLED` | **`false`** | `container_<protocol>_requests_total` / `_duration_*` RED metrics | Traces |
 | `--ebpf-l7-traces-enabled` / `EBPF_L7_TRACES_ENABLED` | **`false`** | L7 spans (sampled, see Trace sampling). Off: tracer not initialized, no span allocation | L7 metrics. The L7 eBPF programs and TLS uprobes stay loaded while either L7 setting is on |
 | `--container-log-collection-enabled` / `CONTAINER_LOG_COLLECTION_ENABLED` | **`false`** | Tailing and OTLP export of container/journald logs | Tracing, metrics |
+| `--container-log-min-level` / `CONTAINER_LOG_MIN_LEVEL` | `all` | Least severe level exported when log collection is on: `all`, `debug`, `info`, `warning`, `error`, `critical`. Lines with no detectable level are dropped unless `CONTAINER_LOG_KEEP_UNKNOWN_LEVEL=true`. Drops counted in `node_agent_dropped_total{component="logs"}` | Log parsing metrics |
 | `--container-log-parsing-enabled` / `CONTAINER_LOG_PARSING_ENABLED` | **`false`** | Pattern extraction and `container_log_messages_total` | Log export |
 | `--profiling-enabled` / `PROFILING_ENABLED` | **`false`** | eBPF CPU profiler (session, symbolization, JVM perf-map dumps, process handoff). Also requires a profiles endpoint | L7 tracing, dependency detection, TLS uprobes |
 
