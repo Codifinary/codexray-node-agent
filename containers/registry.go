@@ -419,6 +419,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 			c.lock.Lock()
 			c.cgroup = cg
 			c.metadata = md
+			c.publishAge()
 			c.runLogParser("")
 			c.lock.Unlock()
 		}

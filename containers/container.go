@@ -160,6 +160,12 @@ type Container struct {
 	zombieAt  time.Time
 	restarts  int
 
+	// Copies of the start time used for --min-container-age (startedAt, or the cgroup
+	// creation time) and of zombieAt, as UnixNano, so that callbacks running under other
+	// locks (the log parser's) can check the age without taking c.lock. See publishAge.
+	ageStartNano  atomic.Int64
+	ageZombieNano atomic.Int64
+
 	delays      Delays
 	delaysByPid map[uint32]Delays
 
@@ -262,6 +268,7 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 	}
 	diag.ContainersActive.Inc()
 	c.lock.Lock()
+	c.publishAge()
 	c.runLogParser("")
 	c.lock.Unlock()
 
@@ -315,26 +322,63 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 // youngerThanMinAge reports whether the container is younger than --min-container-age.
 // Must be called with c.lock held.
 func (c *Container) youngerThanMinAge(now time.Time) bool {
-	minAge := minContainerAge()
-	if minAge <= 0 {
+	if minContainerAge() <= 0 {
 		return false
 	}
-	// Fall back to cgroup mtime when taskstats hasn't populated startedAt
-	// (PID-vs-TGID races, restricted netlink caps, missing CONFIG_TASKSTATS_NETLINK).
-	// Without this, every container whose first taskstats lookup failed would be
-	// permanently filtered, dropping all of its metrics — not just for ~30s.
+	return youngerThan(c.ageStart(), c.zombieAt, now, minContainerAge())
+}
+
+// ageStart is the start time used for --min-container-age. It falls back to the cgroup mtime
+// when taskstats hasn't populated startedAt (PID-vs-TGID races, restricted netlink caps,
+// missing CONFIG_TASKSTATS_NETLINK). Without this, every container whose first taskstats lookup
+// failed would be permanently filtered, dropping all of its metrics, not just for ~30s.
+// Must be called with c.lock held.
+func (c *Container) ageStart() time.Time {
 	started := c.startedAt
 	if started.IsZero() && c.cgroup != nil {
 		started = c.cgroup.CreatedAt()
 	}
+	return started
+}
+
+func youngerThan(started, zombieAt, now time.Time, minAge time.Duration) bool {
 	if started.IsZero() {
 		return false
 	}
 	end := now
-	if !c.zombieAt.IsZero() && c.zombieAt.Before(end) {
-		end = c.zombieAt
+	if !zombieAt.IsZero() && zombieAt.Before(end) {
+		end = zombieAt
 	}
 	return end.Sub(started) < minAge
+}
+
+// publishAge copies the age inputs into atomics for youngerThanMinAgeNoLock. Must be called
+// with c.lock held (or before the container is shared) after startedAt, zombieAt or cgroup change.
+func (c *Container) publishAge() {
+	c.ageStartNano.Store(unixNano(c.ageStart()))
+	c.ageZombieNano.Store(unixNano(c.zombieAt))
+}
+
+// youngerThanMinAgeNoLock is youngerThanMinAge for callers that must not take c.lock.
+func (c *Container) youngerThanMinAgeNoLock(now time.Time) bool {
+	if minContainerAge() <= 0 {
+		return false
+	}
+	return youngerThan(fromUnixNano(c.ageStartNano.Load()), fromUnixNano(c.ageZombieNano.Load()), now, minContainerAge())
+}
+
+func unixNano(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+func fromUnixNano(n int64) time.Time {
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
 }
 
 func minContainerAge() time.Duration {
@@ -350,8 +394,9 @@ func minAgeGatesLogsAndTraces() bool {
 }
 
 // logEmitter wraps the OTLP log emitter so that, with --min-container-age-applies-to=all,
-// lines from containers younger than --min-container-age are not exported. Once a container is
-// old enough the check is skipped without taking the container lock.
+// lines from containers younger than --min-container-age are not exported. The callback runs
+// with the log parser's lock held, and Collect holds c.lock while reading the parser's
+// counters, so it must never take c.lock: it reads the age from atomics instead.
 func (c *Container) logEmitter(containerId string) logparser.OnMsgCallbackF {
 	emit := logs.OtelLogEmitter(containerId)
 	if emit == nil || !minAgeGatesLogsAndTraces() {
@@ -360,10 +405,7 @@ func (c *Container) logEmitter(containerId string) logparser.OnMsgCallbackF {
 	var mature atomic.Bool
 	return func(ts time.Time, level logparser.Level, patternHash string, msg string) {
 		if !mature.Load() {
-			c.lock.Lock()
-			young := c.youngerThanMinAge(time.Now())
-			c.lock.Unlock()
-			if young {
+			if c.youngerThanMinAgeNoLock(time.Now()) {
 				return
 			}
 			mature.Store(true)
@@ -603,6 +645,7 @@ func (c *Container) collectGpuUsage(ch chan<- prometheus.Metric) {
 func (c *Container) onProcessStart(pid uint32) *Process {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+	defer c.publishAge() // runs before Unlock
 	stats, err := TaskstatsPID(pid)
 	if err != nil {
 		return nil
@@ -651,6 +694,7 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	delete(c.processes, pid)
 	if len(c.processes) == 0 {
 		c.zombieAt = time.Now()
+		c.publishAge()
 	}
 	delete(c.delaysByPid, pid)
 	if oomKill {

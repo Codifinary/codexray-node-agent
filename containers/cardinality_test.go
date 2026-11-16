@@ -105,3 +105,35 @@ func TestMinContainerAgeScope(t *testing.T) {
 	assert.False(t, young.youngerThanMinAge(now))
 	assert.False(t, minAgeGatesLogsAndTraces(), "no gating when min-container-age is disabled")
 }
+
+// The log emitter runs under the log parser's lock, so its age check must not take c.lock
+// (Collect holds c.lock while reading the parser's counters).
+func TestMinContainerAgeNoLock(t *testing.T) {
+	prevAge := *flags.MinContainerAge
+	defer func() { *flags.MinContainerAge = prevAge }()
+	*flags.MinContainerAge = 30 * time.Second
+
+	now := time.Now()
+	c := &Container{id: "/k8s/job", startedAt: now.Add(-5 * time.Second)}
+	c.publishAge()
+
+	c.lock.Lock() // held, as by Collect
+	done := make(chan bool)
+	go func() { done <- c.youngerThanMinAgeNoLock(now) }()
+	select {
+	case young := <-done:
+		assert.True(t, young)
+	case <-time.After(time.Second):
+		t.Fatal("youngerThanMinAgeNoLock blocked on c.lock")
+	}
+	c.startedAt = now.Add(-time.Hour)
+	c.publishAge()
+	c.lock.Unlock()
+	assert.False(t, c.youngerThanMinAgeNoLock(now))
+
+	// A container that exited while young stays young.
+	c.startedAt, c.zombieAt = now.Add(-time.Minute), now.Add(-50*time.Second)
+	c.publishAge()
+	assert.Equal(t, c.youngerThanMinAge(now), c.youngerThanMinAgeNoLock(now))
+	assert.True(t, c.youngerThanMinAgeNoLock(now))
+}
