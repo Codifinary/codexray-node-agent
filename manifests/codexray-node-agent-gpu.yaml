@@ -120,10 +120,12 @@ spec:
             - --collector-endpoint=http://YOUR_CODEXRAY_IP:8080
             - --cgroupfs-root=/host/sys/fs/cgroup
             - --wal-dir=/data
-            # Required since v1.4.0: the containers to monitor (regexes on the cgroup path; one flag
-            # per pattern; '*' is rejected). These cover every pod and the node's kubelet and container
-            # runtime. Narrow them for large clusters, e.g. ^/k8s/<namespace>/.
-            - --container-allowlist=^/k8s/
+            # Required since v1.4.0: the containers to monitor (regexes on the agent's container ID,
+            # e.g. /k8s/<namespace>/<pod>/<container>, /k8s-cronjob/<namespace>/<job>/<container>,
+            # /system.slice/<unit>, /docker/<name>; not the kubepods cgroup path). One flag per
+            # pattern; '*' is rejected. These cover every pod, CronJob pods included, and the node's
+            # kubelet and container runtime. Narrow them for large clusters, e.g. ^/k8s(-cronjob)?/<namespace>/.
+            - --container-allowlist=^/k8s(-cronjob)?/
             - --container-allowlist=^/system\.slice/(kubelet|containerd|docker|crio|k3s|k3s-agent)\.service$
           env:
             # API key from a Secret, never as a command-line argument (arguments are visible in

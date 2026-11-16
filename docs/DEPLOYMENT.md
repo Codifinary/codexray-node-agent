@@ -23,10 +23,13 @@ Nothing here deploys automatically. Every step is run by an operator and can be 
 4. Build and push the new images from the release commits, using the regular images rather
    than the `-debug` variants.
 5. **Set the container allowlist.** Since v1.4.0 the agent exits at startup without
-   `--container-allowlist` / `CONTAINER_ALLOWLIST` (regexes on the cgroup path; `*` is rejected).
+   `--container-allowlist` / `CONTAINER_ALLOWLIST`. The patterns are regexes on the agent's
+   container ID (`/k8s/<namespace>/<pod>/<container>`, `/k8s-cronjob/<namespace>/<job>/<container>`,
+   `/system.slice/<unit>`, `/docker/<name>`), not on the kubepods cgroup path. `*` is rejected.
    - Kubernetes: one `--container-allowlist=` argument per pattern. The shipped manifests cover
-     every pod (`^/k8s/`) plus the kubelet and container runtime services; narrow them to the
-     namespaces you monitor, e.g. `^/k8s/<namespace>/`.
+     every pod, CronJob pods included (`^/k8s(-cronjob)?/`), plus the kubelet and container
+     runtime services; narrow them to the namespaces you monitor, e.g.
+     `^/k8s(-cronjob)?/<namespace>/`.
    - systemd hosts: `install.sh` refuses to install without it. Give one regex and use
      alternation for several services, e.g.
      `CONTAINER_ALLOWLIST='^/system.slice/(nginx|postgresql)[.]service$'`. Use `[.]` rather than

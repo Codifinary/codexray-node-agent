@@ -37,7 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed (breaking default)
 - **Container allowlist in the manifests and installer.** `--container-allowlist` has been
   required since v1.4.0, but the manifests and `install.sh` did not set it, so the agent exited at
-  startup. Both manifests now list every pod (`^/k8s/`) and the kubelet and container runtime
+  startup. Both manifests now list every pod (`^/k8s(-cronjob)?/`) and the kubelet and container runtime
   services; narrow them per cluster. `install.sh` stops with an explanation when
   `CONTAINER_ALLOWLIST` is neither passed nor already in the env file, instead of installing a
   unit that restarts forever. See docs/DEPLOYMENT.md, step 5.
