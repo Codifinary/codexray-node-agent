@@ -34,15 +34,15 @@ func TestParseAndSelectFilesystems(t *testing.T) {
 
 	var mps []string
 	for _, m := range got {
-		mps = append(mps, m.mountPoint)
+		mps = append(mps, m.MountPoint)
 	}
 	// One entry per device: the bind mount /home of the root fs and the kubelet/containerd
 	// bind mounts of nvme1n1 are not double counted; virtual and overlay mounts are excluded.
 	require.Equal(t, []string{"/", "/mnt/data disk", "/mnt/nfs", "/var/lib/kubelet"}, mps)
 	for _, m := range got {
-		if m.mountPoint == "/mnt/data disk" {
-			require.True(t, m.readOnly)
-			require.Equal(t, "/dev/nvme2n1", m.source)
+		if m.MountPoint == "/mnt/data disk" {
+			require.True(t, m.ReadOnly)
+			require.Equal(t, "/dev/nvme2n1", m.Source)
 		}
 	}
 }

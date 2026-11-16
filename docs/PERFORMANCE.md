@@ -29,7 +29,7 @@ final build). Compare C–F with B, not with B2.
 - **Series, final vs baseline (+135):**
   - self-observability: `node_agent_*` 35, `go_*` 49, `process_*` 9 (93 total)
   - `node_filesystem_*`: 36 (6 mounts in the VM)
-  - `node_load_average`: 3
+  - `node_load1`, `node_load5`, `node_load15`: 3 (measured as `node_load_average`, since renamed)
 
   Container and node series are unchanged. On a real node, the filesystem count depends on
   mounts (capped by `NODE_FS_MAX_MOUNTS`) and self-observability stays roughly constant. The

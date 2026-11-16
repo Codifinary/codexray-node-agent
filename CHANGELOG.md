@@ -94,8 +94,9 @@ until the soak/canary criteria in [docs/SOAK-TEST.md](docs/SOAK-TEST.md) pass.
   soft memory limit (`GO_MEMORY_LIMIT_RATIO`), and pprof on a separate listener with optional
   bearer token.
 - **Node metrics:** `node_filesystem_*` (capacity, available, free, inodes, read-only; bind
-  mounts de-duplicated; configurable exclusions; `NODE_FS_MAX_MOUNTS`) and
-  `node_load_average`.
+  mounts de-duplicated; configurable exclusions; `NODE_FS_MAX_MOUNTS`), labelled
+  `mountpoint`, `device`, `fstype` like node-exporter, and `node_load1` / `node_load5` /
+  `node_load15`.
 - Soak-test workloads and scripts (`scripts/soak/`), deployment/canary/rollback guide.
 
 ### Upgrade notes

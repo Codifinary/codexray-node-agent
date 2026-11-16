@@ -201,9 +201,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	if la, err := loadAverage(procRoot); err == nil {
-		ch <- gauge(loadDesc, la[0], "1m")
-		ch <- gauge(loadDesc, la[1], "5m")
-		ch <- gauge(loadDesc, la[2], "15m")
+		ch <- gauge(load1Desc, la[0])
+		ch <- gauge(load5Desc, la[1])
+		ch <- gauge(load15Desc, la[2])
 	}
 	if c.fs != nil {
 		c.fs.collect(ch)
@@ -299,7 +299,9 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- netTxPacketsDesc
 	ch <- netIfaceUpDesc
 	ch <- ipDesc
-	ch <- loadDesc
+	ch <- load1Desc
+	ch <- load5Desc
+	ch <- load15Desc
 	for _, d := range []*prometheus.Desc{fsSizeDesc, fsAvailDesc, fsFreeDesc, fsFilesDesc, fsFilesFreeDesc, fsReadonlyDesc} {
 		ch <- d
 	}

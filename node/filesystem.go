@@ -4,8 +4,6 @@
 package node
 
 import (
-	"bufio"
-	"bytes"
 	"os"
 	"path"
 	"regexp"
@@ -16,12 +14,14 @@ import (
 	"time"
 
 	"github.com/codifinary/codexray-node-agent/flags"
+	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 )
 
-var fsLabels = []string{"mount_point", "device", "fstype"}
+// Same names and labels as node-exporter, which the backend already queries.
+var fsLabels = []string{"mountpoint", "device", "fstype"}
 
 var (
 	fsSizeDesc      = prometheus.NewDesc("node_filesystem_size_bytes", "Filesystem size in bytes", fsLabels, nil)
@@ -31,7 +31,9 @@ var (
 	fsFilesFreeDesc = prometheus.NewDesc("node_filesystem_files_free", "Filesystem free inodes", fsLabels, nil)
 	fsReadonlyDesc  = prometheus.NewDesc("node_filesystem_readonly", "1 if the filesystem is mounted read-only", fsLabels, nil)
 
-	loadDesc = prometheus.NewDesc("node_load_average", "System load average", []string{"window"}, nil)
+	load1Desc  = prometheus.NewDesc("node_load1", "1m load average", nil, nil)
+	load5Desc  = prometheus.NewDesc("node_load5", "5m load average", nil, nil)
+	load15Desc = prometheus.NewDesc("node_load15", "15m load average", nil, nil)
 )
 
 // DefaultFSExcludeTypes are virtual, pseudo or per-container filesystems: they have no node
@@ -42,68 +44,10 @@ const DefaultFSExcludeTypes = `^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugf
 // (pod volumes are reported per container by the container metrics and by kubelet volume stats).
 const DefaultFSExcludeMountPoints = `^/(dev|proc|sys|run|var/lib/kubelet/pods|var/lib/docker/.+|var/lib/containerd/.+|run/containerd/.+|var/lib/containers/storage/.+|snap/.+)($|/)`
 
-type mountInfo struct {
-	majorMinor string
-	root       string
-	mountPoint string
-	readOnly   bool
-	fsType     string
-	source     string
-}
+// mountInfo is a parsed mountinfo line; parsing is shared with container mount attribution.
+type mountInfo = proc.MountEntry
 
-// parseMountInfo parses /proc/<pid>/mountinfo (see proc(5)).
-func parseMountInfo(data []byte) []mountInfo {
-	var res []mountInfo
-	sc := bufio.NewScanner(bytes.NewReader(data))
-	sc.Buffer(make([]byte, 64*1024), 1024*1024)
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		// 36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
-		sep := -1
-		for i, f := range fields {
-			if f == "-" {
-				sep = i
-				break
-			}
-		}
-		if sep < 6 || len(fields) < sep+3 {
-			continue
-		}
-		m := mountInfo{
-			majorMinor: fields[2],
-			root:       unescapeMount(fields[3]),
-			mountPoint: unescapeMount(fields[4]),
-			fsType:     fields[sep+1],
-			source:     fields[sep+2],
-		}
-		for _, o := range strings.Split(fields[5], ",") {
-			if o == "ro" {
-				m.readOnly = true
-			}
-		}
-		res = append(res, m)
-	}
-	return res
-}
-
-// unescapeMount decodes the octal escapes used by the kernel for spaces, tabs, newlines and backslashes.
-func unescapeMount(s string) string {
-	if !strings.Contains(s, `\`) {
-		return s
-	}
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+3 < len(s) {
-			if v, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
-				b.WriteByte(byte(v))
-				i += 3
-				continue
-			}
-		}
-		b.WriteByte(s[i])
-	}
-	return b.String()
-}
+func parseMountInfo(data []byte) []mountInfo { return proc.ParseMountInfo(data) }
 
 // selectFilesystems keeps one mount per device (major:minor) so bind mounts and repeated
 // mounts of the same filesystem are counted once. It prefers the mount of the filesystem
@@ -112,22 +56,22 @@ func unescapeMount(s string) string {
 func selectFilesystems(mounts []mountInfo, excludeTypes, excludeMounts *regexp.Regexp, max int) []mountInfo {
 	byDev := map[string]mountInfo{}
 	for _, m := range mounts {
-		if excludeTypes != nil && excludeTypes.MatchString(m.fsType) {
+		if excludeTypes != nil && excludeTypes.MatchString(m.FsType) {
 			continue
 		}
-		if excludeMounts != nil && excludeMounts.MatchString(m.mountPoint) {
+		if excludeMounts != nil && excludeMounts.MatchString(m.MountPoint) {
 			continue
 		}
-		cur, ok := byDev[m.majorMinor]
+		cur, ok := byDev[m.MajorMinor]
 		if !ok || better(m, cur) {
-			byDev[m.majorMinor] = m
+			byDev[m.MajorMinor] = m
 		}
 	}
 	res := make([]mountInfo, 0, len(byDev))
 	for _, m := range byDev {
 		res = append(res, m)
 	}
-	sort.Slice(res, func(i, j int) bool { return res[i].mountPoint < res[j].mountPoint })
+	sort.Slice(res, func(i, j int) bool { return res[i].MountPoint < res[j].MountPoint })
 	if max > 0 && len(res) > max {
 		res = res[:max]
 	}
@@ -135,13 +79,13 @@ func selectFilesystems(mounts []mountInfo, excludeTypes, excludeMounts *regexp.R
 }
 
 func better(a, b mountInfo) bool {
-	if (a.root == "/") != (b.root == "/") {
-		return a.root == "/"
+	if (a.Root == "/") != (b.Root == "/") {
+		return a.Root == "/"
 	}
-	if len(a.mountPoint) != len(b.mountPoint) {
-		return len(a.mountPoint) < len(b.mountPoint)
+	if len(a.MountPoint) != len(b.MountPoint) {
+		return len(a.MountPoint) < len(b.MountPoint)
 	}
-	return a.mountPoint < b.mountPoint
+	return a.MountPoint < b.MountPoint
 }
 
 type fsCollector struct {
@@ -214,19 +158,19 @@ func (c *fsCollector) collect(ch chan<- prometheus.Metric) {
 		return
 	}
 	for _, m := range selectFilesystems(parseMountInfo(data), c.excludeTypes, c.excludeMounts, c.max) {
-		st, ok := c.statfs(path.Join(procRoot, "1", "root", m.mountPoint))
+		st, ok := c.statfs(path.Join(procRoot, "1", "root", m.MountPoint))
 		if !ok {
 			continue
 		}
 		bsize := float64(st.Bsize)
-		lv := []string{m.mountPoint, m.source, m.fsType}
+		lv := []string{m.MountPoint, m.Source, m.FsType}
 		ch <- gauge(fsSizeDesc, float64(st.Blocks)*bsize, lv...)
 		ch <- gauge(fsAvailDesc, float64(st.Bavail)*bsize, lv...)
 		ch <- gauge(fsFreeDesc, float64(st.Bfree)*bsize, lv...)
 		ch <- gauge(fsFilesDesc, float64(st.Files), lv...)
 		ch <- gauge(fsFilesFreeDesc, float64(st.Ffree), lv...)
 		ro := 0.0
-		if m.readOnly || st.Flags&unix.ST_RDONLY != 0 {
+		if m.ReadOnly || st.Flags&unix.ST_RDONLY != 0 {
 			ro = 1
 		}
 		ch <- gauge(fsReadonlyDesc, ro, lv...)
