@@ -9,9 +9,12 @@ import (
 	"bytes"
 	"debug/buildinfo"
 	"debug/elf"
+	"errors"
+	"io/fs"
 	"os"
 	"regexp"
 	"strings"
+	"syscall"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/codifinary/codexray-node-agent/common"
@@ -147,6 +150,7 @@ type goTlsBinaryInfo struct {
 	name, version  string
 	skipReason     string // non-empty: don't attach (unsupported version, symbols missing, ...)
 	skipErr        error
+	transient      bool // the result came from an I/O failure (e.g. the process exited): don't cache it
 	writeAddr      uint64
 	readAddr       uint64
 	readRetOffsets []int
@@ -154,11 +158,22 @@ type goTlsBinaryInfo struct {
 
 var goTlsBinaryCache = newFileInfoCache[*goTlsBinaryInfo](256)
 
+// isTransientFileError reports whether err comes from accessing the file (it vanished with its
+// process, permissions, I/O) rather than from its contents. Such results are not cached: the
+// next process running the same binary may succeed.
+func isTransientFileError(err error) bool {
+	var pe *fs.PathError
+	return errors.As(err, &pe) || errors.Is(err, syscall.ESRCH) || errors.Is(err, syscall.EIO)
+}
+
+func cacheableGoTlsBinaryInfo(info *goTlsBinaryInfo) bool { return info != nil && !info.transient }
+
 func loadGoTlsBinaryInfo(path string) *goTlsBinaryInfo {
 	info := &goTlsBinaryInfo{}
 	bi, err := buildinfo.ReadFile(path)
 	if err != nil {
 		info.skipReason, info.skipErr = "failed to read build info", err
+		info.transient = isTransientFileError(err)
 		return info
 	}
 	info.isGo = true
@@ -180,6 +195,7 @@ func loadGoTlsBinaryInfo(path string) *goTlsBinaryInfo {
 	ef, err := OpenELFFile(path)
 	if err != nil {
 		info.skipReason, info.skipErr = "failed to open as elf binary", err
+		info.transient = isTransientFileError(err)
 		return info
 	}
 	defer ef.Close()
@@ -210,7 +226,7 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 	}
 
 	path := proc.Path(pid, "exe")
-	info, cached := goTlsBinaryCache.get(path, loadGoTlsBinaryInfo)
+	info, cached := goTlsBinaryCache.getIf(path, loadGoTlsBinaryInfo, cacheableGoTlsBinaryInfo)
 	if info == nil || !info.isGo {
 		return nil, false
 	}

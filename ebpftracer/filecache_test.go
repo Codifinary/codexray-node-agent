@@ -4,6 +4,7 @@
 package ebpftracer
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -84,4 +85,29 @@ func BenchmarkGoTlsBinaryInfo(b *testing.B) {
 			c.get(path, loadGoTlsBinaryInfo)
 		}
 	})
+}
+
+func TestFileInfoCacheSkipsUncacheable(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "bin")
+	require.NoError(t, os.WriteFile(p, []byte("x"), 0o644))
+	c := newFileInfoCache[int](4)
+	calls := 0
+	load := func(string) int { calls++; return calls }
+	transient := func(v int) bool { return v > 1 } // first result is "transient"
+	v, cached := c.getIf(p, load, transient)
+	require.Equal(t, 1, v)
+	require.False(t, cached)
+	v, cached = c.getIf(p, load, transient) // recomputed, now cached
+	require.Equal(t, 2, v)
+	require.False(t, cached)
+	v, cached = c.getIf(p, load, transient)
+	require.Equal(t, 2, v)
+	require.True(t, cached)
+}
+
+func TestIsTransientFileError(t *testing.T) {
+	_, err := os.Open(filepath.Join(t.TempDir(), "gone"))
+	require.True(t, isTransientFileError(err))
+	require.False(t, isTransientFileError(errors.New("not a Go executable")))
 }

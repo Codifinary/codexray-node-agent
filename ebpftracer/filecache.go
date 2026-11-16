@@ -46,6 +46,12 @@ func newFileInfoCache[V any](max int) *fileInfoCache[V] {
 // cached reports whether the value came from the cache. If the file cannot be stat'ed,
 // load is called without caching.
 func (c *fileInfoCache[V]) get(path string, load func(path string) V) (v V, cached bool) {
+	return c.getIf(path, load, nil)
+}
+
+// getIf is get, but a computed value is stored only if cacheable (nil: always) reports true,
+// so results of transient failures are recomputed next time.
+func (c *fileInfoCache[V]) getIf(path string, load func(path string) V, cacheable func(V) bool) (v V, cached bool) {
 	key, ok := statFileKey(path)
 	if !ok {
 		return load(path), false
@@ -57,6 +63,9 @@ func (c *fileInfoCache[V]) get(path string, load func(path string) V) (v V, cach
 	}
 	c.mu.Unlock()
 	v = load(path) // outside the lock: may take a while for large binaries
+	if cacheable != nil && !cacheable(v) {
+		return v, false
+	}
 	c.mu.Lock()
 	if len(c.entries) >= c.max {
 		c.entries = map[fileKey]V{}
