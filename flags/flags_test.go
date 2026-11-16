@@ -106,11 +106,12 @@ func TestNormalizeBoolArgs(t *testing.T) {
 		NormalizeBoolArgs(app.Model(), []string{"--disable-pinger=maybe", "--", "--disable-pinger=false"}))
 }
 
-func TestContainerResourceMetricsDefaultOff(t *testing.T) {
+// container_resources_* are read by the backend, so they stay on by default.
+func TestContainerResourceMetricsDefaultOn(t *testing.T) {
 	f := kingpin.CommandLine.GetFlag("container-resource-metrics-enabled")
 	assert.NotNil(t, f)
-	assert.Equal(t, []string{"false"}, f.Model().Default)
-	assert.False(t, Telemetry.ContainerResourceMetrics)
+	assert.Equal(t, []string{"true"}, f.Model().Default)
+	assert.True(t, Telemetry.ContainerResourceMetrics)
 }
 
 func TestScrapeIntervalDefault(t *testing.T) {

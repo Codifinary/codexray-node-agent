@@ -121,12 +121,10 @@ consumers (port-forward targets) if you changed them.
 
 ## 5. Recommended settings for new Kubernetes installs
 
-`CONTAINER_RESOURCE_METRICS_ENABLED=false` is now the code default (see
-[FEATURE-FLAGS.md](FEATURE-FLAGS.md)); the other rows are recommendations, not code defaults.
+These are recommendations, not code defaults (see [FEATURE-FLAGS.md](FEATURE-FLAGS.md)).
 
 | Setting | Value | Why |
 |---|---|---|
-| `CONTAINER_RESOURCE_METRICS_ENABLED` | `false` | Pod-level CPU/memory comes from the cluster agent; removes the `container_resources_*` series |
 | `TRACES_SAMPLING` | workload-dependent (e.g. `0.1`) | RED metrics are unaffected by sampling |
 | `GO_MEMORY_LIMIT_RATIO` | `0.7` | Returns burst memory to the OS sooner |
 | `MEMORY_WATCHDOG_THRESHOLD_RATIO` | `0.8` | Captures the owner of any future spike |

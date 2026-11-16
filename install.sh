@@ -232,10 +232,6 @@ create_env_file() {
         [ -z "$NEW_ENV" ] || echo "$NEW_ENV"
     } | $SUDO sh -c "umask 077; cat > ${FILE_ENV}.tmp && mv -f ${FILE_ENV}.tmp ${FILE_ENV}"
     $SUDO chmod 0600 ${FILE_ENV}
-    if $SUDO grep -qE '^(DISABLE_L7_TRACING|DISABLE_LOG_PARSING)=' ${FILE_ENV}; then
-        info "env: DISABLE_L7_TRACING/DISABLE_LOG_PARSING no longer have an effect: L7 traces and"
-        info "     log parsing are off by default. Set EBPF_L7_TRACES_ENABLED / CONTAINER_LOG_PARSING_ENABLED instead."
-    fi
 }
 
 create_systemd_service_file() {

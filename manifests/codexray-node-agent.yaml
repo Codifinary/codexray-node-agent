@@ -132,25 +132,23 @@ spec:
             - name: API_KEY
               valueFrom:
                 secretKeyRef: {name: codexray-agent, key: api-key}
-            # Telemetry categories (shown explicitly; these are the defaults: only node metrics on).
-            # Set a category to "true" to turn it on. See docs/FEATURE-FLAGS.md.
+            # Telemetry categories (shown explicitly; these are the defaults: everything on).
+            # Set a category to "false" to turn it off. See docs/FEATURE-FLAGS.md.
             - {name: NODE_METRICS_ENABLED, value: "true"}
-            # Off by default: pod CPU/memory comes from the cluster agent. Set "true" if dashboards
-            # use container_resources_* (the CodeXray UI node disk panels currently do).
-            - {name: CONTAINER_RESOURCE_METRICS_ENABLED, value: "false"}
-            - {name: EBPF_L7_METRICS_ENABLED, value: "false"}
-            - {name: EBPF_L7_TRACES_ENABLED, value: "false"}
+            - {name: CONTAINER_RESOURCE_METRICS_ENABLED, value: "true"}
+            - {name: EBPF_L7_METRICS_ENABLED, value: "true"}
+            - {name: EBPF_L7_TRACES_ENABLED, value: "true"}
             - {name: TRACES_SAMPLING, value: "1.0"}
             # Adaptive sampling: keep all error spans and spans slower than TRACES_SLOW_THRESHOLD,
             # sample the rest at TRACES_SAMPLING.
             - {name: TRACES_ADAPTIVE_SAMPLING_ENABLED, value: "false"}
             - {name: TRACES_SLOW_THRESHOLD, value: "500ms"}
-            - {name: CONTAINER_LOG_COLLECTION_ENABLED, value: "false"}
+            - {name: CONTAINER_LOG_COLLECTION_ENABLED, value: "true"}
             # With log collection on: export only this level and above (all|debug|info|warning|error|critical).
             - {name: CONTAINER_LOG_MIN_LEVEL, value: "all"}
             - {name: CONTAINER_LOG_KEEP_UNKNOWN_LEVEL, value: "false"}
-            - {name: CONTAINER_LOG_PARSING_ENABLED, value: "false"}
-            - {name: PROFILING_ENABLED, value: "false"}
+            - {name: CONTAINER_LOG_PARSING_ENABLED, value: "true"}
+            - {name: PROFILING_ENABLED, value: "true"}
             # Memory safeguards and diagnostics
             - {name: GO_MEMORY_LIMIT_RATIO, value: "0.7"}
             - {name: MEMORY_WATCHDOG_THRESHOLD_RATIO, value: "0.8"}

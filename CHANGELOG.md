@@ -41,16 +41,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   services; narrow them per cluster. `install.sh` stops with an explanation when
   `CONTAINER_ALLOWLIST` is neither passed nor already in the env file, instead of installing a
   unit that restarts forever. See docs/DEPLOYMENT.md, step 5.
-- **Only node metrics are on by default.** `EBPF_L7_METRICS_ENABLED`, `EBPF_L7_TRACES_ENABLED`,
-  `CONTAINER_LOG_COLLECTION_ENABLED`, `CONTAINER_LOG_PARSING_ENABLED` and `PROFILING_ENABLED` now
-  default to `false`, like `CONTAINER_RESOURCE_METRICS_ENABLED`. Set each to `true` to keep it.
-  The legacy `DISABLE_L7_TRACING` / `DISABLE_LOG_PARSING` no longer change anything on top of
-  these defaults. TCP connection metrics (service map, network connectivity) are unaffected.
 - **`SCRAPE_INTERVAL` now defaults to `20s`** (was `15s`): the agent gathers and sends its metrics
   every 20 s. Set `SCRAPE_INTERVAL=15s` to keep the old rate.
-- **`CONTAINER_RESOURCE_METRICS_ENABLED` now defaults to `false`.** Pod CPU/memory comes from
-  the cluster agent. Set it to `true` to keep `container_resources_*`; the CodeXray UI node
-  disk panels currently depend on them.
 - **`MIN_CONTAINER_AGE`** behavior is now explicit: it gates metrics only (unchanged);
   `MIN_CONTAINER_AGE_APPLIES_TO=all` also drops logs and traces of young containers.
 
@@ -93,8 +85,8 @@ until the soak/canary criteria in [docs/SOAK-TEST.md](docs/SOAK-TEST.md) pass.
 - **Telemetry settings:** `NODE_METRICS_ENABLED`, `CONTAINER_RESOURCE_METRICS_ENABLED`,
   `EBPF_L7_METRICS_ENABLED`, `EBPF_L7_TRACES_ENABLED`, `CONTAINER_LOG_COLLECTION_ENABLED`,
   `CONTAINER_LOG_PARSING_ENABLED`, `PROFILING_ENABLED`. Legacy `DISABLE_L7_TRACING` and
-  `DISABLE_LOG_PARSING` keep their meaning unless a new setting is set explicitly. No defaults
-  change. See [docs/FEATURE-FLAGS.md](docs/FEATURE-FLAGS.md).
+  `DISABLE_LOG_PARSING` keep their meaning (L7 metrics and traces off; log collection and parsing
+  off) unless a new setting is set explicitly. Every category stays on by default, as before. See [docs/FEATURE-FLAGS.md](docs/FEATURE-FLAGS.md).
 - **Self-observability:** Go runtime/process/cgroup-memory collectors and `node_agent_*`
   health metrics (active containers/processes/uprobes/log parsers, queue depth, perf lost
   samples, drops, export failures, profiling, spool size, feature state).

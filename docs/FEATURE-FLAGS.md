@@ -12,16 +12,19 @@ is never silently defaulted.
 | Setting (flag / env) | Default | Controls | Not affected |
 |---|---|---|---|
 | `--node-metrics-enabled` / `NODE_METRICS_ENABLED` | `true` | `node_*` CPU, memory, load, disk I/O, filesystem, network, uptime, cloud info | Everything else |
-| `--container-resource-metrics-enabled` / `CONTAINER_RESOURCE_METRICS_ENABLED` | **`false`** | `container_resources_*`: CPU usage/limit/throttling/delay, memory RSS/cache/limit, PSI, disk size/usage/IO, GPU. Also skips the cgroup and taskstats reads behind them | Container discovery, process attribution, `container_info`, `container_restarts_total`, `container_oom_kills_total`, network, L7, logs, traces, profiling, JVM/.NET/Python/Node.js runtime metrics |
-| `--ebpf-l7-metrics-enabled` / `EBPF_L7_METRICS_ENABLED` | **`false`** | `container_<protocol>_requests_total` / `_duration_*` RED metrics | Traces |
-| `--ebpf-l7-traces-enabled` / `EBPF_L7_TRACES_ENABLED` | **`false`** | L7 spans (sampled, see Trace sampling). Off: tracer not initialized, no span allocation | L7 metrics. The L7 eBPF programs and TLS uprobes stay loaded while either L7 setting is on |
-| `--container-log-collection-enabled` / `CONTAINER_LOG_COLLECTION_ENABLED` | **`false`** | Tailing and OTLP export of container/journald logs | Tracing, metrics |
+| `--container-resource-metrics-enabled` / `CONTAINER_RESOURCE_METRICS_ENABLED` | `true` | `container_resources_*`: CPU usage/limit/throttling/delay, memory RSS/cache/limit, PSI, disk size/usage/IO, GPU. Also skips the cgroup and taskstats reads behind them | Container discovery, process attribution, `container_info`, `container_restarts_total`, `container_oom_kills_total`, network, L7, logs, traces, profiling, JVM/.NET/Python/Node.js runtime metrics |
+| `--ebpf-l7-metrics-enabled` / `EBPF_L7_METRICS_ENABLED` | `true`¹ | `container_<protocol>_requests_total` / `_duration_*` RED metrics | Traces |
+| `--ebpf-l7-traces-enabled` / `EBPF_L7_TRACES_ENABLED` | `true`¹ | L7 spans (sampled, see Trace sampling). Off: tracer not initialized, no span allocation | L7 metrics. The L7 eBPF programs and TLS uprobes stay loaded while either L7 setting is on |
+| `--container-log-collection-enabled` / `CONTAINER_LOG_COLLECTION_ENABLED` | `true`² | Tailing and OTLP export of container/journald logs | Tracing, metrics |
 | `--container-log-min-level` / `CONTAINER_LOG_MIN_LEVEL` | `all` | Least severe level exported when log collection is on: `all`, `debug`, `info`, `warning`, `error`, `critical`. Lines with no detectable level are dropped unless `CONTAINER_LOG_KEEP_UNKNOWN_LEVEL=true`. Drops counted in `node_agent_dropped_total{component="logs"}` | Log parsing metrics |
-| `--container-log-parsing-enabled` / `CONTAINER_LOG_PARSING_ENABLED` | **`false`** | Pattern extraction and `container_log_messages_total` | Log export |
-| `--profiling-enabled` / `PROFILING_ENABLED` | **`false`** | eBPF CPU profiler (session, symbolization, JVM perf-map dumps, process handoff). Also requires a profiles endpoint | L7 tracing, dependency detection, TLS uprobes |
+| `--container-log-parsing-enabled` / `CONTAINER_LOG_PARSING_ENABLED` | `true`² | Pattern extraction and `container_log_messages_total` | Log export |
+| `--profiling-enabled` / `PROFILING_ENABLED` | `true` | eBPF CPU profiler (session, symbolization, JVM perf-map dumps, process handoff). Also requires a profiles endpoint | L7 tracing, dependency detection, TLS uprobes |
 
-**Only node metrics are on by default.** Every other category is opt-in: set its setting to `true`.
-With both L7 settings off, the L7 eBPF programs and TLS/Go uprobes are not loaded; TCP connection
+¹ `false` when the legacy `DISABLE_L7_TRACING=true` is set and the setting itself is not.
+² `false` when the legacy `DISABLE_LOG_PARSING=true` is set and the setting itself is not.
+
+**Every category is on by default, as in earlier releases.** Set a category to `false` to turn
+it off. With both L7 settings off, the L7 eBPF programs and TLS/Go uprobes are not loaded; TCP connection
 metrics (used for the service map and network connectivity) are not L7 settings and stay on.
 With both log settings off, no tailers, journald reader, parsers or log exporter are created.
 
@@ -56,29 +59,15 @@ sampling keeps all failures and slow requests and 10% of the fast successful one
 
 | Existing setting | Behavior after upgrade | New equivalent |
 |---|---|---|
-| `DISABLE_L7_TRACING=true` | No effect beyond the new default (L7 off). An explicit new L7 setting wins | `EBPF_L7_METRICS_ENABLED=false` + `EBPF_L7_TRACES_ENABLED=false` |
-| `DISABLE_LOG_PARSING=true` | No effect beyond the new default (logs off). An explicit new log setting wins | `CONTAINER_LOG_COLLECTION_ENABLED=false` + `CONTAINER_LOG_PARSING_ENABLED=false` |
+| `DISABLE_L7_TRACING=true` | Unchanged: L7 metrics and traces off. An explicit new L7 setting wins | `EBPF_L7_METRICS_ENABLED=false` + `EBPF_L7_TRACES_ENABLED=false` |
+| `DISABLE_LOG_PARSING=true` | Unchanged: log collection and parsing off. An explicit new log setting wins | `CONTAINER_LOG_COLLECTION_ENABLED=false` + `CONTAINER_LOG_PARSING_ENABLED=false` |
 | `TRACES_SAMPLING` | Unchanged; applies when traces are enabled. With adaptive sampling it is the rate for spans that are neither errors nor slow | `TRACES_ADAPTIVE_SAMPLING_ENABLED=true` |
 | `MIN_CONTAINER_AGE` | Unchanged; suppresses **metrics** of young containers. Their logs and traces are still exported (crash logs of short-lived job pods are kept for RCA) | `MIN_CONTAINER_AGE_APPLIES_TO=all` also drops their logs and eBPF traces |
-| Container resource metrics, L7 metrics and traces, log collection and parsing, profiling all on by default | **Changed: all off by default.** Set each one to `true` to keep it | `CONTAINER_RESOURCE_METRICS_ENABLED`, `EBPF_L7_METRICS_ENABLED`, `EBPF_L7_TRACES_ENABLED`, `CONTAINER_LOG_COLLECTION_ENABLED`, `CONTAINER_LOG_PARSING_ENABLED`, `PROFILING_ENABLED` |
 | Agent metrics gathered every 15 s | **Changed: every 20 s** | `SCRAPE_INTERVAL=15s` |
 
-**Defaults change in this release: only node metrics are on, and `SCRAPE_INTERVAL` is `20s`.**
-To keep the previous behaviour, set every category you use to `true` explicitly, for example:
-
-```
-CONTAINER_RESOURCE_METRICS_ENABLED=true  EBPF_L7_METRICS_ENABLED=true  EBPF_L7_TRACES_ENABLED=true
-CONTAINER_LOG_COLLECTION_ENABLED=true    CONTAINER_LOG_PARSING_ENABLED=true  PROFILING_ENABLED=true
-```
-
-Pod-level CPU and memory come from the cluster agent (`codexray_pod_*`). Container discovery,
-process attribution, `container_info`, restarts/OOM kills and TCP connection metrics stay on.
-
-> **Before upgrading:** service request rates and latencies, traces, logs, profiles and
-> `container_resources_*` stop unless their settings are set to `true`. Any dashboard built on
-> them goes empty. That includes the CodeXray UI's node disk panels, which are built from
-> `container_resources_disk_*`: set `CONTAINER_RESOURCE_METRICS_ENABLED=true` until those panels
-> read node-level data.
+**Default change in this release: `SCRAPE_INTERVAL` is `20s`.** Every telemetry category keeps
+its previous default (on). To reduce volume or memory, turn off the categories you do not use, for
+example `PROFILING_ENABLED=false` or `CONTAINER_LOG_COLLECTION_ENABLED=false`.
 
 Boolean flags also accept `--flag=false` / `--flag=true` (rewritten to `--no-flag` / `--flag`
 before parsing).
