@@ -30,6 +30,21 @@ func TestTargetFinderReconcileRemovesExitedProcesses(t *testing.T) {
 	require.Equal(t, 100.0, testutil.ToFloat64(diag.ProfilingTargets))
 }
 
+// A PID that dies and is reused (and re-registered) while reconcile stats /proc must keep
+// the new registration.
+func TestTargetFinderReconcileKeepsReusedPid(t *testing.T) {
+	tf := &TargetFinder{processes: map[uint32]*processInfo{}}
+	tf.add(containers.ProcessInfo{Pid: 7, ContainerId: "/k8s/ns/pod/old", StartedAt: time.Now()})
+	old := tf.processes[7]
+	tf.reconcile(func(pid uint32) bool {
+		// The old process is gone; a new process with the same PID is handed over meanwhile.
+		tf.add(containers.ProcessInfo{Pid: 7, ContainerId: "/k8s/ns/pod/new", StartedAt: time.Now()})
+		return false
+	})
+	require.NotNil(t, tf.processes[7], "the new process is kept")
+	require.NotSame(t, old, tf.processes[7])
+}
+
 func TestTargetFinderFindTargetRespectsMinAgeAndIsConcurrencySafe(t *testing.T) {
 	tf := &TargetFinder{processes: map[uint32]*processInfo{}}
 	now := time.Now()

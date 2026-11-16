@@ -364,23 +364,31 @@ func (tf *TargetFinder) Update(_ sd.TargetsOptions) {
 // over after their exit event was processed were never removed at all, so without this the
 // map grew with process churn (exec probes, cron jobs, short-lived tools).
 func (tf *TargetFinder) reconcile(exists func(pid uint32) bool) {
+	type entry struct {
+		pid uint32
+		pi  *processInfo
+	}
 	tf.lock.Lock()
-	pids := make([]uint32, 0, len(tf.processes))
-	for pid := range tf.processes {
-		pids = append(pids, pid)
+	snapshot := make([]entry, 0, len(tf.processes))
+	for pid, pi := range tf.processes {
+		snapshot = append(snapshot, entry{pid, pi})
 	}
 	tf.lock.Unlock()
 
-	var dead []uint32
-	for _, pid := range pids {
-		if !exists(pid) {
-			dead = append(dead, pid)
+	var dead []entry
+	for _, e := range snapshot {
+		if !exists(e.pid) {
+			dead = append(dead, e)
 		}
 	}
 
 	tf.lock.Lock()
-	for _, pid := range dead {
-		delete(tf.processes, pid)
+	for _, e := range dead {
+		// The PID may have been reused and a new process registered since the snapshot:
+		// remove only the entry that was seen dead.
+		if tf.processes[e.pid] == e.pi {
+			delete(tf.processes, e.pid)
+		}
 	}
 	n := len(tf.processes)
 	tf.lock.Unlock()
