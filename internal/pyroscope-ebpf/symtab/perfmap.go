@@ -36,16 +36,23 @@ var (
 	PerfMapBytesParsed  atomic.Int64
 )
 
-// NewPerfMap loads the perf map of pid. prev, if non-nil, is returned as-is when the file
-// has not changed since it was parsed.
-func NewPerfMap(pid int, prev *PerfMap) (*PerfMap, error) {
+// NewPerfMap loads the perf map of pid. cur points at the caller's current table: it is
+// returned as-is when the file has not changed since it was parsed. Otherwise *cur is cleared
+// before parsing, so the old table can be collected while the new one is built (a large JVM
+// map would otherwise be held twice at the peak).
+func NewPerfMap(pid int, cur **PerfMap) (*PerfMap, error) {
 	nsPid := getNsPid(pid)
 
 	perfMapPath := fmt.Sprintf("/proc/%d/root/tmp/perf-%d.map", pid, nsPid)
-	return loadPerfMap(perfMapPath, prev)
+	return loadPerfMap(perfMapPath, cur)
 }
 
-func loadPerfMap(perfMapPath string, prev *PerfMap) (*PerfMap, error) {
+func loadPerfMap(perfMapPath string, cur **PerfMap) (*PerfMap, error) {
+	var prev *PerfMap
+	if cur != nil {
+		prev = *cur
+		*cur = nil // the caller's reference is dropped unless the table is reused
+	}
 	f, err := os.Open(perfMapPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -62,6 +69,7 @@ func loadPerfMap(perfMapPath string, prev *PerfMap) (*PerfMap, error) {
 		PerfMapReused.Add(1)
 		return prev, nil
 	}
+	prev = nil // the last reference held here: free it before parsing
 	if MaxPerfMapSize > 0 && fi.Size() > MaxPerfMapSize {
 		// Not an error: an error would mark the whole ProcTable as failed and stop refreshing
 		// its ELF mappings. Native frames keep resolving; only JIT frames are left unknown.
