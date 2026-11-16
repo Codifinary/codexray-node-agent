@@ -43,8 +43,12 @@ show_help() {
     echo "  -b PATH, --binary PATH            Install this local binary instead of downloading a release"
     echo "  -m 2G, --memory-max 2G            systemd MemoryMax for the agent (default: 2G; 'infinity' for no cap)"
     echo ""
-    echo "Agent settings (COLLECTOR_ENDPOINT, API_KEY, EBPF_L7_TRACES_ENABLED, ...) are read from the"
-    echo "environment, e.g.: sudo COLLECTOR_ENDPOINT=http://host:8182/ingest API_KEY=... sh install.sh"
+    echo "Agent settings (COLLECTOR_ENDPOINT, API_KEY, CONTAINER_ALLOWLIST, EBPF_L7_TRACES_ENABLED, ...) are"
+    echo "read from the environment, e.g.:"
+    echo "  sudo COLLECTOR_ENDPOINT=http://host:8182/ingest API_KEY=... \\"
+    echo "       CONTAINER_ALLOWLIST='^/system.slice/(nginx|postgresql)[.]service\$' sh install.sh"
+    echo "CONTAINER_ALLOWLIST is required (since v1.4.0): one regex on the cgroup path of the services or"
+    echo "containers to monitor; use alternation (a|b) for several, and [.] rather than a backslash."
     echo "On upgrade, settings already in ${FILE_ENV} are kept unless set again."
 }
 
@@ -202,6 +206,19 @@ systemd_disable() {
 # Writes ${FILE_ENV}: settings exported to this script replace the same names in the
 # existing file; everything else in the existing file is kept, so an upgrade does not
 # drop the API key or endpoint. The file is root-only (0600) because it holds API_KEY.
+# The agent exits at startup without a container allowlist (required since v1.4.0). Check before
+# anything is changed, so a missing allowlist never leaves a stopped service or a unit that
+# restarts forever. It may come from this run's environment or the existing env file.
+verify_allowlist() {
+    if [ -n "${CONTAINER_ALLOWLIST}" ]; then
+        return
+    fi
+    if $SUDO grep -qE "^CONTAINER_ALLOWLIST=['\"]?[^'\"]" ${FILE_ENV} 2>/dev/null; then
+        return
+    fi
+    fatal "CONTAINER_ALLOWLIST is required: set it to a regex for the services or containers to monitor, e.g. CONTAINER_ALLOWLIST='^/system.slice/(nginx|postgresql)[.]service\$'"
+}
+
 create_env_file() {
     info "env: Updating environment file ${FILE_ENV}"
     NEW_ENV=$(sh -c export | while read x v; do echo "$v"; done | grep -E "${ENV_VARS}" || true)
@@ -324,6 +341,7 @@ done
 
 {
     verify_system
+    verify_allowlist
     download
     create_uninstall
     systemd_disable

@@ -22,6 +22,17 @@ Nothing here deploys automatically. Every step is run by an operator and can be 
    the key was an argument, **rotate the key**.
 4. Build and push the new images from the release commits, using the regular images rather
    than the `-debug` variants.
+5. **Set the container allowlist.** Since v1.4.0 the agent exits at startup without
+   `--container-allowlist` / `CONTAINER_ALLOWLIST` (regexes on the cgroup path; `*` is rejected).
+   - Kubernetes: one `--container-allowlist=` argument per pattern. The shipped manifests cover
+     every pod (`^/k8s/`) plus the kubelet and container runtime services; narrow them to the
+     namespaces you monitor, e.g. `^/k8s/<namespace>/`.
+   - systemd hosts: `install.sh` refuses to install without it. Give one regex and use
+     alternation for several services, e.g.
+     `CONTAINER_ALLOWLIST='^/system.slice/(nginx|postgresql)[.]service$'`. Use `[.]` rather than
+     a backslash, which the installer's env handling strips. Several patterns in the env var form
+     must be separated by newlines, which an env file can't hold on one line.
+   - If the running agent has no allowlist, add one in the same rollout as the upgrade.
 
 ## 1. Canary: one failing worker
 
