@@ -111,3 +111,16 @@ func TestIsTransientFileError(t *testing.T) {
 	require.True(t, isTransientFileError(err))
 	require.False(t, isTransientFileError(errors.New("not a Go executable")))
 }
+
+func TestOpensslVersionTransientNotCached(t *testing.T) {
+	dir := t.TempDir()
+	r := loadOpensslVersion(filepath.Join(dir, "libcrypto.so.3")) // vanished with its process
+	require.Equal(t, "", r.version)
+	require.True(t, r.transient)
+
+	notElf := filepath.Join(dir, "libcrypto.so.1")
+	require.NoError(t, os.WriteFile(notElf, []byte("not an elf file"), 0o644))
+	r = loadOpensslVersion(notElf) // a definite answer: cached
+	require.Equal(t, "", r.version)
+	require.False(t, r.transient)
+}

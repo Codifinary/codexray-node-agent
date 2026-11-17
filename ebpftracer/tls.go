@@ -292,7 +292,14 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 
 // opensslVersionCache avoids reading libcrypto's .rodata (megabytes) for every process
 // that maps the same library file.
-var opensslVersionCache = newFileInfoCache[string](256)
+// Results of transient file errors are not cached: libcrypto is shared by most processes on
+// the node, so one process exiting mid-read would otherwise disable OpenSSL uprobes node-wide.
+var opensslVersionCache = newFileInfoCache[opensslVersionResult](256)
+
+type opensslVersionResult struct {
+	version   string
+	transient bool
+}
 
 func getSslLibPathAndVersion(pid uint32) (string, string) {
 	f, err := os.Open(proc.Path(pid, "maps"))
@@ -331,26 +338,33 @@ func getSslLibPathAndVersion(pid uint32) (string, string) {
 		return "", ""
 	}
 
-	version, _ := opensslVersionCache.get(libcryptoPath, readOpensslVersion)
+	res, _ := opensslVersionCache.getIf(libcryptoPath, loadOpensslVersion,
+		func(r opensslVersionResult) bool { return !r.transient })
+	version := res.version
 	if version == "" {
 		return "", ""
 	}
 	return libsslPath, version
 }
 
-func readOpensslVersion(libcryptoPath string) string {
+func loadOpensslVersion(libcryptoPath string) opensslVersionResult {
+	v, err := readOpensslVersion(libcryptoPath)
+	return opensslVersionResult{version: v, transient: err != nil && isTransientFileError(err)}
+}
+
+func readOpensslVersion(libcryptoPath string) (string, error) {
 	ef, err := elf.Open(libcryptoPath)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	defer ef.Close()
 	rodataSection := ef.Section(".rodata")
 	if rodataSection == nil {
-		return ""
+		return "", nil
 	}
 	rodataSectionData, err := rodataSection.Data()
 	if err != nil {
-		return ""
+		return "", err
 	}
 	var version string
 	for _, b := range bytes.Split(rodataSectionData, []byte("\x00")) {
@@ -365,5 +379,5 @@ func readOpensslVersion(libcryptoPath string) string {
 			version = m[1]
 		}
 	}
-	return "v" + version
+	return "v" + version, nil
 }
