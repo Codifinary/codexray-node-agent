@@ -49,8 +49,9 @@ show_help() {
     echo "read from the environment, e.g.:"
     echo "  sudo COLLECTOR_ENDPOINT=http://host:8182/ingest API_KEY=... \\"
     echo "       CONTAINER_ALLOWLIST='^/system.slice/(nginx|postgresql)[.]service\$' sh install.sh"
-    echo "CONTAINER_ALLOWLIST is required (since v1.4.0): one regex on the cgroup path of the services or"
-    echo "containers to monitor; use alternation (a|b) for several, and [.] rather than a backslash."
+    echo "CONTAINER_ALLOWLIST is required (since v1.4.0): one regex on the container ID (/system.slice/<unit>,"
+    echo "/docker/<name>, ...) of the services or containers to monitor; use alternation (a|b) for several,"
+    echo "and [.] rather than a backslash."
     echo "On upgrade, settings already in ${FILE_ENV} are kept unless set again, and so are the"
     echo "existing unit's MemoryMax, LISTEN and WAL_DIR."
 }

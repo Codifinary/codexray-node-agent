@@ -96,7 +96,8 @@ until the soak/canary criteria in [docs/SOAK-TEST.md](docs/SOAK-TEST.md) pass.
 - **Node metrics:** `node_filesystem_*` (capacity, available, free, inodes, read-only; bind
   mounts de-duplicated; configurable exclusions; `NODE_FS_MAX_MOUNTS`), labelled
   `mountpoint`, `device`, `fstype` like node-exporter, and `node_load1` / `node_load5` /
-  `node_load15`.
+  `node_load15`. On hosts that also run Codexray's node-exporter, run only one of the two for node
+  metrics: the backend currently shows load twice for such a node.
 - Soak-test workloads and scripts (`scripts/soak/`), deployment/canary/rollback guide.
 
 ### Upgrade notes

@@ -28,6 +28,13 @@ it off. With both L7 settings off, the L7 eBPF programs and TLS/Go uprobes are n
 metrics (used for the service map and network connectivity) are not L7 settings and stay on.
 With both log settings off, no tailers, journald reader, parsers or log exporter are created.
 
+**Node metrics and node-exporter:** `node_filesystem_*` and `node_load1/5/15` use the
+node-exporter names and labels. They don't collide on ingestion (the agent's series carry their own
+`job` and `instance`), but if a host also runs Codexray's node-exporter and both resolve to the
+same node, the backend currently lists that node's 1m/5m/15m load twice. Run one source of node
+metrics per host (`NODE_METRICS_ENABLED=false` on the agent, or no node-exporter) until the backend
+merges them.
+
 `node_agent_feature_enabled{feature}` reports the **effective** value of each setting.
 
 ### Interactions
