@@ -19,6 +19,9 @@ type L7Metrics struct {
 }
 
 func (m *L7Metrics) observe(status, method string, duration time.Duration) {
+	if m == nil {
+		return
+	}
 	if m.Requests != nil {
 		var err error
 		var c prometheus.Counter
@@ -61,7 +64,7 @@ func (s L7Stats) get(protocol l7.Protocol, key common.DestinationKey) *L7Metrics
 		default:
 			hOpts := L7Latency[protocol]
 			m.Latency = prometheus.NewHistogram(
-				prometheus.HistogramOpts{Name: hOpts.Name, Help: hOpts.Help, ConstLabels: constLabels},
+				prometheus.HistogramOpts{Name: hOpts.Name, Help: hOpts.Help, ConstLabels: constLabels, Buckets: common.L7LatencyBuckets},
 			)
 		}
 		cOpts := L7Requests[protocol]

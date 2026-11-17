@@ -1,0 +1,186 @@
+# Soak-test workloads for the node agent. Apply to a TEST cluster (or a canary node via
+# nodeSelector), never to production namespaces:
+#   kubectl label node <canary-node> codexray.io/soak=true
+#   kubectl apply -f scripts/soak/workloads.yaml
+# Delete with: kubectl delete ns cx-soak
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cx-soak
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: soak-src
+  namespace: cx-soak
+data:
+  load.go: |
+    package main
+
+    import (
+      "crypto/tls"
+      "io"
+      "net/http"
+      "net/http/httptest"
+      "time"
+    )
+
+    // HTTP + HTTPS (Go crypto/tls) request loop: L7 metrics, traces and Go TLS uprobes.
+    func main() {
+      h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if r.URL.Path == "/err" { w.WriteHeader(500) }
+        _, _ = w.Write([]byte("ok"))
+      })
+      plain, secure := httptest.NewServer(h), httptest.NewTLSServer(h)
+      c := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, DisableKeepAlives: true}}
+      paths := []string{"/a", "/b", "/err"}
+      for i := 0; ; i++ {
+        for _, base := range []string{plain.URL, secure.URL} {
+          if resp, err := c.Get(base + paths[i%3]); err == nil {
+            _, _ = io.Copy(io.Discard, resp.Body); resp.Body.Close()
+          }
+        }
+        time.Sleep(5 * time.Millisecond)
+      }
+    }
+  Main.java: |
+    import java.util.*;
+    import java.util.function.*;
+    // CPU-bound JVM with many JIT-compiled methods: exercises profiling and JVM perf maps.
+    public class Main {
+      public static void main(String[] a) throws Exception {
+        List<Function<Long, Long>> fs = new ArrayList<>();
+        for (int i = 0; i < 2000; i++) { final int k = i; fs.add(x -> x * 31 + k); }
+        long acc = 0;
+        while (true) { for (Function<Long, Long> f : fs) acc = f.apply(acc); if (acc == 42) System.out.println(acc); }
+      }
+    }
+  busy.py: |
+    import math, time
+    while True:
+        s = 0
+        for i in range(200000): s += math.sqrt(i)
+        time.sleep(0.01)
+---
+# Process churn + exec probes (each probe is a new process).
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: process-churn, namespace: cx-soak}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: process-churn}}
+  template:
+    metadata: {labels: {app: process-churn}}
+    spec:
+      nodeSelector: {codexray.io/soak: "true"}
+      containers:
+        - name: churn
+          image: busybox:1.36
+          command: ["sh", "-c", "while true; do sh -c 'ls / >/dev/null'; sleep 0.05; done"]
+          livenessProbe: {exec: {command: ["sh", "-c", "true"]}, periodSeconds: 2}
+          resources: {requests: {cpu: 50m, memory: 16Mi}, limits: {memory: 64Mi}}
+---
+# Short-lived pods (below MIN_CONTAINER_AGE) and failing jobs.
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: short-lived, namespace: cx-soak}
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Allow
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      parallelism: 10
+      completions: 10
+      backoffLimit: 2
+      template:
+        spec:
+          nodeSelector: {codexray.io/soak: "true"}
+          restartPolicy: Never
+          containers:
+            - name: job
+              image: busybox:1.36
+              command: ["sh", "-c", "echo start; sleep 3; [ $((RANDOM % 4)) -ne 0 ] || exit 1"]
+              resources: {requests: {cpu: 10m, memory: 8Mi}, limits: {memory: 32Mi}}
+---
+# Busy HTTP/HTTPS service; restarted every 60s so TLS uprobes attach/detach continuously.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: busy-http, namespace: cx-soak}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: busy-http}}
+  template:
+    metadata: {labels: {app: busy-http}}
+    spec:
+      nodeSelector: {codexray.io/soak: "true"}
+      initContainers:
+        - name: build
+          image: golang:1.25-alpine
+          command: ["sh", "-c", "cd /src && go build -o /bin-out/load load.go"]
+          volumeMounts: [{name: src, mountPath: /src}, {name: bin, mountPath: /bin-out}]
+      containers:
+        - name: load
+          image: alpine:3.20
+          command: ["sh", "-c", "while true; do timeout 60 /bin-out/load; done"]
+          volumeMounts: [{name: bin, mountPath: /bin-out}]
+          resources: {requests: {cpu: 200m, memory: 64Mi}, limits: {memory: 256Mi}}
+      volumes:
+        - {name: src, configMap: {name: soak-src}}
+        - {name: bin, emptyDir: {}}
+---
+# High-volume logs with multiline stack traces and ever-new error patterns.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: log-flood, namespace: cx-soak}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: log-flood}}
+  template:
+    metadata: {labels: {app: log-flood}}
+    spec:
+      nodeSelector: {codexray.io/soak: "true"}
+      containers:
+        - name: logs
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              i=0
+              while true; do
+                i=$((i+1))
+                echo "$(date -Iseconds) ERROR order service failed for tenant t$((i % 5000)) code E$((i % 997))"
+                echo "java.lang.IllegalStateException: request $i rejected"
+                echo "    at com.example.orders.Service.handle(Service.java:$((i % 400)))"
+                echo "    at com.example.orders.Controller.post(Controller.java:88)"
+                echo "$(date -Iseconds) WARN slow query on table_$((i % 300)) took $((i % 5000))ms"
+                echo "$(date -Iseconds) INFO request served in $((i % 100))ms"
+                usleep 2000
+              done
+          resources: {requests: {cpu: 100m, memory: 16Mi}, limits: {memory: 64Mi}}
+---
+# Profiling targets: JVM (perf maps), Python, Go (busy-http).
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: profiled-runtimes, namespace: cx-soak}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: profiled-runtimes}}
+  template:
+    metadata: {labels: {app: profiled-runtimes}}
+    spec:
+      nodeSelector: {codexray.io/soak: "true"}
+      containers:
+        - name: java
+          image: eclipse-temurin:21-jdk
+          command: ["java", "/src/Main.java"]
+          volumeMounts: [{name: src, mountPath: /src}]
+          resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
+        - name: python
+          image: python:3.12-slim
+          command: ["python", "/src/busy.py"]
+          volumeMounts: [{name: src, mountPath: /src}]
+          resources: {requests: {cpu: 100m, memory: 32Mi}, limits: {memory: 128Mi}}
+      volumes: [{name: src, configMap: {name: soak-src}}]

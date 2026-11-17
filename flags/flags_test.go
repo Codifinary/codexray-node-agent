@@ -4,6 +4,9 @@ import (
 	"os"
 	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 func TestNormalizeLegacyStatsDArgs(t *testing.T) {
@@ -77,4 +80,42 @@ func restoreEnv(t *testing.T, name string) {
 		}
 		_ = os.Unsetenv(name)
 	})
+}
+
+func TestNormalizeBoolArgs(t *testing.T) {
+	app := kingpin.New("t", "")
+	crm := app.Flag("container-resource-metrics-enabled", "").Default("false").Bool()
+	pinger := app.Flag("disable-pinger", "").Default("false").Bool()
+	l7 := &OptionalBool{}
+	app.Flag("ebpf-l7-traces-enabled", "").SetValue(l7)
+	name := app.Flag("provider", "").String()
+
+	args := NormalizeBoolArgs(app.Model(), []string{
+		"--container-resource-metrics-enabled=true", "--disable-pinger=false", "--ebpf-l7-traces-enabled=false", "--provider=false",
+	})
+	assert.Equal(t, []string{"--container-resource-metrics-enabled", "--no-disable-pinger", "--no-ebpf-l7-traces-enabled", "--provider=false"}, args)
+	_, err := app.Parse(args)
+	assert.NoError(t, err)
+	assert.True(t, *crm)
+	assert.False(t, *pinger)
+	assert.True(t, l7.set, "tri-state flag is explicitly set")
+	assert.False(t, l7.value)
+	assert.Equal(t, "false", *name)
+
+	assert.Equal(t, []string{"--disable-pinger=maybe", "--", "--disable-pinger=false"},
+		NormalizeBoolArgs(app.Model(), []string{"--disable-pinger=maybe", "--", "--disable-pinger=false"}))
+}
+
+// container_resources_* are read by the backend, so they stay on by default.
+func TestContainerResourceMetricsDefaultOn(t *testing.T) {
+	f := kingpin.CommandLine.GetFlag("container-resource-metrics-enabled")
+	assert.NotNil(t, f)
+	assert.Equal(t, []string{"true"}, f.Model().Default)
+	assert.True(t, Telemetry.ContainerResourceMetrics)
+}
+
+func TestScrapeIntervalDefault(t *testing.T) {
+	f := kingpin.CommandLine.GetFlag("scrape-interval")
+	assert.NotNil(t, f)
+	assert.Equal(t, []string{"20s"}, f.Model().Default)
 }

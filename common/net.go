@@ -59,10 +59,29 @@ func init() {
 			from: uint16(from),
 			to:   uint16(to),
 		}
+		if w := EphemeralRangeWarning(uint16(from), uint16(to)); w != "" {
+			klog.Warningln(w)
+		}
 	}
 	var err error
 	if HttpFilter, err = newHttpFilter(*flags.ExcludeHTTPMetricsByPath); err != nil {
 		klog.Exitf("invalid HTTP filter: %s", err)
+	}
+	if v := flags.L7ActualDestination; v != nil && *v == "drop" {
+		DropActualDestination = true
+		klog.Infoln("l7-actual-destination: drop (network and L7 metrics aggregated by destination)")
+	}
+	if v := flags.L7LatencyBuckets; v != nil && *v != "" {
+		if L7LatencyBuckets, err = ParseLatencyBuckets(*v); err != nil {
+			klog.Exitf("invalid l7-latency-buckets: %s", err)
+		}
+		klog.Infoln("l7-latency-buckets:", L7LatencyBuckets)
+	}
+	if v := flags.DNSMaxDomainsPerContainer; v != nil {
+		if *v < 0 {
+			klog.Exitf("invalid dns-max-domains-per-container: %d", *v)
+		}
+		DNSMaxDomainsPerContainer = *v
 	}
 }
 
@@ -296,10 +315,25 @@ func newHttpFilter(patterns []string) (*httpFilter, error) {
 }
 
 func (f *httpFilter) ShouldBeSkipped(path string) bool {
+	if f == nil {
+		return false
+	}
 	for _, g := range f.globs {
 		if g.Match(path) {
 			return true
 		}
 	}
 	return false
+}
+
+// EphemeralRangeWarning explains the effect of an ephemeral range that reaches into service
+// ports. Connections whose destination or listen port falls inside the range are not tracked,
+// so a range like 1-65535 silently removes all network, L7 and trace data.
+func EphemeralRangeWarning(from, to uint16) string {
+	const lowestTypicalEphemeral = 10000 // service ports (80, 443, 3306, 5432, 6379, 8080, 9092...) sit below this
+	if from >= lowestTypicalEphemeral {
+		return ""
+	}
+	return fmt.Sprintf("ephemeral-port-range %d-%d includes service ports below %d: connections to services listening on ports %d-%d will NOT be tracked (no network/L7 metrics or traces). The Linux default is 32768-60999",
+		from, to, lowestTypicalEphemeral, from, min(to, lowestTypicalEphemeral-1))
 }

@@ -9,8 +9,9 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"flag"
+	"io"
 	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/containers"
+	"github.com/codifinary/codexray-node-agent/diag"
 	"github.com/codifinary/codexray-node-agent/dogstatsd"
 	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/codifinary/codexray-node-agent/gpu"
@@ -30,7 +32,9 @@ import (
 	"github.com/codifinary/codexray-node-agent/profiling"
 	"github.com/codifinary/codexray-node-agent/prom"
 	"github.com/codifinary/codexray-node-agent/tracing"
+	"github.com/codifinary/logparser"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"
@@ -115,10 +119,32 @@ func whitelistNodeExternalNetworks() {
 }
 
 func main() {
-	klog.LogToStderr(false)
-	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
+	// Registered first so it runs after every other deferred cleanup: a fatal runtime error
+	// (e.g. --listen already in use) must end in a non-zero exit, not a "Completed" pod.
+	exitCode := 0
+	defer func() {
+		if exitCode != 0 {
+			klog.Flush()
+			os.Exit(exitCode)
+		}
+	}()
+	setupLogging(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
 
 	klog.Infoln("agent version:", version)
+	diag.ApplyGoMemoryLimit(*flags.GoMemoryLimitRatio)
+	watchdogDir := *flags.MemoryWatchdogDir
+	if watchdogDir == "" {
+		watchdogDir = filepath.Join(*flags.WalDir, "diagnostics")
+	}
+	watchdog := diag.NewWatchdog(diag.WatchdogConfig{
+		Dir:            watchdogDir,
+		ThresholdBytes: uint64(*flags.MemoryWatchdogThreshold),
+		ThresholdRatio: *flags.MemoryWatchdogThresholdRatio,
+		MinInterval:    *flags.MemoryWatchdogMinInterval,
+		MaxDumps:       *flags.MemoryWatchdogMaxDumps,
+	})
+	watchdog.Start()
+	defer watchdog.Stop()
 
 	hostname, kv, err := uname()
 	if err != nil {
@@ -140,8 +166,26 @@ func main() {
 	machineId := machineID()
 	systemUuid := systemUUID()
 
-	tracing.Init(machineId, hostname, version)
-	logs.Init(machineId, hostname, version)
+	logparser.DefaultOptions = logparser.Options{
+		MaxPatterns:  *flags.LogPatternsMax,
+		MaxSampleLen: *flags.MaxLabelLength, // the exported sample label is truncated to this anyway
+	}
+
+	tm := flags.Telemetry
+	klog.Infof("telemetry: node_metrics=%t container_resource_metrics=%t l7_metrics=%t l7_traces=%t log_collection=%t log_parsing=%t profiling=%t",
+		tm.NodeMetrics, tm.ContainerResourceMetrics, tm.L7Metrics, tm.L7Traces, tm.LogCollection, tm.LogParsing, tm.Profiling)
+	logparser.DefaultOptions.DisablePatterns = !tm.LogParsing
+
+	if tm.L7Traces {
+		tracing.Init(machineId, hostname, version)
+	} else {
+		klog.Infoln("eBPF L7 traces disabled")
+	}
+	if tm.LogCollection {
+		logs.Init(machineId, hostname, version)
+	} else {
+		klog.Infoln("container log collection (export) disabled")
+	}
 
 	nodeCollector := node.NewCollector(hostname, kv)
 
@@ -151,8 +195,21 @@ func main() {
 		prometheus.Labels{"machine_id": machineId, "system_uuid": systemUuid},
 		registry,
 	)
-	if err := registerer.Register(nodeCollector); err != nil {
-		klog.Exitln(err)
+	registerRuntimeDiagnostics(registerer)
+	for name, enabled := range map[string]bool{
+		"node_metrics": tm.NodeMetrics, "container_resource_metrics": tm.ContainerResourceMetrics,
+		"ebpf_l7_metrics": tm.L7Metrics, "ebpf_l7_traces": tm.L7Traces,
+		"container_log_collection": tm.LogCollection, "container_log_parsing": tm.LogParsing,
+		"profiling": tm.Profiling,
+	} {
+		diag.SetFeature(name, enabled)
+	}
+	if tm.NodeMetrics {
+		if err := registerer.Register(nodeCollector); err != nil {
+			klog.Exitln(err)
+		}
+	} else {
+		klog.Infoln("node metrics disabled")
 	}
 
 	gpuCollector, err := gpu.NewCollector()
@@ -171,7 +228,12 @@ func main() {
 			registerer = prometheus.WrapRegistererWith(prometheus.Labels{"az": az, "region": region}, registerer)
 		}
 	}
-	processInfoCh := profiling.Init(machineId, hostname)
+	var processInfoCh chan<- containers.ProcessInfo
+	if tm.Profiling {
+		processInfoCh = profiling.Init(machineId, hostname)
+	} else {
+		klog.Infoln("profiling disabled")
+	}
 	cr, err := containers.NewRegistry(registerer, processInfoCh, gpuCollector.ProcessUsageSampleCh)
 	if err != nil {
 		klog.Exitln(err)
@@ -275,12 +337,15 @@ func main() {
 		klog.Exitln(err)
 	}
 
-	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	// A dedicated mux: the metrics listener is commonly reachable through hostPort, so it must
+	// not inherit handlers registered on http.DefaultServeMux (net/http/pprof used to be).
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	http.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if *flags.DogStatsDEnabled && (dogStatsDReceiver == nil || !dogStatsDReceiver.Ready() || dogStatsDPipeline == nil || !dogStatsDPipeline.Healthy()) {
 			http.Error(w, "dogstatsd pipeline not ready", http.StatusServiceUnavailable)
 			return
@@ -288,8 +353,12 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready\n"))
 	})
+	if err := diag.StartPprof(*flags.PprofListen, *flags.PprofAuthToken); err != nil {
+		klog.Errorln(err)
+	}
 	server := &http.Server{
 		Addr:              *flags.ListenAddress,
+		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
@@ -313,6 +382,7 @@ func main() {
 	case err := <-serverErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			klog.Errorln("HTTP server failed:", err)
+			exitCode = 1
 		}
 	}
 	if dogStatsDReceiver != nil {
@@ -324,6 +394,30 @@ func main() {
 		if err := dogStatsDPipeline.Close(); err != nil {
 			klog.Warningln("DogStatsD final spool flush failed:", err)
 		}
+	}
+}
+
+// registerRuntimeDiagnostics exposes the agent's own resource usage: Go heap and runtime
+// memory classes (to separate Go heap from RSS), GC, goroutines, process RSS/FDs/CPU,
+// the agent cgroup's memory accounting, and the bounded agent health metrics in diag.
+func registerRuntimeDiagnostics(reg prometheus.Registerer) {
+	for _, c := range []prometheus.Collector{
+		// Default Go metrics (memstats, goroutines, GC summary) plus runtime memory classes,
+		// which separate live heap, free-but-unreleased heap, stacks and runtime overhead.
+		// GC size-class and scheduler histograms are left out: ~100 extra bucket series.
+		collectors.NewGoCollector(collectors.WithGoCollectorRuntimeMetrics(collectors.MetricsMemory)),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		diag.NewCgroupMemoryCollector(),
+	} {
+		if err := reg.Register(c); err != nil {
+			klog.Warningln("failed to register runtime collector:", err)
+		}
+	}
+	if err := diag.Register(reg); err != nil {
+		klog.Exitln(err)
+	}
+	if err := profiling.RegisterMetrics(reg); err != nil {
+		klog.Exitln(err)
 	}
 }
 
@@ -340,6 +434,18 @@ type logger struct{}
 
 func (l logger) Println(v ...interface{}) {
 	klog.Errorln(v...)
+}
+
+// setupLogging sends klog output to w, writing every message exactly once. By default klog
+// also copies each message into the buffers of all lower severities, and with a single
+// writer an error was printed three times and a warning twice (also using up the
+// --log-per-second budget three times as fast).
+func setupLogging(w io.Writer) {
+	fs := flag.NewFlagSet("klog", flag.ContinueOnError)
+	klog.InitFlags(fs)
+	_ = fs.Set("logtostderr", "false")
+	_ = fs.Set("one_output", "true")
+	klog.SetOutput(w)
 }
 
 type RateLimitedLogOutput struct {

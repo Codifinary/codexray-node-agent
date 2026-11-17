@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/codifinary/codexray-node-agent/diag"
 	"io"
 	"os"
 	"path"
@@ -389,6 +390,7 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 		}
 		if rec.LostSamples > 0 {
 			klog.Errorln(name, "lost samples:", rec.LostSamples)
+			diag.PerfLostSamples.WithLabelValues(name).Add(float64(rec.LostSamples))
 			continue
 		}
 		var event Event

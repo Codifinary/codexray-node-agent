@@ -1,0 +1,131 @@
+// Copyright Codexray
+// SPDX-License-Identifier: Apache-2.0
+
+package flags
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"gopkg.in/alecthomas/kingpin.v2"
+)
+
+func ob(v bool) *OptionalBool { return &OptionalBool{set: true, value: v} }
+
+func TestResolveTelemetryDefaultsAndLegacy(t *testing.T) {
+	unset := func() *OptionalBool { return &OptionalBool{} }
+	// Kingpin defaults: node metrics, container resource metrics and profiling on.
+	base := TelemetryInputs{NodeMetrics: true, ContainerResourceMetrics: true, Profiling: true,
+		L7Metrics: unset(), L7Traces: unset(), LogCollection: unset(), LogParsing: unset()}
+
+	// No settings: everything on, as in earlier releases.
+	got := ResolveTelemetry(base)
+	require.Equal(t, AllTelemetry, got)
+	require.True(t, got.L7Probes())
+	require.True(t, got.LogPipeline())
+
+	// Legacy DISABLE_L7_TRACING turns off L7 metrics and traces, as before.
+	in := base
+	in.LegacyDisableL7Tracing = true
+	got = ResolveTelemetry(in)
+	require.False(t, got.L7Metrics)
+	require.False(t, got.L7Traces)
+	require.False(t, got.L7Probes())
+	require.True(t, got.LogCollection)
+
+	// Legacy DISABLE_LOG_PARSING turns off log collection and parsing, as before.
+	in = base
+	in.LegacyDisableLogParsing = true
+	got = ResolveTelemetry(in)
+	require.False(t, got.LogCollection)
+	require.False(t, got.LogParsing)
+	require.False(t, got.LogPipeline())
+	require.True(t, got.L7Metrics)
+
+	// An explicit new setting wins over the legacy one: metrics without traces.
+	in = base
+	in.LegacyDisableL7Tracing = true
+	in.L7Metrics = ob(true)
+	got = ResolveTelemetry(in)
+	require.True(t, got.L7Metrics)
+	require.False(t, got.L7Traces)
+	require.True(t, got.L7Probes(), "L7 eBPF programs load for metrics")
+
+	// Each feature turns off independently.
+	in = base
+	in.L7Traces = ob(false)
+	got = ResolveTelemetry(in)
+	require.True(t, got.L7Metrics)
+	require.False(t, got.L7Traces)
+	in = base
+	in.LogCollection = ob(false)
+	got = ResolveTelemetry(in)
+	require.False(t, got.LogCollection)
+	require.True(t, got.LogParsing)
+	require.True(t, got.LogPipeline())
+}
+
+func TestTelemetryFlagDefaults(t *testing.T) {
+	for name, want := range map[string]string{
+		"node-metrics-enabled": "true", "container-resource-metrics-enabled": "true", "profiling-enabled": "true",
+	} {
+		f := kingpin.CommandLine.GetFlag(name)
+		require.NotNil(t, f, name)
+		require.Equal(t, []string{want}, f.Model().Default, name)
+	}
+	require.Equal(t, AllTelemetry, Telemetry)
+}
+
+// Exhaustive: every combination of the boolean features resolves independently.
+func TestResolveTelemetryIndependence(t *testing.T) {
+	for mask := 0; mask < 1<<7; mask++ {
+		bit := func(i int) bool { return mask&(1<<i) != 0 }
+		got := ResolveTelemetry(TelemetryInputs{
+			NodeMetrics: bit(0), ContainerResourceMetrics: bit(1), Profiling: bit(2),
+			L7Metrics: ob(bit(3)), L7Traces: ob(bit(4)), LogCollection: ob(bit(5)), LogParsing: ob(bit(6)),
+			LegacyDisableL7Tracing: true, LegacyDisableLogParsing: true, // explicit values win
+		})
+		require.Equal(t, TelemetryConfig{bit(0), bit(1), bit(3), bit(4), bit(5), bit(6), bit(2)}, got, "mask %b", mask)
+	}
+}
+
+func TestOptionalBoolFlagPrecedence(t *testing.T) {
+	newApp := func() (*kingpin.Application, *OptionalBool) {
+		app := kingpin.New("t", "")
+		v := &OptionalBool{}
+		app.Flag("x-enabled", "").Envar("X_ENABLED").SetValue(v)
+		return app, v
+	}
+	app, v := newApp()
+	_, err := app.Parse(nil)
+	require.NoError(t, err)
+	require.True(t, v.Or(true), "unset -> default")
+	require.False(t, v.Or(false))
+
+	t.Setenv("X_ENABLED", "false")
+	app, v = newApp()
+	_, err = app.Parse(nil)
+	require.NoError(t, err)
+	require.False(t, v.Or(true), "env applies")
+
+	app, v = newApp()
+	_, err = app.Parse([]string{"--x-enabled"})
+	require.NoError(t, err)
+	require.True(t, v.Or(false), "flag beats env")
+
+	t.Setenv("X_ENABLED", "true")
+	app, v = newApp()
+	_, err = app.Parse([]string{"--no-x-enabled"})
+	require.NoError(t, err)
+	require.False(t, v.Or(true), "--no- form beats env")
+
+	app, v = newApp()
+	_, err = app.Parse([]string{"--x-enabled"})
+	require.NoError(t, err)
+	require.True(t, v.Or(false), "bare flag means true")
+
+	t.Setenv("X_ENABLED", "maybe")
+	app, _ = newApp()
+	_, err = app.Parse(nil)
+	require.Error(t, err, "invalid env value is rejected, not silently defaulted")
+}

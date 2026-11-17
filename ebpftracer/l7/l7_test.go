@@ -186,7 +186,7 @@ func TestParseClickHouse(t *testing.T) {
 		0x29, 0x29, 0x20, 0x41, 0x4e, 0x44, 0x20, 0x54, 0x69, 0x6d, 0x0,
 	}
 	assert.Equal(t,
-		`SELECT Timestamp, TraceId, SpanId, ParentSpanId, SpanName, ServiceName, Duration, StatusCode, StatusMessage, ResourceAttributes, SpanAttributes, Events.Timestamp, Events.Name, Events.Attributes FROM otel_traces_distributed WHERE ServiceName IN (['/codifinary/codexray-codexray', '/system.slice/k3s-agent.service', '/system.slice/k3s.service']) AND (SpanAttributes['net.peer.name'] IN (['10.42.3.84', '10.42.1.73', '10.42.0.173', '10.42.5.69']) OR (SpanAttributes['net.peer.name'], SpanAttributes['net.peer.port']) IN (('10.42.3.84', '9009'), ('10.42.3.84', '0'), ('10.42.3.84', '9000'), ('10.42.3.84', '8123'), ('10.42.1.73', '0'), ('10.42.1.73', '8123'), ('10.42.1.73', '9009'), ('10.42.1.73', '9000'), ('10.42.0.173', '0'), ('10.42.0.173', '9009'), ('10.42.0.173', '9000'), ('10.42.0.173', '8123'), ('10.42.5.69', '9000'), ('10.42.5.69', '8123'), ('10.42.5.69', '9009'), ('10.42.5.69', '0'))) AND Tim...<TRUNCATED>`,
+		`SELECT Timestamp, TraceId, SpanId, ParentSpanId, SpanName, ServiceName, Duration, StatusCode, StatusMessage, ResourceAttributes, SpanAttributes, Events.Timestamp, Events.Name, Events.Attributes FROM otel_traces_distributed WHERE ServiceName IN (['/k8s/coroot/coroot-coroot', '/system.slice/k3s-agent.service', '/system.slice/k3s.service']) AND (SpanAttributes['net.peer.name'] IN (['10.42.3.84', '10.42.1.73', '10.42.0.173', '10.42.5.69']) OR (SpanAttributes['net.peer.name'], SpanAttributes['net.peer.port']) IN (('10.42.3.84', '9009'), ('10.42.3.84', '0'), ('10.42.3.84', '9000'), ('10.42.3.84', '8123'), ('10.42.1.73', '0'), ('10.42.1.73', '8123'), ('10.42.1.73', '9009'), ('10.42.1.73', '9000'), ('10.42.0.173', '0'), ('10.42.0.173', '9009'), ('10.42.0.173', '9000'), ('10.42.0.173', '8123'), ('10.42.5.69', '9000'), ('10.42.5.69', '8123'), ('10.42.5.69', '9009'), ('10.42.5.69', '0'))) AND Tim...<TRUNCATED>`,
 		ParseClickhouse(payload),
 	)
 
@@ -250,7 +250,7 @@ func TestParseZookeeper(t *testing.T) {
 	}
 	op, arg := ParseZookeeper(payload)
 	assert.Equal(t, "multi(setData, ...)", op)
-	assert.Equal(t, "/clickhouse/tables/shard-1/codexray_3kuq8b3z/otel_traces_trace_id_ts/replicas/codexray-clickhouse-shard-1-0/min_unprocessed_insert_time", arg)
+	assert.Equal(t, "/clickhouse/tables/shard-1/coroot_3kuq8b3z/otel_traces_trace_id_ts/replicas/coroot-clickhouse-shard-1-0/min_unprocessed_insert_time", arg)
 
 	payload = []byte{
 		0x0, 0x0, 0x0, 0x53, 0x0, 0xce, 0x16, 0x90, 0x0, 0x0, 0x0, 0x4, 0x0, 0x0, 0x0, 0x46, 0x2f, 0x63, 0x6c, 0x69, 0x63,
@@ -262,7 +262,7 @@ func TestParseZookeeper(t *testing.T) {
 	op, arg = ParseZookeeper(payload)
 
 	assert.Equal(t, "getData", op)
-	assert.Equal(t, "/clickhouse/tables/shard-1/codexray_3kuq8b3z/otel_traces_trace_id_ts/log", arg)
+	assert.Equal(t, "/clickhouse/tables/shard-1/coroot_3kuq8b3z/otel_traces_trace_id_ts/log", arg)
 
 	payload = []byte{
 		0x0, 0x0, 0x0, 0x53, 0x0, 0xce, 0x16, 0x90, 0x0, 0x0, 0x0, 0x4, 0x0, 0x0, 0x0, 0x46, 0x2f, 0x63, 0x6c, 0x69, 0x63,
@@ -273,5 +273,39 @@ func TestParseZookeeper(t *testing.T) {
 	op, arg = ParseZookeeper(payload)
 
 	assert.Equal(t, "getData", op)
-	assert.Equal(t, "/clickhouse/tables/shard-1/codexray_3kuq8b3z/otel_t...<TRUNCATED>", arg)
+	assert.Equal(t, "/clickhouse/tables/shard-1/coroot_3kuq8b3z/otel_t...<TRUNCATED>", arg)
+}
+
+// A captured packet that looks like a ClickHouse Query but declares huge string lengths must
+// be rejected without allocating the declared size (observed OOM driver on staging, 2026-11).
+func TestParseClickhouseHugeLengthsDoNotAllocate(t *testing.T) {
+	huge := []byte{0xff, 0xff, 0xff, 0xff, 0x0f} // uvarint 4 GiB - 1
+	cases := map[string][]byte{
+		"query id":      append([]byte{0x01}, huge...),
+		"initial user":  append([]byte{0x01, 0x00, 0x01}, huge...),
+		"setting value": nil,
+	}
+	// Valid header up to the settings, then a setting whose value claims 4 GiB.
+	settings := []byte{0x01, 0x00, 0x01, 0x00, 0x00, 0x00}
+	settings = append(settings, make([]byte, 8)...)                                         // query start time
+	settings = append(settings, 0x01, 0x00, 0x00, 0x00)                                     // TCP, os user, hostname, client name
+	settings = append(settings, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // versions, quota, depth, patch, otel=0, 3x replicas
+	settings = append(settings, 0x01, 'k', 0x00)                                            // key "k", flags
+	cases["setting value"] = append(settings, huge...)
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(10, func() { _ = ParseClickhouse(payload) })
+			assert.Equal(t, "", ParseClickhouse(payload))
+			assert.LessOrEqual(t, allocs, float64(1))
+		})
+	}
+}
+
+func FuzzParseClickhouse(f *testing.F) {
+	f.Add([]byte{0x01, 0x00, 0x01, 0x00, 0x00, 0x00})
+	f.Fuzz(func(t *testing.T, payload []byte) {
+		if q := ParseClickhouse(payload); len(q) > 1024+len("...<TRUNCATED>") {
+			t.Fatalf("query longer than the cap: %d", len(q))
+		}
+	})
 }

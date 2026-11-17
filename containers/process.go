@@ -8,9 +8,11 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/cilium/ebpf/link"
+	"github.com/codifinary/codexray-node-agent/diag"
 	"github.com/codifinary/codexray-node-agent/ebpftracer"
 	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/codifinary/codexray-node-agent/gpu"
@@ -43,7 +45,12 @@ type Process struct {
 	dotNetMonitor *DotNetMonitor
 	isGolangApp   bool
 
+	// uprobes is written by the instrumentation goroutine (Python/Node.js probes) and by the
+	// registry event loop (TLS probes), and drained by Close. uprobesLock guards it and closed,
+	// so a link attached after Close is detached immediately instead of leaking until GC.
+	uprobesLock           sync.Mutex
 	uprobes               []link.Link
+	closed                bool
 	goTlsUprobesChecked   bool
 	openSslUprobesChecked bool
 	pythonGilChecked      bool
@@ -58,6 +65,7 @@ func NewProcess(pid uint32, stats *taskstats.Stats, tracer *ebpftracer.Tracer) *
 	p := &Process{Pid: pid, StartedAt: stats.BeginTime}
 	p.Flags, _ = proc.GetFlags(pid)
 	p.ctx, p.cancelFunc = context.WithCancel(context.Background())
+	diag.ProcessesActive.Inc()
 	go p.instrument(tracer)
 	return p
 }
@@ -129,7 +137,7 @@ func (p *Process) instrumentPython(cmdline []byte, tracer *ebpftracer.Tracer) {
 		return
 	}
 	p.pythonPrevStats = &ebpftracer.PythonStats{}
-	p.uprobes = append(p.uprobes, tracer.AttachPythonThreadLockProbes(p.Pid)...)
+	p.addUprobes(tracer.AttachPythonThreadLockProbes(p.Pid))
 }
 
 func (p *Process) instrumentNodejs(exe string, tracer *ebpftracer.Tracer) {
@@ -141,7 +149,7 @@ func (p *Process) instrumentNodejs(exe string, tracer *ebpftracer.Tracer) {
 		return
 	}
 	p.nodejsPrevStats = &ebpftracer.NodejsStats{}
-	p.uprobes = append(p.uprobes, tracer.AttachNodejsProbes(p.Pid, exe)...)
+	p.addUprobes(tracer.AttachNodejsProbes(p.Pid, exe))
 }
 
 func (p *Process) addGpuUsageSample(sample gpu.ProcessUsageSample) {
@@ -181,9 +189,46 @@ func (p *Process) removeOldGpuUsageSamples(cutoff time.Time) {
 	}
 }
 
+// addUprobes takes ownership of links. If the process has already been closed (it exited while
+// the probes were being attached), the links are detached immediately.
+func (p *Process) addUprobes(links []link.Link) {
+	if len(links) == 0 {
+		return
+	}
+	p.uprobesLock.Lock()
+	defer p.uprobesLock.Unlock()
+	if p.closed {
+		for _, l := range links {
+			_ = l.Close()
+		}
+		diag.UprobesLeakedOnClose.Add(float64(len(links)))
+		return
+	}
+	p.uprobes = append(p.uprobes, links...)
+	diag.UprobesActive.Add(float64(len(links)))
+}
+
+func (p *Process) uprobeCount() int {
+	p.uprobesLock.Lock()
+	defer p.uprobesLock.Unlock()
+	return len(p.uprobes)
+}
+
+// Close cancels the process's background work and detaches its uprobes. It is idempotent.
 func (p *Process) Close() {
 	p.cancelFunc()
-	for _, u := range p.uprobes {
+	p.uprobesLock.Lock()
+	if p.closed {
+		p.uprobesLock.Unlock()
+		return
+	}
+	p.closed = true
+	links := p.uprobes
+	p.uprobes = nil
+	p.uprobesLock.Unlock()
+	for _, u := range links {
 		_ = u.Close()
 	}
+	diag.UprobesActive.Sub(float64(len(links)))
+	diag.ProcessesActive.Dec()
 }

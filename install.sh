@@ -16,7 +16,13 @@ SYSTEMD_SERVICE=${SYSTEM_NAME}.service
 UNINSTALL_SH=${BIN_DIR}/${SYSTEM_NAME}-uninstall.sh
 FILE_SERVICE=${SYSTEMD_DIR}/${SYSTEMD_SERVICE}
 FILE_ENV=${SYSTEMD_DIR}/${SYSTEMD_SERVICE}.env
-ENV_VARS="^(LISTEN|CGROUPFS_ROOT|DISABLE_LOG_PARSING|DISABLE_PINGER|DISABLE_L7_TRACING|TRACK_PUBLIC_NETWORK|EPHEMERAL_PORT_RANGE|PROVIDER|REGION|AVAILABILITY_ZONE|INSTANCE_TYPE|INSTANCE_LIFE_CYCLE|LOG_PER_SECOND|LOG_BURST|COLLECTOR_ENDPOINT|API_KEY|METRICS_ENDPOINT|TRACES_ENDPOINT|LOGS_ENDPOINT|PROFILES_ENDPOINT|SCRAPE_INTERVAL|WAL_DIR)"
+STATE_DIR=/var/lib/codexray-node-agent
+BINARY=
+# Empty: 2G on a fresh install, the previous unit's value on an upgrade (see unit_defaults).
+MEMORY_MAX=${MEMORY_MAX:-}
+# Agent settings copied from the installer's environment into ${FILE_ENV}. Matched as
+# prefixes of NAME=value, so e.g. STATSD_ covers every STATSD_* setting.
+ENV_VARS="^(LISTEN|CGROUPFS_ROOT|DISABLE_LOG_PARSING|DISABLE_PINGER|DISABLE_L7_TRACING|TRACK_PUBLIC_NETWORK|EPHEMERAL_PORT_RANGE|PROVIDER|REGION|AVAILABILITY_ZONE|INSTANCE_TYPE|INSTANCE_LIFE_CYCLE|LOG_PER_SECOND|LOG_BURST|COLLECTOR_ENDPOINT|API_KEY|METRICS_ENDPOINT|TRACES_ENDPOINT|LOGS_ENDPOINT|PROFILES_ENDPOINT|SCRAPE_INTERVAL|WAL_DIR|INSECURE_SKIP_VERIFY|NODE_METRICS_ENABLED|CONTAINER_|EBPF_L7_|PROFILING_|TRACES_|GO_MEMORY_LIMIT_RATIO|GOMEMLIMIT|MEMORY_WATCHDOG_|PPROF_|STATSD_|NODE_FS_|DNS_MAX_DOMAINS_PER_CONTAINER|EXCLUDE_HTTP_REQUESTS_BY_PATH|INSTRUMENTATION_DELAY|LOG_PATTERNS_MAX|MAX_LABEL_LENGTH|MAX_SPOOL_SIZE|MIN_CONTAINER_AGE)"
 
 info()
 {
@@ -35,6 +41,19 @@ show_help() {
     echo "Options:"
     echo "  -h, --help                        Show this help message and exit"
     echo "  -v v1.22.2, --version v1.22.2     Specify the version to install (default: latest)"
+    echo "  -b PATH, --binary PATH            Install this local binary instead of downloading a release"
+    echo "  -m 2G, --memory-max 2G            systemd MemoryMax for the agent (default: 2G on a fresh install;"
+    echo "                                    on upgrade, the existing unit's value, or none; 'infinity' for no cap)"
+    echo ""
+    echo "Agent settings (COLLECTOR_ENDPOINT, API_KEY, CONTAINER_ALLOWLIST, EBPF_L7_TRACES_ENABLED, ...) are"
+    echo "read from the environment, e.g.:"
+    echo "  sudo COLLECTOR_ENDPOINT=http://host:8182/ingest API_KEY=... \\"
+    echo "       CONTAINER_ALLOWLIST='^/system.slice/(nginx|postgresql)[.]service\$' sh install.sh"
+    echo "CONTAINER_ALLOWLIST is required (since v1.4.0): one regex on the container ID (/system.slice/<unit>,"
+    echo "/docker/<name>, ...) of the services or containers to monitor; use alternation (a|b) for several,"
+    echo "and [.] rather than a backslash."
+    echo "On upgrade, settings already in ${FILE_ENV} are kept unless set again, and so are the"
+    echo "existing unit's MemoryMax, LISTEN and WAL_DIR."
 }
 
 verify_system() {
@@ -140,6 +159,14 @@ setup_binary() {
 }
 
 download() {
+    if [ -n "$BINARY" ]; then
+        [ -f "$BINARY" ] || fatal "Binary not found: $BINARY"
+        setup_tmp
+        cp "$BINARY" ${TMP_BIN}
+        info "Using local binary $BINARY"
+        setup_binary
+        return
+    fi
     verify_arch
     verify_downloader curl || verify_downloader wget || fatal 'Can not find curl or wget for downloading files'
     setup_tmp
@@ -175,17 +202,74 @@ EOF
     $SUDO chown root:root ${UNINSTALL_SH}
 }
 
+# unit_defaults decides MemoryMax, LISTEN and WAL_DIR for the unit. A fresh install gets the
+# recommended values (2G cap, :10300, ${STATE_DIR}). An upgrade keeps what the existing unit
+# had: units written by earlier installers had no cap and no LISTEN/WAL_DIR lines (the agent
+# then defaults to 0.0.0.0:80 and /tmp/Codexray-node-agent), and silently changing them would
+# OOM-kill busy hosts, move the port, or orphan the unsent spool.
+unit_defaults() {
+    if [ -f "${FILE_SERVICE}" ]; then
+        prev_unit_value() { $SUDO sed -n "s/^$1//p" ${FILE_SERVICE} | tail -n 1; }
+        PREV_MEMORY_MAX=$(prev_unit_value 'MemoryMax=')
+        UNIT_LISTEN=$(prev_unit_value 'Environment=LISTEN=')
+        UNIT_WAL_DIR=$(prev_unit_value 'Environment=WAL_DIR=')
+        [ -n "${MEMORY_MAX}" ] || MEMORY_MAX=${PREV_MEMORY_MAX}
+        info "upgrade: using MemoryMax=${MEMORY_MAX:-<none>} LISTEN=${UNIT_LISTEN:-<agent default>} WAL_DIR=${UNIT_WAL_DIR:-<agent default>}"
+        [ -n "${MEMORY_MAX}" ] || info "upgrade: no memory cap; pass --memory-max 2G to add one (recommended)"
+    else
+        [ -n "${MEMORY_MAX}" ] || MEMORY_MAX=2G
+        UNIT_LISTEN=0.0.0.0:10300
+        UNIT_WAL_DIR=${STATE_DIR}
+    fi
+}
+
 systemd_disable() {
     $SUDO systemctl disable ${SYSTEM_NAME} >/dev/null 2>&1 || true
     $SUDO rm -f ${FILE_SERVICE} || true
-    $SUDO rm -f ${FILE_ENV} || true
+}
+
+# Writes ${FILE_ENV}: settings exported to this script replace the same names in the
+# existing file; everything else in the existing file is kept, so an upgrade does not
+# drop the API key or endpoint. The file is root-only (0600) because it holds API_KEY.
+# The agent exits at startup without a container allowlist (required since v1.4.0). Check before
+# anything is changed, so a missing allowlist never leaves a stopped service or a unit that
+# restarts forever. It may come from this run's environment or the existing env file.
+verify_allowlist() {
+    if [ -n "${CONTAINER_ALLOWLIST}" ]; then
+        return
+    fi
+    if $SUDO grep -qE "^CONTAINER_ALLOWLIST=['\"]?[^'\"]" ${FILE_ENV} 2>/dev/null; then
+        return
+    fi
+    fatal "CONTAINER_ALLOWLIST is required: set it to a regex for the services or containers to monitor, e.g. CONTAINER_ALLOWLIST='^/system.slice/(nginx|postgresql)[.]service\$'"
 }
 
 create_env_file() {
-    info "env: Creating environment file ${FILE_ENV}"
-    $SUDO touch ${FILE_ENV}
+    info "env: Updating environment file ${FILE_ENV}"
+    NEW_ENV=$(sh -c export | while read x v; do echo "$v"; done | grep -E "${ENV_VARS}" || true)
+    OLD_ENV=$($SUDO cat ${FILE_ENV} 2>/dev/null || true)
+    {
+        echo "$OLD_ENV" | while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            name=${line%%=*}
+            echo "$NEW_ENV" | grep -q "^${name}=" || echo "$line"
+        done
+        [ -z "$NEW_ENV" ] || echo "$NEW_ENV"
+    } | $SUDO sh -c "umask 077; cat > ${FILE_ENV}.tmp && mv -f ${FILE_ENV}.tmp ${FILE_ENV}"
     $SUDO chmod 0600 ${FILE_ENV}
-    sh -c export | while read x v; do echo $v; done | grep -E ${ENV_VARS} | $SUDO tee ${FILE_ENV} >/dev/null
+}
+
+# unit_lines prints the optional memory cap and LISTEN/WAL_DIR defaults chosen by unit_defaults.
+unit_lines() {
+    if [ -n "${MEMORY_MAX}" ]; then
+        echo "# Memory cap. The agent sizes its Go soft limit and diagnostic watchdog from this"
+        echo "# cgroup limit; without a cap neither takes effect. Override with --memory-max."
+        echo "MemoryMax=${MEMORY_MAX}"
+        echo "MemorySwapMax=0"
+    fi
+    echo "# Defaults; the EnvironmentFile entries above take precedence."
+    [ -z "${UNIT_LISTEN}" ] || echo "Environment=LISTEN=${UNIT_LISTEN}"
+    [ -z "${UNIT_WAL_DIR}" ] || echo "Environment=WAL_DIR=${UNIT_WAL_DIR}"
 }
 
 create_systemd_service_file() {
@@ -216,6 +300,11 @@ TasksMax=infinity
 TimeoutStartSec=0
 Restart=always
 RestartSec=5s
+$(unit_lines)
+Environment=GO_MEMORY_LIMIT_RATIO=0.7
+Environment=MEMORY_WATCHDOG_THRESHOLD_RATIO=0.8
+Environment=PPROF_LISTEN=127.0.0.1:10302
+StateDirectory=codexray-node-agent
 ExecStart=${BIN_DIR}/codexray-node-agent
 EOF
 }
@@ -264,6 +353,14 @@ while [ $# -gt 0 ]; do
             VERSION="$2"
             shift 2
             ;;
+        -b|--binary)
+            BINARY="$2"
+            shift 2
+            ;;
+        -m|--memory-max)
+            MEMORY_MAX="$2"
+            shift 2
+            ;;
         *)
             fatal "Unknown option: $1"
             ;;
@@ -272,6 +369,8 @@ done
 
 {
     verify_system
+    verify_allowlist
+    unit_defaults
     download
     create_uninstall
     systemd_disable

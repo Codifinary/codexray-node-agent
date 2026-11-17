@@ -9,10 +9,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/codifinary/codexray-node-agent/cgroup"
 	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/diag"
 	"github.com/codifinary/codexray-node-agent/ebpftracer"
 	"github.com/codifinary/codexray-node-agent/ebpftracer/l7"
 	"github.com/codifinary/codexray-node-agent/flags"
@@ -63,13 +65,22 @@ type Delays struct {
 type LogParser struct {
 	parser *logparser.Parser
 	stop   func()
+	once   sync.Once
 }
 
 func (p *LogParser) Stop() {
-	if p.stop != nil {
-		p.stop()
-	}
-	p.parser.Stop()
+	p.once.Do(func() {
+		if p.stop != nil {
+			p.stop()
+		}
+		p.parser.Stop()
+		diag.LogParsersActive.Dec()
+	})
+}
+
+func newLogParser(parser *logparser.Parser, stop func()) *LogParser {
+	diag.LogParsersActive.Inc()
+	return &LogParser{parser: parser, stop: stop}
 }
 
 type ConnectionKey struct {
@@ -102,6 +113,33 @@ type PidFd struct {
 	Fd  uint64
 }
 
+const (
+	pendingL7TTL             = 5 * time.Second
+	maxPendingL7PerContainer = 1000
+)
+
+const (
+	ignoredConnectionTTL        = 30 * time.Second // kept after close for late L7 events
+	maxIgnoredConnsPerContainer = 100000
+)
+
+type ignoredConnection struct {
+	closed time.Time
+}
+
+type pendingL7Events struct {
+	added    time.Time
+	requests []*l7.RequestData
+}
+
+// pidFdTs identifies one connection: the same pid/fd pair is reused by every new
+// connection a process opens after closing the previous one.
+type pidFdTs struct {
+	Pid uint32
+	Fd  uint64
+	Ts  uint64
+}
+
 type ConnectionStats struct {
 	Count           uint64
 	TotalTime       time.Duration
@@ -122,6 +160,12 @@ type Container struct {
 	zombieAt  time.Time
 	restarts  int
 
+	// Copies of the start time used for --min-container-age (startedAt, or the cgroup
+	// creation time) and of zombieAt, as UnixNano, so that callbacks running under other
+	// locks (the log parser's) can check the age without taking c.lock. See publishAge.
+	ageStartNano  atomic.Int64
+	ageZombieNano atomic.Int64
+
 	delays      Delays
 	delaysByPid map[uint32]Delays
 
@@ -132,9 +176,27 @@ type Container struct {
 	lastConnectionAttempts   map[common.HostPort]time.Time
 	activeConnections        map[ConnectionKey]*ActiveConnection
 	connectionsByPidFd       map[PidFd]*ActiveConnection
+	// replacedConnections holds connections whose pid/fd has been taken over by a newer
+	// connection. L7 events are read from a separate perf buffer than connection events
+	// and can arrive after the next connection on the same fd has been opened; without
+	// this index such events (typical for clients that open one connection per request)
+	// failed the timestamp check and were dropped.
+	replacedConnections map[pidFdTs]*ActiveConnection
+	// pendingL7 holds L7 events that arrived before their connection's open event.
+	pendingL7      map[pidFdTs]*pendingL7Events
+	pendingL7Count int
+	// pendingL7Expired is when expirePendingL7 last ran.
+	pendingL7Expired time.Time
+	// ignoredConnections holds connections deliberately not tracked (port/IP filters,
+	// loopback inside a pod network namespace, unknown process), so that their L7 events
+	// are counted as ignored instead of being deferred and then reported as unmatched.
+	ignoredConnections map[pidFdTs]*ignoredConnection
 
 	l7Stats  L7Stats
 	dnsStats *L7Metrics
+	// dnsDomains holds the domain label values seen by this container, for DNS_MAX_DOMAINS_PER_CONTAINER.
+	dnsDomains        map[string]struct{}
+	dnsOverflowLogged bool
 
 	gpuStats map[string]*GpuUsage
 
@@ -153,7 +215,8 @@ type Container struct {
 
 	lock sync.Mutex
 
-	done chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid uint32, registry *Registry) (*Container, error) {
@@ -185,8 +248,10 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 		lastConnectionAttempts:   map[common.HostPort]time.Time{},
 		activeConnections:        map[ConnectionKey]*ActiveConnection{},
 		connectionsByPidFd:       map[PidFd]*ActiveConnection{},
+		replacedConnections:      map[pidFdTs]*ActiveConnection{},
 		l7Stats:                  L7Stats{},
 		dnsStats:                 &L7Metrics{},
+		dnsDomains:               map[string]struct{}{},
 
 		gpuStats: map[string]*GpuUsage{},
 
@@ -201,7 +266,11 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 
 		done: make(chan struct{}),
 	}
+	diag.ContainersActive.Inc()
+	c.lock.Lock()
+	c.publishAge()
 	c.runLogParser("")
+	c.lock.Unlock()
 
 	go func() {
 		ticker := time.NewTicker(gcInterval)
@@ -219,11 +288,26 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 	return c, nil
 }
 
+// Close releases everything the container owns: log parsers (tailers, journald subscriptions and
+// their goroutines), any processes still attached (and their uprobes), and the gc goroutine.
+// It is idempotent and safe to call concurrently with Collect.
 func (c *Container) Close() {
-	for _, p := range c.logParsers {
-		p.Stop()
-	}
-	close(c.done)
+	c.closeOnce.Do(func() {
+		c.lock.Lock()
+		parsers := c.logParsers
+		c.logParsers = map[string]*LogParser{}
+		processes := c.processes
+		c.processes = map[uint32]*Process{}
+		c.lock.Unlock()
+		for _, p := range parsers {
+			p.Stop()
+		}
+		for _, p := range processes {
+			p.Close()
+		}
+		close(c.done)
+		diag.ContainersActive.Dec()
+	})
 }
 
 func (c *Container) Dead(now time.Time) bool {
@@ -235,30 +319,109 @@ func (c *Container) Describe(ch chan<- *prometheus.Desc) {
 	ch <- prometheus.NewDesc("container", "", nil, nil)
 }
 
+// youngerThanMinAge reports whether the container is younger than --min-container-age.
+// Must be called with c.lock held.
+func (c *Container) youngerThanMinAge(now time.Time) bool {
+	if minContainerAge() <= 0 {
+		return false
+	}
+	return youngerThan(c.ageStart(), c.zombieAt, now, minContainerAge())
+}
+
+// ageStart is the start time used for --min-container-age. It falls back to the cgroup mtime
+// when taskstats hasn't populated startedAt (PID-vs-TGID races, restricted netlink caps,
+// missing CONFIG_TASKSTATS_NETLINK). Without this, every container whose first taskstats lookup
+// failed would be permanently filtered, dropping all of its metrics, not just for ~30s.
+// Must be called with c.lock held.
+func (c *Container) ageStart() time.Time {
+	started := c.startedAt
+	if started.IsZero() && c.cgroup != nil {
+		started = c.cgroup.CreatedAt()
+	}
+	return started
+}
+
+func youngerThan(started, zombieAt, now time.Time, minAge time.Duration) bool {
+	if started.IsZero() {
+		return false
+	}
+	end := now
+	if !zombieAt.IsZero() && zombieAt.Before(end) {
+		end = zombieAt
+	}
+	return end.Sub(started) < minAge
+}
+
+// publishAge copies the age inputs into atomics for youngerThanMinAgeNoLock. Must be called
+// with c.lock held (or before the container is shared) after startedAt, zombieAt or cgroup change.
+func (c *Container) publishAge() {
+	c.ageStartNano.Store(unixNano(c.ageStart()))
+	c.ageZombieNano.Store(unixNano(c.zombieAt))
+}
+
+// youngerThanMinAgeNoLock is youngerThanMinAge for callers that must not take c.lock.
+func (c *Container) youngerThanMinAgeNoLock(now time.Time) bool {
+	if minContainerAge() <= 0 {
+		return false
+	}
+	return youngerThan(fromUnixNano(c.ageStartNano.Load()), fromUnixNano(c.ageZombieNano.Load()), now, minContainerAge())
+}
+
+func unixNano(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+func fromUnixNano(n int64) time.Time {
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
+
+func minContainerAge() time.Duration {
+	if flags.MinContainerAge == nil {
+		return 0
+	}
+	return *flags.MinContainerAge
+}
+
+// minAgeGatesLogsAndTraces reports whether --min-container-age-applies-to=all.
+func minAgeGatesLogsAndTraces() bool {
+	return flags.MinContainerAgeAppliesTo != nil && *flags.MinContainerAgeAppliesTo == "all" && minContainerAge() > 0
+}
+
+// logEmitter wraps the OTLP log emitter so that, with --min-container-age-applies-to=all,
+// lines from containers younger than --min-container-age are not exported. The callback runs
+// with the log parser's lock held, and Collect holds c.lock while reading the parser's
+// counters, so it must never take c.lock: it reads the age from atomics instead.
+func (c *Container) logEmitter(containerId string) logparser.OnMsgCallbackF {
+	emit := logs.OtelLogEmitter(containerId)
+	if emit == nil || !minAgeGatesLogsAndTraces() {
+		return emit
+	}
+	var mature atomic.Bool
+	return func(ts time.Time, level logparser.Level, patternHash string, msg string) {
+		if !mature.Load() {
+			if c.youngerThanMinAgeNoLock(time.Now()) {
+				return
+			}
+			mature.Store(true)
+		}
+		emit(ts, level, patternHash, msg)
+	}
+}
+
 func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	c.registry.updateStatsFromEbpfMapsIfNecessary()
 
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if minAge := *flags.MinContainerAge; minAge > 0 {
-		// Fall back to cgroup mtime when taskstats hasn't populated startedAt
-		// (PID-vs-TGID races, restricted netlink caps, missing CONFIG_TASKSTATS_NETLINK).
-		// Without this, every container whose first taskstats lookup failed would be
-		// permanently filtered, dropping all of its metrics — not just for ~30s.
-		started := c.startedAt
-		if started.IsZero() {
-			started = c.cgroup.CreatedAt()
-		}
-		if !started.IsZero() {
-			end := time.Now()
-			if !c.zombieAt.IsZero() && c.zombieAt.Before(end) {
-				end = c.zombieAt
-			}
-			if end.Sub(started) < minAge {
-				return
-			}
-		}
+	if c.youngerThanMinAge(time.Now()) {
+		return
 	}
 
 	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
@@ -267,6 +430,20 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 
 	ch <- counter(metrics.Restarts, float64(c.restarts))
 
+	if c.oomKills > 0 {
+		ch <- counter(metrics.OOMKills, float64(c.oomKills))
+	}
+
+	if flags.Telemetry.ContainerResourceMetrics {
+		c.collectResourceMetrics(ch)
+	}
+
+	c.collectNonResourceMetrics(ch)
+}
+
+// collectResourceMetrics exports container CPU, memory, throttling, pressure, disk and GPU
+// usage (CONTAINER_RESOURCE_METRICS_ENABLED). Must be called with c.lock held.
+func (c *Container) collectResourceMetrics(ch chan<- prometheus.Metric) {
 	if cpu := c.cgroup.CpuStat(); cpu != nil {
 		if cpu.LimitCores > 0 {
 			ch <- gauge(metrics.CPULimit, cpu.LimitCores)
@@ -298,10 +475,6 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		ch <- counter(metrics.PsiIO, psi.IOSecondsFull, "full")
 	}
 
-	if c.oomKills > 0 {
-		ch <- counter(metrics.OOMKills, float64(c.oomKills))
-	}
-
 	if disks, err := node.GetDisks(); err == nil {
 		ioStat := c.cgroup.IOStat()
 		for majorMinor, mounts := range c.getMounts() {
@@ -326,6 +499,12 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
+	c.collectGpuUsage(ch)
+}
+
+// collectNonResourceMetrics exports network, L7, logs, runtime and application metrics,
+// which do not depend on CONTAINER_RESOURCE_METRICS_ENABLED. Must be called with c.lock held.
+func (c *Container) collectNonResourceMetrics(ch chan<- prometheus.Metric) {
 	for addr, open := range c.getListens() {
 		ch <- gauge(metrics.NetListenInfo, float64(open), addr.String(), "")
 	}
@@ -353,13 +532,16 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		if !conn.Closed.IsZero() {
 			continue
 		}
-		connections[conn.DestinationKey]++
+		connections[conn.DestinationKey.ForMetrics()]++
 	}
 	for d, count := range connections {
 		ch <- gauge(metrics.NetConnectionsActive, float64(count), d.DestinationLabelValue(), d.ActualDestinationLabelValue())
 	}
 
 	for source, p := range c.logParsers {
+		if !flags.Telemetry.LogParsing {
+			break
+		}
 		for _, c := range p.parser.GetCounters() {
 			ch <- counter(metrics.LogMessages, float64(c.Messages), source, c.Level.String(), c.Hash, common.TruncateUtf8(c.Sample, *flags.MaxLabelLength))
 		}
@@ -409,24 +591,6 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 
-		for _, usage := range c.gpuStats {
-			usage.Reset()
-		}
-		if usage := process.getGPUUsage(); usage != nil {
-			for uuid, u := range usage {
-				tu := c.gpuStats[uuid]
-				if tu == nil {
-					tu = &GpuUsage{}
-					c.gpuStats[uuid] = tu
-				}
-				tu.GPU += u.GPU
-				tu.Memory += u.Memory
-			}
-		}
-	}
-	for uuid, usage := range c.gpuStats {
-		ch <- gauge(metrics.GpuUsagePercent, usage.GPU, uuid)
-		ch <- gauge(metrics.GpuMemoryUsagePercent, usage.Memory, uuid)
 	}
 
 	for appType := range appTypes {
@@ -454,18 +618,53 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
+// collectGpuUsage aggregates per-process GPU samples into per-GPU container usage.
+// Must be called with c.lock held.
+func (c *Container) collectGpuUsage(ch chan<- prometheus.Metric) {
+	for _, usage := range c.gpuStats {
+		usage.Reset()
+	}
+	for _, process := range c.processes {
+		usage := process.getGPUUsage()
+		for uuid, u := range usage {
+			tu := c.gpuStats[uuid]
+			if tu == nil {
+				tu = &GpuUsage{}
+				c.gpuStats[uuid] = tu
+			}
+			tu.GPU += u.GPU
+			tu.Memory += u.Memory
+		}
+	}
+	for uuid, usage := range c.gpuStats {
+		ch <- gauge(metrics.GpuUsagePercent, usage.GPU, uuid)
+		ch <- gauge(metrics.GpuMemoryUsagePercent, usage.Memory, uuid)
+	}
+}
+
 func (c *Container) onProcessStart(pid uint32) *Process {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+	defer c.publishAge() // runs before Unlock
 	stats, err := TaskstatsPID(pid)
 	if err != nil {
 		return nil
 	}
 	c.zombieAt = time.Time{}
+	// Already registered on demand by a connection event that was processed before this
+	// process-start event (see ensureProcess): same incarnation, nothing to do.
+	if old := c.processes[pid]; old != nil && old.StartedAt.Equal(stats.BeginTime) {
+		return nil
+	}
 	p := NewProcess(pid, stats, c.registry.tracer)
 
 	if p == nil {
 		return nil
+	}
+	// PID reuse within the same cgroup after a missed exit event: release the previous
+	// incarnation's uprobes and cancel its instrumentation instead of orphaning them.
+	if old := c.processes[pid]; old != nil {
+		old.Close()
 	}
 	c.processes[pid] = p
 
@@ -495,6 +694,7 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	delete(c.processes, pid)
 	if len(c.processes) == 0 {
 		c.zombieAt = time.Now()
+		c.publishAge()
 	}
 	delete(c.delaysByPid, pid)
 	if oomKill {
@@ -591,13 +791,16 @@ func (c *Container) onListenClose(pid uint32, addr netaddr.IPPort) {
 
 func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst netaddr.IPPort, timestamp uint64, failed bool, duration time.Duration) {
 	if common.PortFilter.ShouldBeSkipped(dst.Port()) {
+		c.markIgnored(pid, fd, timestamp, failed)
 		return
 	}
 	p := c.processes[pid]
 	if p == nil {
+		c.markIgnored(pid, fd, timestamp, failed)
 		return
 	}
 	if dst.IP().IsLoopback() && !p.isHostNs() {
+		c.markIgnored(pid, fd, timestamp, failed)
 		return
 	}
 	if actualDst.Port() == 0 {
@@ -608,9 +811,11 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 		}
 	}
 	if actualDst.IP().IsLoopback() && !p.isHostNs() {
+		c.markIgnored(pid, fd, timestamp, failed)
 		return
 	}
 	if common.ConnectionFilter.ShouldBeSkipped(dst.IP(), actualDst.IP()) {
+		c.markIgnored(pid, fd, timestamp, failed)
 		return
 	}
 	key := common.NewDestinationKey(dst, actualDst, c.registry.getDomain(dst.IP()))
@@ -619,10 +824,10 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	if failed {
 		c.failedConnectionAttempts[key.Destination()]++
 	} else {
-		stats := c.connectionStats[key]
+		stats := c.connectionStats[key.ForMetrics()]
 		if stats == nil {
 			stats = &ConnectionStats{}
-			c.connectionStats[key] = stats
+			c.connectionStats[key.ForMetrics()] = stats
 		}
 		stats.Count++
 		stats.TotalTime += duration
@@ -636,21 +841,74 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 		k := PidFd{Pid: pid, Fd: fd}
 		prev := c.connectionsByPidFd[k]
 		if prev != nil {
-			prev.Closed = time.Now()
+			if prev.Closed.IsZero() {
+				prev.Closed = time.Now()
+			}
+			if prev.Timestamp != 0 && prev.Timestamp != timestamp {
+				c.replacedConnections[pidFdTs{Pid: pid, Fd: fd, Ts: prev.Timestamp}] = prev
+			}
 		}
 		c.connectionsByPidFd[k] = connection
+		c.replayPendingL7(pidFdTs{Pid: pid, Fd: fd, Ts: timestamp}, connection)
 	}
 	c.lastConnectionAttempts[key.Destination()] = time.Now()
 }
 
+// lookupConnection returns the connection identified by pid, fd and the kernel connection
+// timestamp: the current connection on pid/fd if its timestamp matches (or timestamp is 0),
+// otherwise a connection that was replaced on that pid/fd. c.lock must be held.
+func (c *Container) lookupConnection(pid uint32, fd uint64, timestamp uint64) *ActiveConnection {
+	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
+	if conn != nil && (timestamp == 0 || conn.Timestamp == timestamp) {
+		return conn
+	}
+	if timestamp == 0 {
+		return nil
+	}
+	return c.replacedConnections[pidFdTs{Pid: pid, Fd: fd, Ts: timestamp}]
+}
+
+// markIgnored records a connection that is deliberately not tracked and drops any of its
+// L7 events that arrived before the open event.
+func (c *Container) markIgnored(pid uint32, fd uint64, timestamp uint64, failed bool) {
+	if failed || timestamp == 0 {
+		return
+	}
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	k := pidFdTs{Pid: pid, Fd: fd, Ts: timestamp}
+	if p := c.pendingL7[k]; p != nil {
+		delete(c.pendingL7, k)
+		c.pendingL7Count -= len(p.requests)
+		diag.L7EventsMatched.WithLabelValues("ignored").Add(float64(len(p.requests)))
+	}
+	if c.ignoredConnections == nil {
+		c.ignoredConnections = map[pidFdTs]*ignoredConnection{}
+	}
+	if len(c.ignoredConnections) >= maxIgnoredConnsPerContainer {
+		return
+	}
+	c.ignoredConnections[k] = &ignoredConnection{}
+}
+
+// expireIgnoredConnections removes ignored connections closed more than
+// ignoredConnectionTTL ago, and those of processes that are gone. c.lock must be held.
+func (c *Container) expireIgnoredConnections(now time.Time) {
+	for k, ic := range c.ignoredConnections {
+		if (!ic.closed.IsZero() && now.Sub(ic.closed) > ignoredConnectionTTL) || c.processes[k.Pid] == nil {
+			delete(c.ignoredConnections, k)
+		}
+	}
+}
+
 func (c *Container) onConnectionClose(e ebpftracer.Event) {
 	c.lock.Lock()
-	conn := c.connectionsByPidFd[PidFd{Pid: e.Pid, Fd: e.Fd}]
+	conn := c.lookupConnection(e.Pid, e.Fd, e.Timestamp)
+	if ic := c.ignoredConnections[pidFdTs{Pid: e.Pid, Fd: e.Fd, Ts: e.Timestamp}]; ic != nil && ic.closed.IsZero() {
+		ic.closed = time.Now()
+	}
 	c.lock.Unlock()
 	if conn != nil {
-		if conn.Timestamp != 0 && conn.Timestamp != e.Timestamp {
-			return
-		}
 		if conn.Closed.IsZero() {
 			if e.TrafficStats != nil {
 				c.lock.Lock()
@@ -675,10 +933,11 @@ func (c *Container) updateConnectionTrafficStats(ac *ActiveConnection, sent, rec
 	if ac == nil {
 		return
 	}
-	stats := c.connectionStats[ac.DestinationKey]
+	mk := ac.DestinationKey.ForMetrics()
+	stats := c.connectionStats[mk]
 	if stats == nil {
 		stats = &ConnectionStats{}
-		c.connectionStats[ac.DestinationKey] = stats
+		c.connectionStats[mk] = stats
 	}
 	if sent > ac.BytesSent {
 		stats.BytesSent += sent - ac.BytesSent
@@ -715,13 +974,13 @@ func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]*common.Domai
 			[]string{"request_type", "domain", "status"},
 		)
 	}
-	if m, _ := c.dnsStats.Requests.GetMetricWithLabelValues(t, fqdn, status); m != nil {
+	if m, _ := c.dnsStats.Requests.GetMetricWithLabelValues(t, c.dnsDomainLabel(fqdn), status); m != nil {
 		m.Inc()
 	}
 	if r.Duration != 0 {
 		if c.dnsStats.Latency == nil {
 			dnsLatency := L7Latency[l7.ProtocolDNS]
-			c.dnsStats.Latency = prometheus.NewHistogram(prometheus.HistogramOpts{Name: dnsLatency.Name, Help: dnsLatency.Help})
+			c.dnsStats.Latency = prometheus.NewHistogram(prometheus.HistogramOpts{Name: dnsLatency.Name, Help: dnsLatency.Help, Buckets: common.L7LatencyBuckets})
 		}
 		c.dnsStats.Latency.Observe(r.Duration.Seconds())
 	}
@@ -735,6 +994,28 @@ func (c *Container) onDNSRequest(r *l7.RequestData) map[netaddr.IP]*common.Domai
 	return ip2fqdn
 }
 
+// dnsDomainLabel returns fqdn, or DNSOverflowDomain once the container has used up its
+// DNS_MAX_DOMAINS_PER_CONTAINER distinct domains. Domains already seen keep their own series.
+// Must be called with c.lock held.
+func (c *Container) dnsDomainLabel(fqdn string) string {
+	if c.dnsDomains == nil {
+		c.dnsDomains = map[string]struct{}{}
+	}
+	if _, ok := c.dnsDomains[fqdn]; ok {
+		return fqdn
+	}
+	max := common.DNSMaxDomainsPerContainer
+	if max > 0 && len(c.dnsDomains) >= max {
+		if !c.dnsOverflowLogged {
+			c.dnsOverflowLogged = true
+			klog.Warningf("container %s: more than %d distinct DNS domains, counting new ones as domain=%q", c.id, max, common.DNSOverflowDomain)
+		}
+		return common.DNSOverflowDomain
+	}
+	c.dnsDomains[fqdn] = struct{}{}
+	return fqdn
+}
+
 func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.RequestData) map[netaddr.IP]*common.Domain {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -743,16 +1024,85 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 		return c.onDNSRequest(r)
 	}
 
-	conn := c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}]
+	conn := c.lookupConnection(pid, fd, timestamp)
 	if conn == nil {
+		k := pidFdTs{Pid: pid, Fd: fd, Ts: timestamp}
+		if c.ignoredConnections[k] != nil {
+			diag.L7EventsMatched.WithLabelValues("ignored").Inc()
+			return nil
+		}
+		c.deferL7(k, r)
 		return nil
 	}
-	if timestamp != 0 && conn.Timestamp != timestamp {
-		return nil
+	if timestamp != 0 && conn != c.connectionsByPidFd[PidFd{Pid: pid, Fd: fd}] {
+		diag.L7EventsMatched.WithLabelValues("matched_replaced").Inc()
+	} else {
+		diag.L7EventsMatched.WithLabelValues("current").Inc()
 	}
-	stats := c.l7Stats.get(r.Protocol, conn.DestinationKey)
+	c.observeL7(conn, r)
+	return nil
+}
 
-	ebpfTracesDisabled := false
+// deferL7 keeps an L7 event whose connection is not known yet. Connection events and L7
+// events are read from different perf buffers (10 ms vs 100 ms read deadline), so for a
+// short-lived connection the L7 event can be processed before the connection's open
+// event. The event is replayed by onConnectionOpen, or dropped after pendingL7TTL.
+// c.lock must be held.
+func (c *Container) deferL7(k pidFdTs, r *l7.RequestData) {
+	if now := time.Now(); now.Sub(c.pendingL7Expired) > time.Second {
+		c.pendingL7Expired = now
+		c.expirePendingL7(now)
+		c.expireIgnoredConnections(now)
+	}
+	if k.Ts == 0 || c.pendingL7Count >= maxPendingL7PerContainer {
+		diag.L7EventsMatched.WithLabelValues("unmatched").Inc()
+		return
+	}
+	if c.pendingL7 == nil {
+		c.pendingL7 = map[pidFdTs]*pendingL7Events{}
+	}
+	p := c.pendingL7[k]
+	if p == nil {
+		p = &pendingL7Events{added: time.Now()}
+		c.pendingL7[k] = p
+	}
+	p.requests = append(p.requests, r)
+	c.pendingL7Count++
+}
+
+// replayPendingL7 processes L7 events that arrived before conn's open event. c.lock must be held.
+func (c *Container) replayPendingL7(k pidFdTs, conn *ActiveConnection) {
+	p := c.pendingL7[k]
+	if p == nil {
+		return
+	}
+	delete(c.pendingL7, k)
+	c.pendingL7Count -= len(p.requests)
+	for _, r := range p.requests {
+		diag.L7EventsMatched.WithLabelValues("matched_deferred").Inc()
+		c.observeL7(conn, r)
+	}
+}
+
+// expirePendingL7 drops deferred L7 events whose connection never showed up. c.lock must be held.
+func (c *Container) expirePendingL7(now time.Time) {
+	for k, p := range c.pendingL7 {
+		if now.Sub(p.added) > pendingL7TTL {
+			delete(c.pendingL7, k)
+			c.pendingL7Count -= len(p.requests)
+			diag.L7EventsMatched.WithLabelValues("unmatched").Add(float64(len(p.requests)))
+		}
+	}
+}
+
+// observeL7 records metrics and traces for an L7 event on conn. c.lock must be held.
+func (c *Container) observeL7(conn *ActiveConnection, r *l7.RequestData) {
+	var stats *L7Metrics // nil-safe: observe is a no-op when L7 metrics are disabled
+	if flags.Telemetry.L7Metrics {
+		stats = c.l7Stats.get(r.Protocol, conn.DestinationKey.ForMetrics())
+	}
+
+	ebpfTracesDisabled := !flags.Telemetry.L7Traces || (minAgeGatesLogsAndTraces() && c.youngerThanMinAge(time.Now()))
 	for _, p := range c.processes {
 		if p.Flags.EbpfTracesDisabled {
 			ebpfTracesDisabled = true
@@ -832,7 +1182,6 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	case l7.ProtocolFoundationDB:
 		stats.observe(r.Status.String(), "", r.Duration)
 	}
-	return nil
 }
 
 func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) bool {
@@ -842,10 +1191,11 @@ func (c *Container) onRetransmission(src netaddr.IPPort, dst netaddr.IPPort) boo
 	if !ok {
 		return false
 	}
-	stats := c.connectionStats[conn.DestinationKey]
+	mk := conn.DestinationKey.ForMetrics()
+	stats := c.connectionStats[mk]
 	if stats == nil {
 		stats = &ConnectionStats{}
-		c.connectionStats[conn.DestinationKey] = stats
+		c.connectionStats[mk] = stats
 	}
 	stats.Retransmissions++
 	return true
@@ -1035,6 +1385,13 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 			ips[ip] = struct{}{}
 		}
 	}
+	// With L7_ACTUAL_DESTINATION=drop the stats keys carry no actual destination,
+	// so take the upstream IPs from the live connections instead.
+	for _, conn := range c.activeConnections {
+		if ip := conn.DestinationKey.ActualDestination().IP(); !ip.IsZero() {
+			ips[ip] = struct{}{}
+		}
+	}
 	for dst := range c.failedConnectionAttempts {
 		if ip := dst.IP(); !ip.IsZero() {
 			ips[dst.IP()] = struct{}{}
@@ -1062,7 +1419,7 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 }
 
 func (c *Container) runLogParser(logPath string) {
-	if *flags.DisableLogParsing {
+	if !flags.Telemetry.LogPipeline() {
 		return
 	}
 
@@ -1080,7 +1437,7 @@ func (c *Container) runLogParser(logPath string) {
 			return
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout)
+		parser := logparser.NewParser(ch, nil, c.logEmitter(containerId), multilineCollectorTimeout)
 		reader, err := logs.NewTailReader(proc.HostPath(logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
@@ -1088,7 +1445,7 @@ func (c *Container) runLogParser(logPath string) {
 			return
 		}
 		klog.InfoS("started varlog logparser", "cg", c.cgroup.Id, "log", logPath)
-		c.logParsers[logPath] = &LogParser{parser: parser, stop: reader.Stop}
+		c.logParsers[logPath] = newLogParser(parser, reader.Stop)
 		return
 	}
 
@@ -1099,12 +1456,12 @@ func (c *Container) runLogParser(logPath string) {
 			klog.Warningln(err)
 			return
 		}
-		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout)
+		parser := logparser.NewParser(ch, nil, c.logEmitter(containerId), multilineCollectorTimeout)
 		stop := func() {
 			JournaldUnsubscribe(c.cgroup)
 		}
 		klog.InfoS("started journald logparser", "cg", c.cgroup.Id)
-		c.logParsers["journald"] = &LogParser{parser: parser, stop: stop}
+		c.logParsers["journald"] = newLogParser(parser, stop)
 
 	case cgroup.ContainerTypeDocker, cgroup.ContainerTypeContainerd, cgroup.ContainerTypeCrio:
 		if c.metadata.logPath == "" {
@@ -1115,7 +1472,7 @@ func (c *Container) runLogParser(logPath string) {
 			delete(c.logParsers, "stdout/stderr")
 		}
 		ch := make(chan logparser.LogEntry)
-		parser := logparser.NewParser(ch, c.metadata.logDecoder, logs.OtelLogEmitter(containerId), multilineCollectorTimeout)
+		parser := logparser.NewParser(ch, c.metadata.logDecoder, c.logEmitter(containerId), multilineCollectorTimeout)
 		reader, err := logs.NewTailReader(proc.HostPath(c.metadata.logPath), ch)
 		if err != nil {
 			klog.Warningln(err)
@@ -1123,7 +1480,7 @@ func (c *Container) runLogParser(logPath string) {
 			return
 		}
 		klog.InfoS("started container logparser", "cg", c.cgroup.Id)
-		c.logParsers["stdout/stderr"] = &LogParser{parser: parser, stop: reader.Stop}
+		c.logParsers["stdout/stderr"] = newLogParser(parser, reader.Stop)
 	}
 }
 
@@ -1171,6 +1528,13 @@ func (c *Container) gc(now time.Time) {
 			if conn == c.connectionsByPidFd[pidFd] {
 				delete(c.connectionsByPidFd, pidFd)
 			}
+		}
+	}
+	c.expirePendingL7(now)
+	c.expireIgnoredConnections(now)
+	for k, conn := range c.replacedConnections {
+		if now.Sub(conn.Closed) > gcInterval {
+			delete(c.replacedConnections, k)
 		}
 	}
 	for dst, at := range c.lastConnectionAttempts {
@@ -1262,13 +1626,13 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32) {
 		return
 	}
 	if !p.openSslUprobesChecked {
-		p.uprobes = append(p.uprobes, tracer.AttachOpenSslUprobes(pid)...)
+		p.addUprobes(tracer.AttachOpenSslUprobes(pid))
 		p.openSslUprobesChecked = true
 	}
 	if !p.goTlsUprobesChecked {
 		uprobes, isGolangApp := tracer.AttachGoTlsUprobes(pid)
 		p.isGolangApp = isGolangApp
-		p.uprobes = append(p.uprobes, uprobes...)
+		p.addUprobes(uprobes)
 		p.goTlsUprobesChecked = true
 	}
 }

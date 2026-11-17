@@ -79,3 +79,27 @@ func TestTailReader(t *testing.T) {
 	write("foo 5\n")
 	get("foo 5")
 }
+
+// Stop must return even when the consumer stopped reading while the reader was blocked
+// sending a line (previously Stop waited forever, blocking the registry event loop that
+// calls Container.Close).
+func TestTailReaderStopWithBlockedConsumer(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "log")
+	assert.NoError(t, err)
+
+	tailPollInterval = 10 * time.Millisecond
+	ch := make(chan logparser.LogEntry) // nobody reads
+	tr, err := NewTailReader(f.Name(), ch)
+	assert.NoError(t, err)
+	_, err = f.WriteString("line1\nline2\n")
+	assert.NoError(t, err)
+	time.Sleep(100 * time.Millisecond) // reader is now blocked on ch
+
+	stopped := make(chan struct{})
+	go func() { tr.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("TailReader.Stop blocked on an unread channel")
+	}
+}

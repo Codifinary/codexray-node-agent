@@ -4,6 +4,109 @@ All notable changes to the Codexray Node Agent are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Log level filter for exported logs** (`CONTAINER_LOG_MIN_LEVEL`, default `all`): with log
+  collection on, export only lines at or above `debug`, `info`, `warning`, `error` or `critical`.
+  `warning` exports warning, error and critical lines. Lines whose level cannot be detected are
+  dropped unless `CONTAINER_LOG_KEEP_UNKNOWN_LEVEL=true`. Dropped lines are counted in
+  `node_agent_dropped_total{component="logs",reason="below_min_level"|"unknown_level"}`. The level
+  comes from the message text (`ERROR`, `level=warn`, glog `E1115`, etc.); for journald, the
+  syslog priority is used when the text has none. Multiline messages (stack traces) keep the level
+  of their first line. `container_log_messages_total` is not affected.
+- **Adaptive trace sampling** (`TRACES_ADAPTIVE_SAMPLING_ENABLED`, default `false`): keeps every
+  error span and every span longer than `TRACES_SLOW_THRESHOLD` (default `500ms`) and samples the
+  rest at `TRACES_SAMPLING`. Decisions are counted in
+  `node_agent_traces_sampling_decisions_total{decision,reason}`.
+- **systemd installer (`install.sh`)**:
+  - `--binary PATH` installs a local binary.
+  - `--memory-max` sets the service's `MemoryMax`, default `2G`, with `MemorySwapMax=0`.
+  - The unit sets these defaults: `GO_MEMORY_LIMIT_RATIO=0.7` and `MEMORY_WATCHDOG_THRESHOLD_RATIO=0.8`, so the OOM safeguards work outside Kubernetes; `LISTEN=0.0.0.0:10300` (was `:80`); `PPROF_LISTEN=127.0.0.1:10302`; `WAL_DIR=/var/lib/codexray-node-agent` (was `/tmp`).
+  - All current settings are passed through, including the switches, trace sampling, memory, StatsD and pprof settings.
+  - Re-running the installer keeps the existing env file and only replaces the settings passed again. It used to delete the file, which dropped the API key and endpoint on upgrade.
+  - Under a 400M cap with L7, traces and logs on, the agent is OOM-killed at startup: it peaks at about 513 MiB, about 232 MiB of that kernel memory, mostly eBPF maps. Use at least 1G when L7 is on.
+
+### Fixed
+- **Missing L7 requests and spans on short-lived connections.** Clients that open a new connection per request (Python urllib/requests without a session, curl, many scripts) lost most successful requests: about 5% of 2xx responses were recorded, against 95% of errors. Connection events and L7 events are read from different perf buffers. An L7 event could therefore be processed after the next connection had reused the same pid/fd, which failed the timestamp check, or before its own connection's open event.
+  - Replaced connections are now indexed by pid/fd/timestamp.
+  - Events that arrive early are held for up to 5 s (at most 1000 per container) and replayed when the connection opens.
+  - Measured on a host with HTTP/1.0 traffic, one connection per request: 2xx capture went from about 5% to about 95% over a 3-minute window, and the remaining gap is within the load generator's 10 s count granularity. Slow-span capture now equals error capture, and 0 events were left unmatched.
+  - New metric: `node_agent_l7_events_connection_match_total{result="current|matched_replaced|matched_deferred|unmatched"}`.
+
+### Changed (breaking default)
+- **Container allowlist in the manifests and installer.** `--container-allowlist` has been
+  required since v1.4.0, but the manifests and `install.sh` did not set it, so the agent exited at
+  startup. Both manifests now list every pod (`^/k8s(-cronjob)?/`) and the kubelet and container runtime
+  services; narrow them per cluster. `install.sh` stops with an explanation when
+  `CONTAINER_ALLOWLIST` is neither passed nor already in the env file, instead of installing a
+  unit that restarts forever. See docs/DEPLOYMENT.md, step 5.
+- **`SCRAPE_INTERVAL` now defaults to `20s`** (was `15s`): the agent gathers and sends its metrics
+  every 20 s. Set `SCRAPE_INTERVAL=15s` to keep the old rate.
+- **`MIN_CONTAINER_AGE`** behavior is now explicit: it gates metrics only (unchanged);
+  `MIN_CONTAINER_AGE_APPLIES_TO=all` also drops logs and traces of young containers.
+
+### Added (cardinality and guard rails)
+- `L7_ACTUAL_DESTINATION` (`keep`), `L7_LATENCY_BUCKETS`, `DNS_MAX_DOMAINS_PER_CONTAINER` (500).
+- Boolean flags accept `--flag=false` / `--flag=true`.
+- Startup warnings for an `EPHEMERAL_PORT_RANGE` that covers service ports and an error for a
+  `CGROUPFS_ROOT` that is not a cgroup filesystem.
+
+Stabilization for the repeated OOM kills, independent telemetry controls, and node
+filesystem metrics. The root cause analysis is in
+[docs/RCA-NODE-AGENT-OOM.md](docs/RCA-NODE-AGENT-OOM.md); the OOMs are **not** declared fixed
+until the soak/canary criteria in [docs/SOAK-TEST.md](docs/SOAK-TEST.md) pass.
+
+### Fixed
+- **Profiler perf maps:** JIT perf maps (JVM/Node.js) were rewritten and fully re-parsed every
+  minute for every profiled process. Unchanged maps are now reused, maps above
+  `PROFILING_MAX_PERFMAP_SIZE` (64MB) are skipped, and `PROFILING_JVM_PERFMAP_DUMP_INTERVAL`
+  is configurable.
+- **Profiler symbolization:** MiniDebugInfo decompression is pre-sized and capped
+  (`PROFILING_MAX_MINIDEBUGINFO_SIZE`); the per-file symbol-name cache is bounded; symbol cache
+  size and keep-rounds are configurable.
+- **Profiling target map:** no longer grows with process churn (reconciled every round). The
+  JVM perf-map dump no longer runs under a lock, and the process handoff no longer blocks the
+  eBPF event loop.
+- **Go TLS uprobes:** attach no longer parses the whole ELF symbol table per process (measured:
+  89MB/16ms per process for a 130MB binary). Results are cached per binary.
+- **Uprobe races:** uprobe links attached concurrently with process exit are no longer leaked.
+  PID reuse no longer orphans a process's uprobes.
+- **logparser** (local fork): fixed a shutdown panic and goroutine leak, and capped the pattern
+  table per source (`LOG_PATTERNS_MAX`, 512).
+- **Shutdown hangs:** `TailReader.Stop` and the journald follower can no longer hang on a
+  stopped consumer.
+- **GPU usage:** aggregated across all processes of a container (previously only the last
+  process counted).
+- **Security:** pprof moved off the metrics listener to `127.0.0.1:10302` and no longer serves
+  `/debug/pprof/cmdline`, which exposed `--api-key` arguments.
+
+### Added
+- **Telemetry settings:** `NODE_METRICS_ENABLED`, `CONTAINER_RESOURCE_METRICS_ENABLED`,
+  `EBPF_L7_METRICS_ENABLED`, `EBPF_L7_TRACES_ENABLED`, `CONTAINER_LOG_COLLECTION_ENABLED`,
+  `CONTAINER_LOG_PARSING_ENABLED`, `PROFILING_ENABLED`. Legacy `DISABLE_L7_TRACING` and
+  `DISABLE_LOG_PARSING` keep their meaning (L7 metrics and traces off; log collection and parsing
+  off) unless a new setting is set explicitly. Every category stays on by default, as before. See [docs/FEATURE-FLAGS.md](docs/FEATURE-FLAGS.md).
+- **Self-observability:** Go runtime/process/cgroup-memory collectors and `node_agent_*`
+  health metrics (active containers/processes/uprobes/log parsers, queue depth, perf lost
+  samples, drops, export failures, profiling, spool size, feature state).
+- **Diagnostics:** optional memory watchdog (`MEMORY_WATCHDOG_THRESHOLD[_RATIO]`), optional Go
+  soft memory limit (`GO_MEMORY_LIMIT_RATIO`), and pprof on a separate listener with optional
+  bearer token.
+- **Node metrics:** `node_filesystem_*` (capacity, available, free, inodes, read-only; bind
+  mounts de-duplicated; configurable exclusions; `NODE_FS_MAX_MOUNTS`), labelled
+  `mountpoint`, `device`, `fstype` like node-exporter, and `node_load1` / `node_load5` /
+  `node_load15`. On hosts that also run Codexray's node-exporter, run only one of the two for node
+  metrics: the backend currently shows load twice for such a node.
+- Soak-test workloads and scripts (`scripts/soak/`), deployment/canary/rollback guide.
+
+### Upgrade notes
+- pprof is no longer reachable on `--listen`. Use `kubectl port-forward <pod> 10302` (the pod
+  uses hostNetwork, so the listener is on the node's loopback) or set `PPROF_LISTEN` together
+  with `PPROF_AUTH_TOKEN`.
+- About 93 additional self-observability series per agent (histogram buckets included), plus 6 per filesystem and 3 for
+  load average.
+
 ## [1.4.1] — 2026-10-29
 
 ### Changed

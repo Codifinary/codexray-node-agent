@@ -7,17 +7,33 @@ package flags
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 var (
-	ListenAddress     = kingpin.Flag("listen", "Listen address - ip:port or :port").Default("0.0.0.0:80").Envar("LISTEN").String()
+	ListenAddress  = kingpin.Flag("listen", "Listen address - ip:port or :port").Default("0.0.0.0:80").Envar("LISTEN").String()
+	PprofListen    = kingpin.Flag("pprof-listen", "Listen address for /debug/pprof/ (separate from --listen). Loopback by default; a non-loopback address requires --pprof-auth-token. Empty disables pprof").Default("127.0.0.1:10302").Envar("PPROF_LISTEN").String()
+	PprofAuthToken = kingpin.Flag("pprof-auth-token", "Bearer token required by the pprof listener (prefer the PPROF_AUTH_TOKEN env var from a Secret)").Envar("PPROF_AUTH_TOKEN").String()
+
+	GoMemoryLimitRatio = kingpin.Flag("go-memory-limit-ratio", "Set the Go soft memory limit to this fraction of the container memory limit (e.g. 0.7). Ignored if GOMEMLIMIT is set. 0 disables").Default("0").Envar("GO_MEMORY_LIMIT_RATIO").Float64()
+
+	MemoryWatchdogThreshold      = kingpin.Flag("memory-watchdog-threshold", "Write a diagnostic bundle when the agent's cgroup memory usage reaches this size (e.g. 3GB). 0 disables").Default("0").Envar("MEMORY_WATCHDOG_THRESHOLD").Bytes()
+	MemoryWatchdogThresholdRatio = kingpin.Flag("memory-watchdog-threshold-ratio", "Write a diagnostic bundle at this fraction of the cgroup memory limit (e.g. 0.8). 0 disables").Default("0").Envar("MEMORY_WATCHDOG_THRESHOLD_RATIO").Float64()
+	MemoryWatchdogMinInterval    = kingpin.Flag("memory-watchdog-min-interval", "Minimum time between diagnostic bundles").Default("15m").Envar("MEMORY_WATCHDOG_MIN_INTERVAL").Duration()
+	MemoryWatchdogMaxDumps       = kingpin.Flag("memory-watchdog-max-dumps", "Diagnostic bundles kept on disk").Default("3").Envar("MEMORY_WATCHDOG_MAX_DUMPS").Int()
+	MemoryWatchdogDir            = kingpin.Flag("memory-watchdog-dir", "Directory for diagnostic bundles (defaults to <wal-dir>/diagnostics)").Envar("MEMORY_WATCHDOG_DIR").String()
+
+	NodeFSExcludeTypes       = kingpin.Flag("node-fs-exclude-types", "Regex of filesystem types excluded from node_filesystem_* (default excludes virtual/pseudo/overlay/tmpfs)").Envar("NODE_FS_EXCLUDE_TYPES").String()
+	NodeFSExcludeMountPoints = kingpin.Flag("node-fs-exclude-mount-points", "Regex of mount points excluded from node_filesystem_* (default excludes /dev, /proc, /sys, /run, runtime and pod volume mounts)").Envar("NODE_FS_EXCLUDE_MOUNT_POINTS").String()
+	NodeFSMaxMounts          = kingpin.Flag("node-fs-max-mounts", "Maximum filesystems reported per node (cardinality cap)").Default("64").Envar("NODE_FS_MAX_MOUNTS").Int()
+
 	CgroupRoot        = kingpin.Flag("cgroupfs-root", "The mount point of the host cgroupfs root").Default("/sys/fs/cgroup").Envar("CGROUPFS_ROOT").String()
-	DisableLogParsing = kingpin.Flag("disable-log-parsing", "Disable container log parsing").Default("false").Envar("DISABLE_LOG_PARSING").Bool()
+	DisableLogParsing = kingpin.Flag("disable-log-parsing", "Disable container log collection and parsing (unless --container-log-collection-enabled / --container-log-parsing-enabled is set explicitly)").Default("false").Envar("DISABLE_LOG_PARSING").Bool()
 	DisablePinger     = kingpin.Flag("disable-pinger", "Don't ping upstreams").Default("false").Envar("DISABLE_PINGER").Bool()
-	DisableL7Tracing  = kingpin.Flag("disable-l7-tracing", "Disable L7 tracing").Default("false").Envar("DISABLE_L7_TRACING").Bool()
+	DisableL7Tracing  = kingpin.Flag("disable-l7-tracing", "Disable L7 metrics and traces (unless --ebpf-l7-metrics-enabled / --ebpf-l7-traces-enabled is set explicitly)").Default("false").Envar("DISABLE_L7_TRACING").Bool()
 
 	ContainerAllowlist = kingpin.Flag("container-allowlist", "List of allowed containers (regex patterns)").Envar("CONTAINER_ALLOWLIST").Strings()
 	ContainerDenylist  = kingpin.Flag("container-denylist", "List of denied containers (regex patterns)").Envar("CONTAINER_DENYLIST").Strings()
@@ -31,8 +47,9 @@ var (
 					Strings()
 	EphemeralPortRange = kingpin.Flag("ephemeral-port-range", "Destination and Listen TCP ports from this range will be skipped").Default("32768-60999").Envar("EPHEMERAL_PORT_RANGE").String()
 
-	MinContainerAge      = kingpin.Flag("min-container-age", "Don't report metrics for containers younger than this. Suppresses short-lived job/cronjob pods that produce high-cardinality series. 0 disables.").Default("30s").Envar("MIN_CONTAINER_AGE").Duration()
-	InstrumentationDelay = kingpin.Flag("instrumentation-delay", "Delay before attaching language-runtime instrumentation (Python GIL, Node.js event loop, etc.) to a newly started process.").Default("30s").Envar("INSTRUMENTATION_DELAY").Duration()
+	MinContainerAge          = kingpin.Flag("min-container-age", "Don't report metrics for containers younger than this. Suppresses short-lived job/cronjob pods that produce high-cardinality series. Logs and traces of young containers are still exported unless --min-container-age-applies-to=all. 0 disables.").Default("30s").Envar("MIN_CONTAINER_AGE").Duration()
+	MinContainerAgeAppliesTo = kingpin.Flag("min-container-age-applies-to", "metrics: --min-container-age suppresses metrics only, so crash logs and traces of short-lived pods stay available (default). all: also drop logs and eBPF traces of containers younger than --min-container-age").Default("metrics").Envar("MIN_CONTAINER_AGE_APPLIES_TO").Enum("metrics", "all")
+	InstrumentationDelay     = kingpin.Flag("instrumentation-delay", "Delay before attaching language-runtime instrumentation (Python GIL, Node.js event loop, etc.) to a newly started process.").Default("30s").Envar("INSTRUMENTATION_DELAY").Duration()
 
 	Provider          = kingpin.Flag("provider", "`provider` label for `node_cloud_info` metric").Envar("PROVIDER").String()
 	Region            = kingpin.Flag("region", "`region` label for `node_cloud_info` metric").Envar("REGION").String()
@@ -44,16 +61,34 @@ var (
 
 	MaxLabelLength = kingpin.Flag("max-label-length", "Maximum length of a metric label value").Default("4096").Envar("MAX_LABEL_LENGTH").Int()
 
-	CollectorEndpoint  = kingpin.Flag("collector-endpoint", "A base endpoint URL for metrics, traces, logs, and profiles").Envar("COLLECTOR_ENDPOINT").URL()
-	ApiKey             = kingpin.Flag("api-key", "Codexray API key").Envar("API_KEY").String()
-	MetricsEndpoint    = kingpin.Flag("metrics-endpoint", "The URL of the endpoint to send metrics to").Envar("METRICS_ENDPOINT").URL()
-	TracesEndpoint     = kingpin.Flag("traces-endpoint", "The URL of the endpoint to send traces to").Envar("TRACES_ENDPOINT").URL()
-	TracesSampling     = kingpin.Flag("traces-sampling", "Trace sampling rate (0.0 to 1.0)").Default("1.0").Envar("TRACES_SAMPLING").Float64()
-	LogsEndpoint       = kingpin.Flag("logs-endpoint", "The URL of the endpoint to send logs to").Envar("LOGS_ENDPOINT").URL()
-	ProfilesEndpoint   = kingpin.Flag("profiles-endpoint", "The URL of the endpoint to send profiles to").Envar("PROFILES_ENDPOINT").URL()
-	InsecureSkipVerify = kingpin.Flag("insecure-skip-verify", "whether to skip verifying the certificate or not").Envar("INSECURE_SKIP_VERIFY").Default("false").Bool()
+	// Cardinality controls. Defaults keep the existing output; see docs/cardinality.md.
+	L7ActualDestination       = kingpin.Flag("l7-actual-destination", "keep: label network/L7 metrics with both destination and actual_destination (default). drop: aggregate by destination only, which removes per-backend-pod series behind a Service").Default("keep").Envar("L7_ACTUAL_DESTINATION").Enum("keep", "drop")
+	L7LatencyBuckets          = kingpin.Flag("l7-latency-buckets", "Comma-separated upper bounds in seconds for L7 and DNS latency histograms, e.g. 0.01,0.05,0.1,0.5,1,5. Empty keeps the Prometheus default buckets (11 bounds)").Envar("L7_LATENCY_BUCKETS").String()
+	DNSMaxDomainsPerContainer = kingpin.Flag("dns-max-domains-per-container", "Maximum distinct DNS domains tracked per container; further domains are counted under domain=\"overflow\". 0 disables the cap").Default("500").Envar("DNS_MAX_DOMAINS_PER_CONTAINER").Int()
+	LogPatternsMax            = kingpin.Flag("log-patterns-max", "Maximum distinct warning/error log patterns tracked per log source; further new patterns are counted under pattern_hash=\"overflow\". 0 = unlimited").Default("512").Envar("LOG_PATTERNS_MAX").Int()
+	ContainerLogMinLevel      = kingpin.Flag("container-log-min-level", "Least severe log level exported via OTLP when log collection is on: all (default, every line), debug, info, warning (warning, error and critical), error (error and critical) or critical. Lines whose level cannot be detected are dropped unless --container-log-keep-unknown-level. Does not affect container_log_messages_total").Default("all").Envar("CONTAINER_LOG_MIN_LEVEL").Enum("all", "debug", "info", "warning", "error", "critical")
+	ContainerLogKeepUnknown   = kingpin.Flag("container-log-keep-unknown-level", "With --container-log-min-level other than all, still export lines whose level cannot be detected (plain-text output, e.g. some panics and stack traces printed without a level)").Default("false").Envar("CONTAINER_LOG_KEEP_UNKNOWN_LEVEL").Bool()
 
-	ScrapeInterval = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("15s").Envar("SCRAPE_INTERVAL").Duration()
+	CollectorEndpoint = kingpin.Flag("collector-endpoint", "A base endpoint URL for metrics, traces, logs, and profiles").Envar("COLLECTOR_ENDPOINT").URL()
+	ApiKey            = kingpin.Flag("api-key", "Codexray API key").Envar("API_KEY").String()
+	MetricsEndpoint   = kingpin.Flag("metrics-endpoint", "The URL of the endpoint to send metrics to").Envar("METRICS_ENDPOINT").URL()
+	TracesEndpoint    = kingpin.Flag("traces-endpoint", "The URL of the endpoint to send traces to").Envar("TRACES_ENDPOINT").URL()
+	TracesSampling    = kingpin.Flag("traces-sampling", "Trace sampling rate (0.0 to 1.0). With adaptive sampling, the rate for spans that are neither errors nor slow").Default("1.0").Envar("TRACES_SAMPLING").Float64()
+
+	TracesAdaptiveSampling = kingpin.Flag("traces-adaptive-sampling-enabled", "Adaptive trace sampling: keep every error span and every span slower than --traces-slow-threshold, and sample the rest at --traces-sampling").Default("false").Envar("TRACES_ADAPTIVE_SAMPLING_ENABLED").Bool()
+	TracesSlowThreshold    = kingpin.Flag("traces-slow-threshold", "With adaptive sampling, spans longer than this are always kept").Default("500ms").Envar("TRACES_SLOW_THRESHOLD").Duration()
+	LogsEndpoint           = kingpin.Flag("logs-endpoint", "The URL of the endpoint to send logs to").Envar("LOGS_ENDPOINT").URL()
+	ProfilesEndpoint       = kingpin.Flag("profiles-endpoint", "The URL of the endpoint to send profiles to").Envar("PROFILES_ENDPOINT").URL()
+	InsecureSkipVerify     = kingpin.Flag("insecure-skip-verify", "whether to skip verifying the certificate or not").Envar("INSECURE_SKIP_VERIFY").Default("false").Bool()
+
+	ProfilingSymbolCacheSize        = kingpin.Flag("profiling-symbol-cache-size", "Entries in each eBPF profiler symbol cache (per-PID, build-ID and same-file caches)").Default("256").Envar("PROFILING_SYMBOL_CACHE_SIZE").Int()
+	ProfilingSymbolCacheKeepRounds  = kingpin.Flag("profiling-symbol-cache-keep-rounds", "Collection rounds (1 round = 1m) an unused symbol table is kept in cache").Default("8").Envar("PROFILING_SYMBOL_CACHE_KEEP_ROUNDS").Int()
+	ProfilingMaxMiniDebugInfoSize   = kingpin.Flag("profiling-max-minidebuginfo-size", "Maximum decompressed size of an ELF .gnu_debugdata section loaded for symbolization; larger ones are skipped. 0 = unlimited").Default("32MB").Envar("PROFILING_MAX_MINIDEBUGINFO_SIZE").Bytes()
+	ProfilingMaxPerfMapSize         = kingpin.Flag("profiling-max-perfmap-size", "Skip JIT perf map files (/tmp/perf-<pid>.map from JVM/Node.js) larger than this when symbolizing; JIT frames are then left unresolved. 0 = unlimited").Default("64MB").Envar("PROFILING_MAX_PERFMAP_SIZE").Bytes()
+	ProfilingJvmPerfmapInterval     = kingpin.Flag("profiling-jvm-perfmap-dump-interval", "How often to ask each JVM to rewrite its perf map (Compiler.perfmap). Each dump makes the JVM write, and the agent re-parse, the whole map").Default("1m").Envar("PROFILING_JVM_PERFMAP_DUMP_INTERVAL").Duration()
+	ProfilingSymbolNameCacheEntries = kingpin.Flag("profiling-symbol-name-cache-entries", "Maximum cached symbol names per loaded ELF file. 0 = unlimited").Default("16384").Envar("PROFILING_SYMBOL_NAME_CACHE_ENTRIES").Int()
+
+	ScrapeInterval = kingpin.Flag("scrape-interval", "How often to gather metrics from the agent").Default("20s").Envar("SCRAPE_INTERVAL").Duration()
 	WalDir         = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default("/tmp/Codexray-node-agent").Envar("WAL_DIR").String()
 	MaxSpoolSize   = kingpin.Flag("max-spool-size", "Maximum size of the on-disk spool used to buffer data when it cannot be sent to collector. Supports size suffixes like KB, MB, or GB.").Default("500MB").Envar("MAX_SPOOL_SIZE").Bytes()
 
@@ -108,7 +143,9 @@ func init() {
 
 	kingpin.HelpFlag.Short('h').Hidden()
 	normalizeLegacyStatsDConfig()
+	os.Args = append(os.Args[:1], NormalizeBoolArgs(kingpin.CommandLine.Model(), os.Args[1:])...)
 	kingpin.Parse()
+	resolveTelemetryFromFlags()
 
 	if *agentVersion {
 		fmt.Println("Version:", Version)
@@ -169,4 +206,35 @@ func listenExplicitlyConfigured() bool {
 		}
 	}
 	return false
+}
+
+// NormalizeBoolArgs rewrites --flag=false to --no-flag and --flag=true to --flag for boolean
+// flags, which kingpin otherwise rejects ("unexpected false"). Other arguments are unchanged;
+// an unparsable value is left for kingpin to report.
+func NormalizeBoolArgs(model *kingpin.ApplicationModel, args []string) []string {
+	isBool := map[string]bool{}
+	for _, f := range model.Flags {
+		isBool[f.Name] = f.IsBoolFlag()
+	}
+	out := make([]string, 0, len(args))
+	for i, a := range args {
+		if a == "--" {
+			return append(out, args[i:]...)
+		}
+		name, val, ok := strings.Cut(strings.TrimPrefix(a, "--"), "=")
+		if !ok || !strings.HasPrefix(a, "--") || !isBool[name] {
+			out = append(out, a)
+			continue
+		}
+		b, err := strconv.ParseBool(val)
+		switch {
+		case err != nil:
+			out = append(out, a)
+		case b:
+			out = append(out, "--"+name)
+		default:
+			out = append(out, "--no-"+name)
+		}
+	}
+	return out
 }

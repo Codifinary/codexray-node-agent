@@ -9,9 +9,12 @@ import (
 	"bytes"
 	"debug/buildinfo"
 	"debug/elf"
+	"errors"
+	"io/fs"
 	"os"
 	"regexp"
 	"strings"
+	"syscall"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/codifinary/codexray-node-agent/common"
@@ -138,16 +141,96 @@ func (t *Tracer) AttachOpenSslUprobes(pid uint32) []link.Link {
 	return links
 }
 
+// goTlsBinaryInfo is everything AttachGoTlsUprobes needs from a Go binary. Computing it
+// parses the binary's full ELF symbol table (tens of MB of transient allocations for large
+// binaries), so it is cached per file identity and reused for every process running the
+// same binary instead of being recomputed per PID.
+type goTlsBinaryInfo struct {
+	isGo           bool
+	name, version  string
+	skipReason     string // non-empty: don't attach (unsupported version, symbols missing, ...)
+	skipErr        error
+	transient      bool // the result came from an I/O failure (e.g. the process exited): don't cache it
+	writeAddr      uint64
+	readAddr       uint64
+	readRetOffsets []int
+}
+
+var goTlsBinaryCache = newFileInfoCache[*goTlsBinaryInfo](256)
+
+// isTransientFileError reports whether err comes from accessing the file (it vanished with its
+// process, permissions, I/O) rather than from its contents. Such results are not cached: the
+// next process running the same binary may succeed.
+func isTransientFileError(err error) bool {
+	var pe *fs.PathError
+	return errors.As(err, &pe) || errors.Is(err, syscall.ESRCH) || errors.Is(err, syscall.EIO)
+}
+
+func cacheableGoTlsBinaryInfo(info *goTlsBinaryInfo) bool { return info != nil && !info.transient }
+
+func loadGoTlsBinaryInfo(path string) *goTlsBinaryInfo {
+	info := &goTlsBinaryInfo{}
+	bi, err := buildinfo.ReadFile(path)
+	if err != nil {
+		info.skipReason, info.skipErr = "failed to read build info", err
+		info.transient = isTransientFileError(err)
+		return info
+	}
+	info.isGo = true
+	info.version = bi.GoVersion
+	if name, err := os.Readlink(path); err == nil {
+		info.name = name
+	} else {
+		info.name = path
+	}
+	v, err := common.VersionFromString(strings.Replace(bi.GoVersion, "go", "", 1))
+	if err != nil {
+		info.skipReason, info.skipErr = "failed to determine version", err
+		return info
+	}
+	if !v.GreaterOrEqual(common.NewVersion(1, 17, 0)) {
+		info.skipReason = "versions below 1.17 are not supported"
+		return info
+	}
+	ef, err := OpenELFFile(path)
+	if err != nil {
+		info.skipReason, info.skipErr = "failed to open as elf binary", err
+		info.transient = isTransientFileError(err)
+		return info
+	}
+	defer ef.Close()
+	ws, err := ef.GetSymbol(goTlsWriteSymbol)
+	if err != nil {
+		info.skipReason, info.skipErr = "failed to get symbol", err
+		return info
+	}
+	rs, err := ef.GetSymbol(goTlsReadSymbol)
+	if err != nil {
+		info.skipReason, info.skipErr = "failed to get symbol", err
+		return info
+	}
+	offsets, err := rs.ReturnOffsets()
+	if err != nil {
+		info.skipReason, info.skipErr = "failed to find read_exit offsets", err
+		return info
+	}
+	info.writeAddr = ws.Address()
+	info.readAddr = rs.Address()
+	info.readRetOffsets = offsets
+	return info
+}
+
 func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
-	isGolangApp := false
 	if t.disableL7Tracing {
-		return nil, isGolangApp
+		return nil, false
 	}
 
 	path := proc.Path(pid, "exe")
-
-	var err error
-	var name, version string
+	info, cached := goTlsBinaryCache.getIf(path, loadGoTlsBinaryInfo, cacheableGoTlsBinaryInfo)
+	if info == nil || !info.isGo {
+		return nil, false
+	}
+	name, version := info.name, info.version
 	log := func(msg string, err error) {
 		if err != nil {
 			for _, s := range []string{"not a Go executable", "no such file or directory", "no such process", "permission denied"} {
@@ -160,40 +243,17 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 		}
 		klog.InfofDepth(1, "pid=%d golang_app=%s golang_version=%s: %s", pid, name, version, msg)
 	}
-
-	bi, err := buildinfo.ReadFile(path)
-	if err != nil {
-		log("failed to read build info", err)
-		return nil, isGolangApp
+	if info.skipReason != "" {
+		if !cached { // log once per binary, not once per process
+			log(info.skipReason, info.skipErr)
+		}
+		return nil, true
 	}
-	isGolangApp = true
-
-	name, err = os.Readlink(path)
-	if err != nil {
-		log("failed to read name", err)
-		return nil, isGolangApp
-	}
-	version = bi.GoVersion
-	v, err := common.VersionFromString(strings.Replace(bi.GoVersion, "go", "", 1))
-	if err != nil {
-		log("failed to determine version", err)
-	}
-	if !v.GreaterOrEqual(common.NewVersion(1, 17, 0)) {
-		log("versions below 1.17 are not supported", nil)
-		return nil, isGolangApp
-	}
-
-	ef, err := OpenELFFile(path)
-	if err != nil {
-		log("failed to open as elf binary", err)
-		return nil, isGolangApp
-	}
-	defer ef.Close()
 
 	exe, err := link.OpenExecutable(path)
 	if err != nil {
 		log("failed to open executable", err)
-		return nil, isGolangApp
+		return nil, true
 	}
 
 	var links []link.Link
@@ -202,44 +262,43 @@ func (t *Tracer) AttachGoTlsUprobes(pid uint32) ([]link.Link, bool) {
 			l.Close()
 		}
 	}
-
-	ws, err := ef.GetSymbol(goTlsWriteSymbol)
-	if err != nil {
-		log("failed to get symbol", err)
-		return nil, isGolangApp
-	}
-	l, err := ws.AttachUprobe(exe, t.uprobes["go_crypto_tls_write_enter"], pid)
+	l, err := exe.Uprobe(goTlsWriteSymbol, t.uprobes["go_crypto_tls_write_enter"], &link.UprobeOptions{Address: info.writeAddr, PID: int(pid)})
 	if err != nil {
 		log("failed to attach write_enter uprobe", err)
-		return nil, isGolangApp
+		return nil, true
 	}
 	links = append(links, l)
 
-	rs, err := ef.GetSymbol(goTlsReadSymbol)
-	if err != nil {
-		log("failed to get symbol", err)
-		return nil, isGolangApp
-	}
-	l, err = rs.AttachUprobe(exe, t.uprobes["go_crypto_tls_read_enter"], pid)
+	l, err = exe.Uprobe(goTlsReadSymbol, t.uprobes["go_crypto_tls_read_enter"], &link.UprobeOptions{Address: info.readAddr, PID: int(pid)})
 	if err != nil {
 		log("failed to attach read_enter uprobe", err)
 		closeLinks()
-		return nil, isGolangApp
+		return nil, true
 	}
 	links = append(links, l)
 
-	ls, err := rs.AttachUretprobes(exe, t.uprobes["go_crypto_tls_read_exit"], pid)
-	links = append(links, ls...)
-	if err != nil {
-		log("failed to attach read_exit uprobe", err)
-		closeLinks()
-		return nil, isGolangApp
-	}
-	if len(links) == 0 {
-		return nil, isGolangApp
+	for _, offset := range info.readRetOffsets {
+		l, err = exe.Uprobe("pthread_cond_timedwait", t.uprobes["go_crypto_tls_read_exit"], &link.UprobeOptions{Address: info.readAddr, Offset: uint64(offset), PID: int(pid)})
+		if err != nil {
+			log("failed to attach read_exit uprobe", err)
+			closeLinks()
+			return nil, true
+		}
+		links = append(links, l)
 	}
 	log("crypto/tls uprobes attached", nil)
-	return links, isGolangApp
+	return links, true
+}
+
+// opensslVersionCache avoids reading libcrypto's .rodata (megabytes) for every process
+// that maps the same library file.
+// Results of transient file errors are not cached: libcrypto is shared by most processes on
+// the node, so one process exiting mid-read would otherwise disable OpenSSL uprobes node-wide.
+var opensslVersionCache = newFileInfoCache[opensslVersionResult](256)
+
+type opensslVersionResult struct {
+	version   string
+	transient bool
 }
 
 func getSslLibPathAndVersion(pid uint32) (string, string) {
@@ -279,18 +338,33 @@ func getSslLibPathAndVersion(pid uint32) (string, string) {
 		return "", ""
 	}
 
+	res, _ := opensslVersionCache.getIf(libcryptoPath, loadOpensslVersion,
+		func(r opensslVersionResult) bool { return !r.transient })
+	version := res.version
+	if version == "" {
+		return "", ""
+	}
+	return libsslPath, version
+}
+
+func loadOpensslVersion(libcryptoPath string) opensslVersionResult {
+	v, err := readOpensslVersion(libcryptoPath)
+	return opensslVersionResult{version: v, transient: err != nil && isTransientFileError(err)}
+}
+
+func readOpensslVersion(libcryptoPath string) (string, error) {
 	ef, err := elf.Open(libcryptoPath)
 	if err != nil {
-		return "", ""
+		return "", err
 	}
 	defer ef.Close()
 	rodataSection := ef.Section(".rodata")
 	if rodataSection == nil {
-		return "", ""
+		return "", nil
 	}
 	rodataSectionData, err := rodataSection.Data()
 	if err != nil {
-		return "", ""
+		return "", err
 	}
 	var version string
 	for _, b := range bytes.Split(rodataSectionData, []byte("\x00")) {
@@ -305,5 +379,5 @@ func getSslLibPathAndVersion(pid uint32) (string, string) {
 			version = m[1]
 		}
 	}
-	return libsslPath, "v" + version
+	return "v" + version, nil
 }

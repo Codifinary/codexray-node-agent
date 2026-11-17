@@ -54,6 +54,7 @@ require (
 	github.com/grafana/regexp v0.0.0-20240518133315-a468a5bfb3bc // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/ianlancetaylor/demangle v0.0.0-20240312041847-bd984b5ce465 // indirect
+	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/samber/lo v1.38.1 // indirect
 	github.com/ulikunitz/xz v0.5.15 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
@@ -218,3 +219,6 @@ replace (
 replace github.com/prometheus/prometheus => ./internal/prom
 
 replace github.com/grafana/pyroscope/ebpf => ./internal/pyroscope-ebpf
+
+// Local fork: safe shutdown and bounded pattern table (see internal/logparser/FORK.md).
+replace github.com/codifinary/logparser => ./internal/logparser

@@ -13,6 +13,9 @@ type ElfSymbolReader interface {
 	getString(start int, demangleOptions []demangle.Option) (string, bool)
 }
 
+// MaxStringCacheEntries bounds the per-file symbol name cache. 0 = unbounded.
+var MaxStringCacheEntries = 16384
+
 type InMemElfFile struct {
 	elf.FileHeader
 	Sections    []elf.SectionHeader
@@ -102,6 +105,12 @@ func (f *InMemElfFile) getString(start int, demangleOptions []demangle.Option) (
 				s = demangle.Filter(s, demangleOptions...)
 			}
 			if f.stringCache == nil {
+				f.stringCache = make(map[int]string)
+			}
+			if MaxStringCacheEntries > 0 && len(f.stringCache) >= MaxStringCacheEntries {
+				// Codexray: the cache is a pure optimization and previously grew without bound
+				// (one entry per resolved symbol, demangled, for the lifetime of the cached table).
+				// Dropping it wholesale is O(1) amortized and keeps memory bounded.
 				f.stringCache = make(map[int]string)
 			}
 			f.stringCache[start] = s

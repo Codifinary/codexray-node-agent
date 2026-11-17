@@ -70,10 +70,16 @@ func NewTailReader(fileName string, ch chan<- logparser.LogEntry) (*TailReader, 
 					line = prefix + line
 					prefix = ""
 				}
-				r.ch <- logparser.LogEntry{
+				select {
+				case r.ch <- logparser.LogEntry{
 					Timestamp: time.Now(),
 					Content:   strings.TrimSuffix(line, "\n"),
 					Level:     logparser.LevelUnknown,
+				}:
+				case <-ctx.Done():
+					// Stop must never wait on a consumer that is itself shutting down.
+					r.stopped <- struct{}{}
+					return
 				}
 			}
 		}

@@ -16,6 +16,7 @@ import (
 
 	"github.com/codifinary/codexray-node-agent/cgroup"
 	"github.com/codifinary/codexray-node-agent/common"
+	"github.com/codifinary/codexray-node-agent/diag"
 	"github.com/codifinary/codexray-node-agent/ebpftracer"
 	"github.com/codifinary/codexray-node-agent/flags"
 	"github.com/codifinary/codexray-node-agent/gpu"
@@ -105,8 +106,10 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 	if err = CrioInit(); err != nil {
 		klog.Warningln(err)
 	}
-	if err = JournaldInit(); err != nil {
-		klog.Warningln(err)
+	if flags.Telemetry.LogPipeline() {
+		if err = JournaldInit(); err != nil {
+			klog.Warningln(err)
+		}
 	}
 
 	r := &Registry{
@@ -120,7 +123,8 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 
 		processInfoCh: processInfoCh,
 
-		tracer: ebpftracer.NewTracer(hostNetNs, selfNetNs, *flags.DisableL7Tracing),
+		// L7 eBPF programs and TLS uprobes are needed for either L7 metrics or L7 traces.
+		tracer: ebpftracer.NewTracer(hostNetNs, selfNetNs, !flags.Telemetry.L7Probes()),
 
 		trafficStatsUpdateCh: make(chan *TrafficStatsUpdate),
 		nodejsStatsUpdateCh:  make(chan *NodejsStatsUpdate),
@@ -131,6 +135,7 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 	if err = reg.Register(r); err != nil {
 		return nil, err
 	}
+	diag.SetEventQueue(func() int { return len(r.events) }, func() int { return cap(r.events) })
 	go r.handleEvents(r.events)
 	if err = r.tracer.Run(r.events); err != nil {
 		close(r.events)
@@ -257,10 +262,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 					}
 				}
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
-					p := c.onProcessStart(e.Pid)
-					if r.processInfoCh != nil && p != nil {
-						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}
-					}
+					r.handoffProcess(c, c.onProcessStart(e.Pid))
 				}
 			case ebpftracer.EventTypeProcessExit:
 				if c := r.containersByPid[e.Pid]; c != nil {
@@ -286,6 +288,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 
 			case ebpftracer.EventTypeConnectionOpen:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					r.ensureProcess(c, e.Pid)
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, e.Timestamp, false, e.Duration)
 					c.attachTlsUprobes(r.tracer, e.Pid)
 				} else {
@@ -293,6 +296,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 			case ebpftracer.EventTypeConnectionError:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					r.ensureProcess(c, e.Pid)
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, 0, true, e.Duration)
 				} else {
 					klog.Infoln("TCP connection error from unknown container", e)
@@ -321,6 +325,33 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 			}
 		}
+	}
+}
+
+// handoffProcess passes a newly registered process to the profiler.
+func (r *Registry) handoffProcess(c *Container, p *Process) {
+	if r.processInfoCh == nil || p == nil {
+		return
+	}
+	// Never block the event loop on the profiler: a stalled handoff used to
+	// back up every eBPF event (and, through Collect, every scrape).
+	select {
+	case r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}:
+	default:
+		diag.DroppedTotal.WithLabelValues("profiling", "process_handoff_queue_full").Inc()
+	}
+}
+
+// ensureProcess registers pid in c if its process-start event has not been processed yet.
+// Process events are read from a separate perf buffer with a longer read deadline than
+// connection events, so the first connections of a just-started process (CLI tools, cron
+// jobs, benchmark phases) used to be dropped as coming from an unknown process.
+func (r *Registry) ensureProcess(c *Container, pid uint32) {
+	c.lock.Lock()
+	known := c.processes[pid] != nil
+	c.lock.Unlock()
+	if !known {
+		r.handoffProcess(c, c.onProcessStart(pid))
 	}
 }
 
@@ -385,9 +416,12 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	if c := r.containersById[id]; c != nil {
 		klog.Warningln("id conflict:", id)
 		if cg.CreatedAt().After(c.cgroup.CreatedAt()) {
+			c.lock.Lock()
 			c.cgroup = cg
 			c.metadata = md
+			c.publishAge()
 			c.runLogParser("")
+			c.lock.Unlock()
 		}
 		r.containersByPid[pid] = c
 		r.containersByCgroupId[cg.Id] = c
