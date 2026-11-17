@@ -274,9 +274,7 @@ func main() {
 		dogStatsDReceiver = receiver
 	}
 
-	if err := prom.StartAgent(registry, machineId, systemUuid, seriesSources...); err != nil {
-		klog.Exitln(err)
-	}
+	metricsAgent := prom.StartAgent(registry, machineId, systemUuid, seriesSources...)
 
 	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -284,6 +282,10 @@ func main() {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	http.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !metricsAgent.Healthy() {
+			http.Error(w, "metrics spool not writable", http.StatusServiceUnavailable)
+			return
+		}
 		if *flags.DogStatsDEnabled && (dogStatsDReceiver == nil || !dogStatsDReceiver.Ready() || dogStatsDPipeline == nil || !dogStatsDPipeline.Healthy()) {
 			http.Error(w, "dogstatsd pipeline not ready", http.StatusServiceUnavailable)
 			return

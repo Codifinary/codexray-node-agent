@@ -101,7 +101,7 @@ func TestScrapeDoesNotCommitExternalSeriesWhenSpoolFails(t *testing.T) {
 		reg:          prometheus.NewRegistry(),
 		labels:       map[string]string{},
 		sources:      []SeriesSource{source},
-		spoolDir:     filepath.Join(t.TempDir(), "missing", "spool"),
+		spoolDir:     blockedSpoolDir(t),
 		maxSpoolSize: 1024,
 	}
 	if err := agent.scrape(); err == nil {
@@ -110,6 +110,22 @@ func TestScrapeDoesNotCommitExternalSeriesWhenSpoolFails(t *testing.T) {
 	if source.committed != 0 || len(source.series) != 1 {
 		t.Fatalf("source committed=%d remaining=%d", source.committed, len(source.series))
 	}
+	if agent.Healthy() {
+		t.Fatal("agent reports healthy although the spool cannot be written")
+	}
+	if got := len(agent.memBuf); got != 1 {
+		t.Fatalf("buffered payloads=%d, want 1", got)
+	}
+}
+
+// blockedSpoolDir returns a spool path under a regular file, so it cannot be created even by root.
+func blockedSpoolDir(t *testing.T) string {
+	t.Helper()
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(blocker, "spool")
 }
 
 func TestSendUsesNodeAgentAuthenticationAndRemoteWriteHeaders(t *testing.T) {
