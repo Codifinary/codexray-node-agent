@@ -17,6 +17,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,7 +40,37 @@ const (
 
 	// memoryBufferMaxBytes caps the payloads kept in memory while the spool cannot be written.
 	memoryBufferMaxBytes = 32 << 20
+
+	// metricsQuarantineMaxBytes caps the spool files the collector rejected for good.
+	metricsQuarantineMaxBytes = 50 << 20
+	quarantineDirName         = "quarantine"
+
+	rejectedBodyLogBytes = 512
+	maxDrainedBodyBytes  = 64 << 10
 )
+
+// remoteWriteError is a non-2xx answer from the collector.
+type remoteWriteError struct {
+	status string
+	code   int
+	body   string
+}
+
+func (e *remoteWriteError) Error() string {
+	if e.body == "" {
+		return e.status
+	}
+	return e.status + ": " + e.body
+}
+
+// permanentRejection reports whether retrying the payload can never succeed.
+func permanentRejection(err error) (*remoteWriteError, bool) {
+	var rejected *remoteWriteError
+	if errors.As(err, &rejected) && common.ClassifyHTTPStatus(rejected.code) == common.SendPermanent {
+		return rejected, true
+	}
+	return nil, false
+}
 
 type Agent struct {
 	reg          *prometheus.Registry
@@ -73,6 +104,7 @@ type agentMetrics struct {
 	spoolHealthy      prometheus.Gauge
 	memoryBufferBytes prometheus.Gauge
 	droppedPayloads   prometheus.Counter
+	rejectedPayloads  *prometheus.CounterVec
 }
 
 func newAgentMetrics(reg prometheus.Registerer) *agentMetrics {
@@ -80,8 +112,9 @@ func newAgentMetrics(reg prometheus.Registerer) *agentMetrics {
 		spoolHealthy:      prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "node_agent", Subsystem: "metrics", Name: "spool_healthy", Help: "Whether the on-disk metrics spool can be written."}),
 		memoryBufferBytes: prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "node_agent", Subsystem: "metrics", Name: "memory_buffer_bytes", Help: "Bytes of metrics payloads kept in memory because the spool could not be written."}),
 		droppedPayloads:   prometheus.NewCounter(prometheus.CounterOpts{Namespace: "node_agent", Subsystem: "metrics", Name: "dropped_payloads_total", Help: "Metrics payloads dropped because the in-memory buffer was full."}),
+		rejectedPayloads:  prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "node_agent", Subsystem: "metrics", Name: "rejected_payloads_total", Help: "Metrics payloads the collector rejected for good, by HTTP status."}, []string{"code"}),
 	}
-	reg.MustRegister(m.spoolHealthy, m.memoryBufferBytes, m.droppedPayloads)
+	reg.MustRegister(m.spoolHealthy, m.memoryBufferBytes, m.droppedPayloads, m.rejectedPayloads)
 	m.spoolHealthy.Set(1)
 	return m
 }
@@ -106,6 +139,12 @@ func (m *agentMetrics) setMemoryBufferBytes(n int) {
 func (m *agentMetrics) incDroppedPayloads() {
 	if m != nil {
 		m.droppedPayloads.Inc()
+	}
+}
+
+func (m *agentMetrics) incRejectedPayloads(code int) {
+	if m != nil {
+		m.rejectedPayloads.WithLabelValues(strconv.Itoa(code)).Inc()
 	}
 }
 
@@ -239,19 +278,95 @@ func (a *Agent) sendOnce() (bool, error) {
 	}
 	if fName != "" {
 		if err := a.send(fName); err != nil {
+			if rejected, ok := permanentRejection(err); ok {
+				return true, a.quarantine(fName, rejected)
+			}
 			return true, err
 		}
-		return true, os.Remove(fName)
+		// The spool may have evicted the file while it was being sent.
+		if err := os.Remove(fName); err != nil && !os.IsNotExist(err) {
+			return true, err
+		}
+		return true, nil
 	}
 	p, ok := a.takeOldestFromMemory()
 	if !ok {
 		return false, nil
 	}
 	if err := a.post(bytes.NewReader(p.data)); err != nil {
+		if rejected, ok := permanentRejection(err); ok {
+			a.metrics.incRejectedPayloads(rejected.code)
+			klog.Errorf("collector rejected a buffered metrics payload, dropping it: %s", rejected)
+			return true, nil
+		}
 		a.putBackOldestInMemory(p)
 		return true, err
 	}
 	return true, nil
+}
+
+// quarantine moves a spool file the collector rejected for good out of the queue, so the files after it are sent.
+func (a *Agent) quarantine(fName string, rejected *remoteWriteError) error {
+	a.metrics.incRejectedPayloads(rejected.code)
+	dest, err := quarantineSpoolFile(fName, path.Join(a.spoolDir, quarantineDirName), rejected.code, metricsQuarantineMaxBytes)
+	switch {
+	case err == nil:
+		klog.Errorf("collector rejected %s with %s, moved to %s", fName, rejected, dest)
+		return nil
+	case os.IsNotExist(err):
+		return nil
+	}
+	klog.Errorf("collector rejected %s with %s and it could not be quarantined (%s), deleting it", fName, rejected, err)
+	if err := os.Remove(fName); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("deleting rejected spool file %s: %w", fName, err)
+	}
+	return nil
+}
+
+// quarantineSpoolFile moves src into dir, then deletes the oldest quarantined files while dir holds more than maxBytes.
+func quarantineSpoolFile(src, dir string, code int, maxBytes int64) (string, error) {
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return "", err
+	}
+	dest := path.Join(dir, fmt.Sprintf("%s.%d.failed", path.Base(src), code))
+	if err := os.Rename(src, dest); err != nil {
+		return "", err
+	}
+	return dest, trimQuarantine(dir, maxBytes)
+}
+
+func trimQuarantine(dir string, maxBytes int64) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var files []string
+	sizes := map[string]int64{}
+	var total int64
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".failed") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		name := path.Join(dir, e.Name())
+		files = append(files, name)
+		sizes[name] = info.Size()
+		total += info.Size()
+	}
+	sort.Strings(files)
+	for _, name := range files {
+		if total <= maxBytes {
+			break
+		}
+		if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		total -= sizes[name]
+	}
+	return nil
 }
 
 func (a *Agent) send(fPath string) error {
@@ -282,7 +397,9 @@ func (a *Agent) post(body io.Reader) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return errors.New(resp.Status)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, rejectedBodyLogBytes))     // a cut-off body is still worth logging
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainedBodyBytes)) // drained so the connection is reused
+		return &remoteWriteError{status: resp.Status, code: resp.StatusCode, body: strings.TrimSpace(string(body))}
 	}
 	klog.Infof("sent metrics in %s", time.Since(t).Truncate(time.Millisecond))
 	return nil

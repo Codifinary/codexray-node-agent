@@ -7,23 +7,25 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/codifinary/codexray-node-agent/common"
 )
 
 func TestCustomSenderClassifiesResponsesAndSetsHeaders(t *testing.T) {
 	tests := []struct {
 		status int
-		want   SendDisposition
+		want   common.SendDisposition
 	}{
-		{http.StatusNoContent, SendSuccess},
-		{http.StatusBadRequest, SendPermanent},
-		{http.StatusUnauthorized, SendRetry},
-		{http.StatusForbidden, SendRetry},
-		{http.StatusNotFound, SendPermanent},
-		{http.StatusRequestEntityTooLarge, SendPermanent},
-		{http.StatusRequestTimeout, SendRetry},
-		{http.StatusTooManyRequests, SendRetry},
-		{http.StatusInternalServerError, SendRetry},
-		{http.StatusServiceUnavailable, SendRetry},
+		{http.StatusNoContent, common.SendSuccess},
+		{http.StatusBadRequest, common.SendPermanent},
+		{http.StatusUnauthorized, common.SendRetry},
+		{http.StatusForbidden, common.SendRetry},
+		{http.StatusNotFound, common.SendPermanent},
+		{http.StatusRequestEntityTooLarge, common.SendPermanent},
+		{http.StatusRequestTimeout, common.SendRetry},
+		{http.StatusTooManyRequests, common.SendRetry},
+		{http.StatusInternalServerError, common.SendRetry},
+		{http.StatusServiceUnavailable, common.SendRetry},
 	}
 	for _, tc := range tests {
 		t.Run(http.StatusText(tc.status), func(t *testing.T) {
@@ -50,10 +52,10 @@ func TestCustomSenderClassifiesResponsesAndSetsHeaders(t *testing.T) {
 			if got != tc.want || code != tc.status {
 				t.Fatalf("result=(%v,%d), want (%v,%d), err=%v", got, code, tc.want, tc.status, err)
 			}
-			if tc.want == SendSuccess && err != nil {
+			if tc.want == common.SendSuccess && err != nil {
 				t.Fatal(err)
 			}
-			if tc.want != SendSuccess && err == nil {
+			if tc.want != common.SendSuccess && err == nil {
 				t.Fatal("expected status error")
 			}
 		})

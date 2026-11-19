@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/golang/snappy"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/prompb"
@@ -184,7 +185,7 @@ func (p *Pipeline) run() {
 			_ = p.FlushOnce(at)
 		case <-retryTimer.C:
 			disposition, _, err := p.ReplayOnce()
-			if err != nil && disposition == SendRetry {
+			if err != nil && disposition == common.SendRetry {
 				retryDelay *= 2
 				if retryDelay > p.cfg.RetryMax {
 					retryDelay = p.cfg.RetryMax
@@ -278,43 +279,43 @@ func marshalCustomBatch(series []prompb.TimeSeries) ([]byte, error) {
 
 // ReplayOnce processes only the oldest custom payload. Retryable failures leave
 // it in place; permanent failures move it to quarantine; success removes it.
-func (p *Pipeline) ReplayOnce() (SendDisposition, int, error) {
+func (p *Pipeline) ReplayOnce() (common.SendDisposition, int, error) {
 	file, err := p.spool.Oldest()
 	if err != nil {
 		p.setComponentHealthy("spool", false)
-		return SendRetry, 0, err
+		return common.SendRetry, 0, err
 	}
 	if file == "" {
-		return SendSuccess, 0, nil
+		return common.SendSuccess, 0, nil
 	}
 	sampleCount, countErr := customPayloadSampleCount(file)
 	if countErr != nil {
 		if _, quarantineErr := p.spool.Quarantine(file, "corrupt-payload"); quarantineErr != nil {
 			p.setComponentHealthy("spool", false)
 			p.setComponentHealthy("delivery", false)
-			return SendRetry, 0, errors.Join(countErr, quarantineErr)
+			return common.SendRetry, 0, errors.Join(countErr, quarantineErr)
 		}
 		p.metrics.flushErrors.WithLabelValues("spool_corrupt").Inc()
 		p.metrics.rejected.WithLabelValues("corrupt").Inc()
 		p.setComponentHealthy("spool", true)
 		p.setComponentHealthy("delivery", false)
 		p.refreshSpoolMetrics()
-		return SendPermanent, 0, countErr
+		return common.SendPermanent, 0, countErr
 	}
 	disposition, status, sendErr := p.sender.SendFile(file)
 	switch disposition {
-	case SendSuccess:
+	case common.SendSuccess:
 		if err := p.spool.Remove(file); err != nil {
 			p.setComponentHealthy("spool", false)
 			p.setComponentHealthy("delivery", false)
-			return SendRetry, status, err
+			return common.SendRetry, status, err
 		}
 		p.metrics.deliveredBatches.Inc()
 		p.metrics.deliveredSamples.Add(float64(sampleCount))
 		p.setComponentHealthy("spool", true)
 		p.setComponentHealthy("delivery", true)
 		p.setComponentHealthy("authentication", true)
-	case SendPermanent:
+	case common.SendPermanent:
 		reason := "client-error"
 		if status != 0 {
 			reason = "http-" + strconv.Itoa(status)
@@ -322,7 +323,7 @@ func (p *Pipeline) ReplayOnce() (SendDisposition, int, error) {
 		if _, err := p.spool.Quarantine(file, reason); err != nil {
 			p.setComponentHealthy("spool", false)
 			p.setComponentHealthy("delivery", false)
-			return SendRetry, status, errors.Join(sendErr, err)
+			return common.SendRetry, status, errors.Join(sendErr, err)
 		}
 		p.metrics.rejected.WithLabelValues(strconv.Itoa(status)).Inc()
 		p.setComponentHealthy("spool", true)
@@ -330,7 +331,7 @@ func (p *Pipeline) ReplayOnce() (SendDisposition, int, error) {
 		if status == 401 || status == 403 {
 			p.setComponentHealthy("authentication", false)
 		}
-	case SendRetry:
+	case common.SendRetry:
 		p.metrics.retried.Inc()
 		p.setComponentHealthy("delivery", false)
 		if status == http.StatusUnauthorized || status == http.StatusForbidden {

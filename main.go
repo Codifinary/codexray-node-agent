@@ -120,6 +120,11 @@ func whitelistNodeExternalNetworks() {
 func main() {
 	configureLogging(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
 
+	previousRun, markCleanShutdown, err := startCrashCapture(*flags.WalDir)
+	if err != nil {
+		klog.Warningln("crash capture is off:", err)
+	}
+
 	klog.Infoln("agent version:", version)
 
 	hostname, kv, err := uname()
@@ -166,6 +171,7 @@ func main() {
 	}
 	registerer.MustRegister(info("node_agent_info", version))
 	registerer.MustRegister(uptime("node_agent_uptime_seconds", startedAt))
+	registerer.MustRegister(previousRunOutcome(previousRun))
 
 	if md := nodeCollector.Metadata(); md != nil {
 		region := md.Region
@@ -180,6 +186,7 @@ func main() {
 		klog.Exitln(err)
 	}
 	defer cr.Close()
+	go reportStartupDiagnostics(previousRun)
 
 	profiling.Start()
 	defer profiling.Stop()
@@ -315,6 +322,7 @@ func main() {
 			klog.Warningln("HTTP shutdown did not complete cleanly:", err)
 		}
 		cancel()
+		markCleanShutdown()
 	case err := <-serverErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			klog.Errorln("HTTP server failed:", err)

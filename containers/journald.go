@@ -5,6 +5,7 @@
 package containers
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/codifinary/codexray-node-agent/cgroup"
@@ -14,7 +15,10 @@ import (
 )
 
 var (
-	journaldReader *logs.JournaldReader
+	journaldReader  *logs.JournaldReader
+	journaldInitErr error
+
+	errJournaldNotInitialized = errors.New("journald reader not initialized")
 )
 
 func JournaldInit() error {
@@ -23,15 +27,24 @@ func JournaldInit() error {
 		proc.HostPath("/var/log/journal"),
 	)
 	if err != nil {
+		journaldInitErr = err
 		return err
 	}
 	journaldReader = r
 	return nil
 }
 
+// JournaldInitError is why logs of systemd services are not collected, or nil when the journal is read.
+func JournaldInitError() error {
+	return journaldInitErr
+}
+
 func JournaldSubscribe(cg *cgroup.Cgroup, ch chan<- logparser.LogEntry) error {
 	if journaldReader == nil {
-		return fmt.Errorf("journald reader not initialized")
+		if journaldInitErr != nil {
+			return fmt.Errorf("%w: %w", errJournaldNotInitialized, journaldInitErr)
+		}
+		return errJournaldNotInitialized
 	}
 	err := journaldReader.Subscribe(cg.Id, ch)
 	if err != nil {

@@ -17,9 +17,10 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 )
 
-// collector records the bodies it receives and answers with the configured status.
+// collector records the bodies it receives and answers with the configured status and reply.
 type collector struct {
 	status int
+	reply  string
 	bodies []string
 }
 
@@ -34,7 +35,7 @@ func (c *collector) client() http.Client {
 			StatusCode: c.status,
 			Status:     http.StatusText(c.status),
 			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("")),
+			Body:       io.NopCloser(strings.NewReader(c.reply)),
 			Request:    r,
 		}, nil
 	})}
