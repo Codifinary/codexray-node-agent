@@ -5,6 +5,7 @@
 package logs
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -32,19 +33,27 @@ func NewJournaldReader(journalPaths ...string) (*JournaldReader, error) {
 		subscribers: map[string]chan<- logparser.LogEntry{},
 	}
 	var err error
+	var pathErrs []error
+	skip := func(pathErr error) {
+		klog.Errorln(pathErr)
+		pathErrs = append(pathErrs, pathErr)
+		if r.journal != nil {
+			_ = r.journal.Close() // the journal is abandoned either way
+			r.journal = nil
+		}
+	}
 	for _, journalPath := range journalPaths {
 		if r.journal, err = sdjournal.NewJournalFromDir(journalPath); err != nil {
-			klog.Errorf("failed to get journal at %s: %s", journalPath, err)
+			skip(fmt.Errorf("failed to get journal at %s: %w", journalPath, err))
 			continue
 		}
 		usage, err := r.journal.GetUsage()
 		if err != nil {
-			klog.Errorf("failed to read journal disk space usage at %s: %s", journalPath, err)
+			skip(fmt.Errorf("failed to read journal disk space usage at %s: %w", journalPath, err))
 			continue
 		}
 		if usage == 0 {
-			klog.Errorf("journal at %s is empty", journalPath)
-			r.journal = nil
+			skip(fmt.Errorf("journal at %s is empty", journalPath))
 			continue
 		}
 		if err = r.journal.SeekRealtimeUsec(uint64(time.Now().Add(time.Millisecond).UnixNano() / 1000)); err != nil {
@@ -54,7 +63,7 @@ func NewJournaldReader(journalPaths ...string) (*JournaldReader, error) {
 		break
 	}
 	if r.journal == nil {
-		return nil, fmt.Errorf("systemd journal not found in %s", strings.Join(journalPaths, ","))
+		return nil, fmt.Errorf("systemd journal not found in %s: %w", strings.Join(journalPaths, ","), errors.Join(pathErrs...))
 	}
 	go r.follow()
 	return r, nil

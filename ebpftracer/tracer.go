@@ -84,6 +84,7 @@ const (
 
 type Tracer struct {
 	disableL7Tracing bool
+	l7BufferPages    int
 	hostNetNs        netns.NsHandle
 	selfNetNs        netns.NsHandle
 
@@ -93,12 +94,13 @@ type Tracer struct {
 	uprobes    map[string]*ebpf.Program
 }
 
-func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Tracer {
+func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool, l7BufferPages int) *Tracer {
 	if disableL7Tracing {
 		klog.Infoln("L7 tracing is disabled")
 	}
 	return &Tracer{
 		disableL7Tracing: disableL7Tracing,
+		l7BufferPages:    l7BufferPages,
 		hostNetNs:        hostNetNs,
 		selfNetNs:        selfNetNs,
 
@@ -243,7 +245,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	}
 
 	if !t.disableL7Tracing {
-		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 32})
+		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: t.l7BufferPages})
 	}
 
 	pageSize := os.Getpagesize()

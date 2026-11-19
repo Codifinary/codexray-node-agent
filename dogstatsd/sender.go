@@ -8,14 +8,8 @@ import (
 	"io"
 	"net/http"
 	"os"
-)
 
-type SendDisposition int
-
-const (
-	SendSuccess SendDisposition = iota
-	SendRetry
-	SendPermanent
+	"github.com/codifinary/codexray-node-agent/common"
 )
 
 type HTTPDoer interface {
@@ -42,15 +36,15 @@ func NewCustomSender(client HTTPDoer, endpoint string, headers map[string]string
 	return &CustomSender{client: client, endpoint: endpoint, headers: copyHeaders}, nil
 }
 
-func (s *CustomSender) SendFile(file string) (SendDisposition, int, error) {
+func (s *CustomSender) SendFile(file string) (common.SendDisposition, int, error) {
 	f, err := os.Open(file)
 	if err != nil {
-		return SendRetry, 0, err
+		return common.SendRetry, 0, err
 	}
 	defer f.Close()
 	req, err := http.NewRequest(http.MethodPost, s.endpoint, f)
 	if err != nil {
-		return SendPermanent, 0, err
+		return common.SendPermanent, 0, err
 	}
 	for key, value := range s.headers {
 		req.Header.Set(key, value)
@@ -61,23 +55,13 @@ func (s *CustomSender) SendFile(file string) (SendDisposition, int, error) {
 	req.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return SendRetry, 0, err
+		return common.SendRetry, 0, err
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	disposition := classifyHTTPStatus(resp.StatusCode)
-	if disposition == SendSuccess {
+	disposition := common.ClassifyHTTPStatus(resp.StatusCode)
+	if disposition == common.SendSuccess {
 		return disposition, resp.StatusCode, nil
 	}
 	return disposition, resp.StatusCode, fmt.Errorf("collector returned %s", resp.Status)
-}
-
-func classifyHTTPStatus(code int) SendDisposition {
-	if code >= 200 && code < 300 {
-		return SendSuccess
-	}
-	if code == http.StatusUnauthorized || code == http.StatusForbidden || code == http.StatusRequestTimeout || code == http.StatusTooManyRequests || code >= 500 {
-		return SendRetry
-	}
-	return SendPermanent
 }
