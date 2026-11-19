@@ -22,6 +22,8 @@ type collector struct {
 	status int
 	reply  string
 	bodies []string
+	// onRequest, when set, runs before the collector answers: what the agent does while a send is in flight.
+	onRequest func()
 }
 
 func (c *collector) client() http.Client {
@@ -31,6 +33,9 @@ func (c *collector) client() http.Client {
 			return nil, err
 		}
 		c.bodies = append(c.bodies, string(body))
+		if c.onRequest != nil {
+			c.onRequest()
+		}
 		return &http.Response{
 			StatusCode: c.status,
 			Status:     http.StatusText(c.status),
@@ -112,11 +117,10 @@ func TestScrapeKeepsOnlyNodeMetricsInMemoryWhenSpoolFails(t *testing.T) {
 	if got := metricValue(t, a.metrics.spoolHealthy); got != 0 {
 		t.Fatalf("spool_healthy=%v, want 0", got)
 	}
-	p, ok := a.takeOldestFromMemory()
-	if !ok {
-		t.Fatal("no payload kept in memory")
+	if len(a.memBuf) != 1 {
+		t.Fatalf("buffered payloads=%d, want 1", len(a.memBuf))
 	}
-	names := metricNames(t, p.data)
+	names := metricNames(t, a.memBuf[0].data)
 	if strings.Join(names, ",") != "node_metric" {
 		t.Fatalf("buffered metrics=%v, want only node_metric", names)
 	}
@@ -210,6 +214,94 @@ func TestScrapeMovesBufferedPayloadsToSpoolWhenItRecovers(t *testing.T) {
 		if names := metricNames(t, data); len(names) == 0 {
 			t.Fatalf("spool file %s holds no metrics", f)
 		}
+	}
+}
+
+func TestScrapeKeepsCurrentPayloadBehindBufferedOnesWhenFlushFails(t *testing.T) {
+	spoolDir := t.TempDir()
+	a := newFallbackTestAgent(t, spoolDir, nil)
+	a.bufferInMemory(1, []byte("first"))
+	a.bufferInMemory(2, []byte("second"))
+	// A directory where the second payload's spool file goes makes moving it fail.
+	if err := os.Mkdir(filepath.Join(spoolDir, "spool-2.done"), 0750); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.scrape(); err == nil {
+		t.Fatal("expected moving the buffered payloads to fail")
+	}
+	if a.Healthy() {
+		t.Fatal("agent reports healthy although buffered payloads could not be spooled")
+	}
+	if _, err := os.Stat(filepath.Join(spoolDir, "spool-1.done")); err != nil {
+		t.Fatalf("the payload before the failure was not moved to the spool: %v", err)
+	}
+	if len(a.memBuf) != 2 || a.memBuf[0].timestamp != 2 || a.memBuf[1].timestamp <= 2 {
+		t.Fatalf("buffer=%+v, want the unmoved payload followed by the current one", a.memBuf)
+	}
+	files, err := a.listSpoolFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("spool files=%v, want only spool-1.done and the blocker: the current payload must not overtake buffered ones", files)
+	}
+}
+
+func TestSendOnceKeepsOrderWhenPayloadIsMovedToSpoolMidSend(t *testing.T) {
+	c := &collector{status: http.StatusServiceUnavailable}
+	a := newFallbackTestAgent(t, t.TempDir(), c)
+	// Real scrape timestamps: spool files sort by name, which follows time only for same-length timestamps.
+	now := time.Now().UnixMilli()
+	a.bufferInMemory(now-2000, []byte("m1"))
+	a.bufferInMemory(now-1000, []byte("m2"))
+	// The spool recovers while m1 is being sent: a scrape spools the buffer, then the send fails.
+	c.onRequest = func() {
+		c.onRequest = nil
+		if err := a.scrape(); err != nil {
+			t.Error(err)
+		}
+	}
+
+	if sent, err := a.sendOnce(); !sent || err == nil {
+		t.Fatalf("sent=%v err=%v, want a failed send", sent, err)
+	}
+	if len(a.memBuf) != 0 {
+		t.Fatalf("buffered payloads=%d, want all of them moved to the spool", len(a.memBuf))
+	}
+
+	c.status = http.StatusNoContent
+	for i := 0; i < 3; i++ {
+		if _, err := a.sendOnce(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(c.bodies) != 4 {
+		t.Fatalf("collector received %d payloads, want 4", len(c.bodies))
+	}
+	if got := strings.Join(c.bodies[:3], ","); got != "m1,m1,m2" {
+		t.Fatalf("send order=%q, want m1,m1,m2 (a resend of m1 rather than m2 overtaking it)", got)
+	}
+	if names := metricNames(t, []byte(c.bodies[3])); len(names) == 0 {
+		t.Fatal("the scraped payload was not sent last")
+	}
+}
+
+func TestWriteToSpoolToleratesSpoolFileRemovedMeanwhile(t *testing.T) {
+	spoolDir := t.TempDir()
+	a := newFallbackTestAgent(t, spoolDir, nil)
+	a.maxSpoolSize = 1
+	// A dangling link is listed but cannot be stat'ed, like a file the send loop removed after the listing.
+	if err := os.Symlink(filepath.Join(spoolDir, "sent"), filepath.Join(spoolDir, "spool-1.done")); err != nil {
+		t.Fatal(err)
+	}
+	writeSpoolFile(t, spoolDir, "spool-2.done", "two")
+
+	if err := a.writeToSpool(3, []byte("three")); err != nil {
+		t.Fatalf("spool write failed because of a file removed meanwhile: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(spoolDir, "spool-3.done")); err != nil {
+		t.Fatal(err)
 	}
 }
 

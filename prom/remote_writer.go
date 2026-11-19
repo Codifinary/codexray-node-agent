@@ -86,9 +86,11 @@ type Agent struct {
 
 	// Payloads scraped while the spool could not be written (e.g. a full disk), oldest first.
 	// They are sent from memory so node metrics keep flowing, and moved to the spool once it recovers.
+	// Every spool file is older than every payload kept here; memMu guards that order too.
 	memMu        sync.Mutex
 	memBuf       []memPayload
 	memBufBytes  int
+	memSeq       uint64
 	maxMemBytes  int
 	spoolFailing atomic.Bool
 
@@ -96,6 +98,7 @@ type Agent struct {
 }
 
 type memPayload struct {
+	seq       uint64
 	timestamp int64
 	data      []byte
 }
@@ -272,7 +275,7 @@ func (a *Agent) sendLoop() {
 // sendOnce sends the oldest pending payload: spool files first, then payloads kept in
 // memory while the spool could not be written. It reports whether anything was pending.
 func (a *Agent) sendOnce() (bool, error) {
-	fName, err := a.getOldestSpoolFile()
+	fName, p, err := a.nextPending()
 	if err != nil && !a.spoolFailing.Load() {
 		klog.Warningln("failed to get oldest spool file:", err)
 	}
@@ -289,20 +292,48 @@ func (a *Agent) sendOnce() (bool, error) {
 		}
 		return true, nil
 	}
-	p, ok := a.takeOldestFromMemory()
-	if !ok {
+	if p == nil {
 		return false, nil
 	}
+	// The payload stays buffered while it is sent: on a retryable failure it is simply
+	// still there, and a scrape may move it to the spool meanwhile without reordering it.
 	if err := a.post(bytes.NewReader(p.data)); err != nil {
 		if rejected, ok := permanentRejection(err); ok {
 			a.metrics.incRejectedPayloads(rejected.code)
 			klog.Errorf("collector rejected a buffered metrics payload, dropping it: %s", rejected)
+			a.dropFromMemory(p.seq)
 			return true, nil
 		}
-		a.putBackOldestInMemory(p)
 		return true, err
 	}
+	a.dropFromMemory(p.seq)
 	return true, nil
+}
+
+// nextPending returns the oldest spool file or, when the spool is empty, the oldest payload kept
+// in memory, which is left in the buffer. Holding memMu, which flushMemoryToSpool holds while it
+// moves payloads to the spool, means a payload is never picked ahead of an older one in transit.
+func (a *Agent) nextPending() (string, *memPayload, error) {
+	a.memMu.Lock()
+	defer a.memMu.Unlock()
+	fName, err := a.getOldestSpoolFile()
+	if fName != "" || len(a.memBuf) == 0 {
+		return fName, nil, err
+	}
+	p := a.memBuf[0]
+	return "", &p, err
+}
+
+// dropFromMemory removes a payload nextPending returned once it was delivered or rejected for good.
+// It does nothing when the buffer already let go of it: trimmed, or moved to the spool and then
+// sent again from there, which is a duplicate of identical samples rather than a reordering.
+func (a *Agent) dropFromMemory(seq uint64) {
+	a.memMu.Lock()
+	defer a.memMu.Unlock()
+	if len(a.memBuf) > 0 && a.memBuf[0].seq == seq {
+		a.popOldestLocked()
+		a.metrics.setMemoryBufferBytes(a.memBufBytes)
+	}
 }
 
 // quarantine moves a spool file the collector rejected for good out of the queue, so the files after it are sent.
@@ -332,7 +363,11 @@ func quarantineSpoolFile(src, dir string, code int, maxBytes int64) (string, err
 	if err := os.Rename(src, dest); err != nil {
 		return "", err
 	}
-	return dest, trimQuarantine(dir, maxBytes)
+	// The file is quarantined at this point; a failed trim must not be reported as a failed move.
+	if err := trimQuarantine(dir, maxBytes); err != nil {
+		klog.Warningln("failed to trim the metrics quarantine:", err)
+	}
+	return dest, nil
 }
 
 func trimQuarantine(dir string, maxBytes int64) error {
@@ -442,7 +477,13 @@ func (a *Agent) scrape() error {
 	}
 
 	compressed := snappy.Encode(nil, decompressed)
-	if err = a.writeToSpool(timestamp, compressed); err != nil {
+	// Payloads kept in memory are older, so they reach the spool first: spooling this one ahead
+	// of them would let the send loop deliver it first and the collector reject them as out of order.
+	err = a.flushMemoryToSpool()
+	if err == nil {
+		err = a.writeToSpool(timestamp, compressed)
+	}
+	if err != nil {
 		a.setSpoolFailing(true)
 		payload := compressed
 		if len(snapshots) > 0 {
@@ -459,7 +500,6 @@ func (a *Agent) scrape() error {
 		return fmt.Errorf("spool write failed, keeping metrics in memory: %w", err)
 	}
 	a.setSpoolFailing(false)
-	a.flushMemoryToSpool()
 	for _, snapshot := range snapshots {
 		snapshot.source.Commit(snapshot.count)
 	}
@@ -471,32 +511,16 @@ func (a *Agent) scrape() error {
 func (a *Agent) bufferInMemory(timestamp int64, data []byte) {
 	a.memMu.Lock()
 	defer a.memMu.Unlock()
-	a.memBuf = append(a.memBuf, memPayload{timestamp: timestamp, data: data})
+	a.memSeq++
+	a.memBuf = append(a.memBuf, memPayload{seq: a.memSeq, timestamp: timestamp, data: data})
 	a.memBufBytes += len(data)
 	a.trimMemoryLocked()
 }
 
-func (a *Agent) takeOldestFromMemory() (memPayload, bool) {
-	a.memMu.Lock()
-	defer a.memMu.Unlock()
-	if len(a.memBuf) == 0 {
-		return memPayload{}, false
-	}
-	p := a.memBuf[0]
+func (a *Agent) popOldestLocked() {
+	a.memBufBytes -= len(a.memBuf[0].data)
 	a.memBuf[0] = memPayload{}
 	a.memBuf = a.memBuf[1:]
-	a.memBufBytes -= len(p.data)
-	a.metrics.setMemoryBufferBytes(a.memBufBytes)
-	return p, true
-}
-
-// putBackOldestInMemory returns a payload taken by takeOldestFromMemory that could not be delivered.
-func (a *Agent) putBackOldestInMemory(p memPayload) {
-	a.memMu.Lock()
-	defer a.memMu.Unlock()
-	a.memBuf = append([]memPayload{p}, a.memBuf...)
-	a.memBufBytes += len(p.data)
-	a.trimMemoryLocked()
 }
 
 func (a *Agent) trimMemoryLocked() {
@@ -505,28 +529,26 @@ func (a *Agent) trimMemoryLocked() {
 		limit = memoryBufferMaxBytes
 	}
 	for len(a.memBuf) > 1 && a.memBufBytes > limit {
-		a.memBufBytes -= len(a.memBuf[0].data)
-		a.memBuf[0] = memPayload{}
-		a.memBuf = a.memBuf[1:]
+		a.popOldestLocked()
 		a.metrics.incDroppedPayloads()
 	}
 	a.metrics.setMemoryBufferBytes(a.memBufBytes)
 }
 
-// flushMemoryToSpool moves payloads kept in memory to the spool under their original
-// timestamps, so the send loop delivers them in order. It stops at the first failure.
-func (a *Agent) flushMemoryToSpool() {
-	for {
-		p, ok := a.takeOldestFromMemory()
-		if !ok {
-			return
+// flushMemoryToSpool moves payloads kept in memory to the spool, oldest first and under their
+// original timestamps, so the send loop delivers them in order. It stops at the first failure.
+// memMu is held throughout, so nextPending sees each payload either in memory or in the spool.
+func (a *Agent) flushMemoryToSpool() error {
+	a.memMu.Lock()
+	defer a.memMu.Unlock()
+	defer func() { a.metrics.setMemoryBufferBytes(a.memBufBytes) }()
+	for len(a.memBuf) > 0 {
+		if err := a.writeToSpool(a.memBuf[0].timestamp, a.memBuf[0].data); err != nil {
+			return fmt.Errorf("moving buffered metrics to the spool: %w", err)
 		}
-		if err := a.writeToSpool(p.timestamp, p.data); err != nil {
-			a.putBackOldestInMemory(p)
-			klog.Warningln("failed to move buffered metrics to the spool:", err)
-			return
-		}
+		a.popOldestLocked()
 	}
+	return nil
 }
 
 func withExternalLabels(series prompb.TimeSeries, agentLabels map[string]string) prompb.TimeSeries {
@@ -591,8 +613,12 @@ func (a *Agent) truncateSpoolIfNeeded() error {
 		return nil
 	}
 	totalSize := int64(0)
+	// The send loop removes files as it delivers them, so a listed file may already be gone.
 	for _, f := range files {
 		st, err := os.Stat(f)
+		if os.IsNotExist(err) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -600,7 +626,7 @@ func (a *Agent) truncateSpoolIfNeeded() error {
 	}
 	if totalSize > a.maxSpoolSize {
 		klog.Warningln("spool size exceeded, removing the oldest file:", files[0])
-		if err = os.Remove(files[0]); err != nil {
+		if err = os.Remove(files[0]); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
