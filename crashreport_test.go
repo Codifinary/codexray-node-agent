@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/klog/v2"
 )
 
 func TestReadLastRun(t *testing.T) {
@@ -80,4 +82,31 @@ func TestStartCrashCaptureKeepsThePreviousCrashAndMarksTheRun(t *testing.T) {
 	next, err := readLastRun(dir)
 	require.NoError(t, err)
 	assert.Equal(t, runClean, next.outcome)
+}
+
+func TestLastRunReport(t *testing.T) {
+	tests := []struct {
+		name string
+		last lastRun
+		want string
+	}{
+		{name: "clean", last: lastRun{outcome: runClean}},
+		{name: "crashed", last: lastRun{outcome: runCrashed, crash: "panic: boom"}, want: "previous agent process crashed:\npanic: boom"},
+		{name: "killed", last: lastRun{outcome: runKilled}, want: "previous agent process ended without a clean shutdown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			configureLogging(&out)
+
+			tt.last.report()
+			klog.Flush()
+
+			if tt.want == "" {
+				assert.Empty(t, out.String())
+				return
+			}
+			assert.Contains(t, out.String(), tt.want)
+		})
+	}
 }

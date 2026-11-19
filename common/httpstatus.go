@@ -15,11 +15,16 @@ const (
 )
 
 // ClassifyHTTPStatus maps a collector status to success, retry later, or a permanent rejection.
+// 404 is the collector's "project not found", a config mistake like 401/403, so it is retried.
 func ClassifyHTTPStatus(code int) SendDisposition {
 	if code >= 200 && code < 300 {
 		return SendSuccess
 	}
-	if code == http.StatusUnauthorized || code == http.StatusForbidden || code == http.StatusRequestTimeout || code == http.StatusTooManyRequests || code >= 500 {
+	switch code {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return SendRetry
+	}
+	if code >= 500 {
 		return SendRetry
 	}
 	return SendPermanent

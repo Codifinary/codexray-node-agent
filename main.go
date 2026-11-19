@@ -124,6 +124,8 @@ func main() {
 	if err != nil {
 		klog.Warningln("crash capture is off:", err)
 	}
+	// Written now for docker logs; reportStartupDiagnostics repeats it once the agent ships its own log.
+	previousRun.report()
 
 	klog.Infoln("agent version:", version)
 
