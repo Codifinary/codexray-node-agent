@@ -13,7 +13,7 @@ func TestClassifyHTTPStatus(t *testing.T) {
 		{http.StatusOK, SendSuccess},
 		{http.StatusNoContent, SendSuccess},
 		{http.StatusBadRequest, SendPermanent},
-		{http.StatusNotFound, SendPermanent},
+		{http.StatusNotFound, SendRetry},
 		{http.StatusRequestEntityTooLarge, SendPermanent},
 		{http.StatusUnprocessableEntity, SendPermanent},
 		{http.StatusMovedPermanently, SendPermanent},

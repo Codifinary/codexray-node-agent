@@ -20,7 +20,7 @@ func TestCustomSenderClassifiesResponsesAndSetsHeaders(t *testing.T) {
 		{http.StatusBadRequest, common.SendPermanent},
 		{http.StatusUnauthorized, common.SendRetry},
 		{http.StatusForbidden, common.SendRetry},
-		{http.StatusNotFound, common.SendPermanent},
+		{http.StatusNotFound, common.SendRetry},
 		{http.StatusRequestEntityTooLarge, common.SendPermanent},
 		{http.StatusRequestTimeout, common.SendRetry},
 		{http.StatusTooManyRequests, common.SendRetry},
