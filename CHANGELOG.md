@@ -4,6 +4,24 @@ All notable changes to the Codexray Node Agent are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] — 2026-11-24
+
+Agent uptime for the Node page, crash reports, and metrics that keep flowing when the spool can't be written (release 24-11-26, PR #56).
+
+### Added
+- **Uptime metric:** time since the agent started. The node list's Status uses it.
+- **Crash reports:** a fatal crash is written to `crash.log` in `WAL_DIR`, and an `agent.running` marker tells a crash from a kill (SIGKILL, OOM kill, reboot). On start the agent logs how the previous run ended and reports it as a metric (0 clean, 1 crashed, 2 killed).
+- **`--l7-events-buffer-pages` / `L7_EVENTS_BUFFER_PAGES`** (default `128`): per-CPU size of the L7 events perf buffer in memory pages. Raise it when the agent logs `l7_events lost samples`.
+- **Logging configuration**, with tests.
+
+### Changed
+- **Metrics keep flowing on a full disk:** payloads are kept in memory, oldest first, while the spool can't be written, and moved to the spool once it recovers. The spool's health is reported.
+- **Rejected spool files are quarantined** in `WAL_DIR/quarantine/` (capped at 50 MB) so the files after them are sent.
+- **HTTP 404** from the collector ("project not found") is retried like 401/403.
+
+### Notes
+- `WAL_DIR` (default `/tmp/Codexray-node-agent`) must be writable; it now also holds `crash.log`, `agent.running` and `quarantine/`. On rollback these files are harmless and can be deleted.
+
 ## [1.4.1] — 2026-10-29
 
 ### Changed
