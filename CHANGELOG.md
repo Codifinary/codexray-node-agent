@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Agent uptime for the Node page, crash reports, and metrics that keep flowing when the spool can't be written (release 24-11-26, PR #56).
 
+**Reverts the required container allowlist from 1.4.0 / 1.4.1** (PR #50), which caused an incident at a customer: an agent started without `--container-allowlist` / `CONTAINER_ALLOWLIST` exited at startup. The allowlist is optional again, as in 1.3.1.
+
+### Reverted
+- **`--container-allowlist` / `CONTAINER_ALLOWLIST` is optional again.** With no allowlist every container is monitored, as before 1.4.0; a set allowlist still limits monitoring to the containers it matches, and `--container-denylist` is unchanged. The startup check that exited on a missing, empty or wildcard allowlist is removed.
+
 ### Added
 - **Uptime metric:** time since the agent started. The node list's Status uses it.
 - **Crash reports:** a fatal crash is written to `crash.log` in `WAL_DIR`, and an `agent.running` marker tells a crash from a kill (SIGKILL, OOM kill, reboot). On start the agent logs how the previous run ended and reports it as a metric (0 clean, 1 crashed, 2 killed).
