@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/golang/snappy"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/prometheus/prompb"
@@ -65,7 +66,7 @@ func TestPipelineFlushEncodesIdentityAndSuccessRemovesFile(t *testing.T) {
 	if len(request.Timeseries) != 1 || labelValue(request.Timeseries[0].Labels, "instance") != "real" {
 		t.Fatalf("unexpected request: %#v", request)
 	}
-	if disposition, _, err := pipeline.ReplayOnce(); disposition != SendSuccess || err != nil {
+	if disposition, _, err := pipeline.ReplayOnce(); disposition != common.SendSuccess || err != nil {
 		t.Fatalf("replay=(%v,%v)", disposition, err)
 	}
 	if *requests != 1 {
@@ -100,7 +101,7 @@ func TestPipelineCountsDeliveredSamplesFromDurablePayload(t *testing.T) {
 	if _, err := spool.Put(payload); err != nil {
 		t.Fatal(err)
 	}
-	if disposition, _, err := pipeline.ReplayOnce(); disposition != SendSuccess || err != nil {
+	if disposition, _, err := pipeline.ReplayOnce(); disposition != common.SendSuccess || err != nil {
 		t.Fatalf("replay=(%v,%v)", disposition, err)
 	}
 	if *requests != 1 {
@@ -117,7 +118,7 @@ func TestPipelineQuarantinesCorruptPayloadWithoutSending(t *testing.T) {
 		t.Fatal(err)
 	}
 	disposition, _, err := pipeline.ReplayOnce()
-	if disposition != SendPermanent || err == nil {
+	if disposition != common.SendPermanent || err == nil {
 		t.Fatalf("replay=(%v,%v), want permanent corruption error", disposition, err)
 	}
 	if *requests != 0 {
@@ -157,12 +158,12 @@ func TestRetryJitterStaysBounded(t *testing.T) {
 func TestPipelineRetryRetainsAndPermanentQuarantines(t *testing.T) {
 	for _, tc := range []struct {
 		status   int
-		want     SendDisposition
+		want     common.SendDisposition
 		retained bool
 	}{
-		{http.StatusServiceUnavailable, SendRetry, true},
-		{http.StatusUnauthorized, SendRetry, true},
-		{http.StatusBadRequest, SendPermanent, false},
+		{http.StatusServiceUnavailable, common.SendRetry, true},
+		{http.StatusUnauthorized, common.SendRetry, true},
+		{http.StatusBadRequest, common.SendPermanent, false},
 	} {
 		pipeline, spool, agg, _ := newTestPipeline(t, tc.status)
 		agg.Add(Metric{Name: "orders", Type: MetricTypeCounter, Value: 1, SampleRate: 1}, nil)
@@ -180,7 +181,7 @@ func TestPipelineRetryRetainsAndPermanentQuarantines(t *testing.T) {
 		if pipeline.Healthy() {
 			t.Fatalf("status %d did not degrade pipeline health", tc.status)
 		}
-		if tc.want == SendPermanent {
+		if tc.want == common.SendPermanent {
 			entries, err := os.ReadDir(spool.quarantine)
 			if err != nil || len(entries) != 1 {
 				t.Fatalf("quarantine entries=%d err=%v", len(entries), err)
@@ -195,7 +196,7 @@ func TestLocalFlushDoesNotClearAuthenticationFailure(t *testing.T) {
 	if err := pipeline.FlushOnce(time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if disposition, _, err := pipeline.ReplayOnce(); disposition != SendRetry || err == nil {
+	if disposition, _, err := pipeline.ReplayOnce(); disposition != common.SendRetry || err == nil {
 		t.Fatalf("replay=(%v,%v), want retained authentication failure", disposition, err)
 	}
 	if pipeline.Healthy() {
@@ -238,7 +239,7 @@ func TestAPIKeyRotationReplaysRetainedPayloadAfterRestart(t *testing.T) {
 	if err := oldPipeline.FlushOnce(time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if disposition, _, err := oldPipeline.ReplayOnce(); disposition != SendRetry || err == nil {
+	if disposition, _, err := oldPipeline.ReplayOnce(); disposition != common.SendRetry || err == nil {
 		t.Fatalf("old-key replay=(%v,%v), want retained authentication failure", disposition, err)
 	}
 	retained, err := spool.Oldest()
@@ -258,7 +259,7 @@ func TestAPIKeyRotationReplaysRetainedPayloadAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if disposition, _, err := newPipeline.ReplayOnce(); disposition != SendSuccess || err != nil {
+	if disposition, _, err := newPipeline.ReplayOnce(); disposition != common.SendSuccess || err != nil {
 		t.Fatalf("rotated-key replay=(%v,%v), want success", disposition, err)
 	}
 	if file, err := reopenedSpool.Oldest(); err != nil || file != "" {

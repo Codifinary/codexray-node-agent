@@ -5,17 +5,22 @@
 package prom
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/codifinary/codexray-node-agent/common"
@@ -30,7 +35,42 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const RemoteWriteTimeout = 30 * time.Second
+const (
+	RemoteWriteTimeout = 30 * time.Second
+
+	// memoryBufferMaxBytes caps the payloads kept in memory while the spool cannot be written.
+	memoryBufferMaxBytes = 32 << 20
+
+	// metricsQuarantineMaxBytes caps the spool files the collector rejected for good.
+	metricsQuarantineMaxBytes = 50 << 20
+	quarantineDirName         = "quarantine"
+
+	rejectedBodyLogBytes = 512
+	maxDrainedBodyBytes  = 64 << 10
+)
+
+// remoteWriteError is a non-2xx answer from the collector.
+type remoteWriteError struct {
+	status string
+	code   int
+	body   string
+}
+
+func (e *remoteWriteError) Error() string {
+	if e.body == "" {
+		return e.status
+	}
+	return e.status + ": " + e.body
+}
+
+// permanentRejection reports whether retrying the payload can never succeed.
+func permanentRejection(err error) (*remoteWriteError, bool) {
+	var rejected *remoteWriteError
+	if errors.As(err, &rejected) && common.ClassifyHTTPStatus(rejected.code) == common.SendPermanent {
+		return rejected, true
+	}
+	return nil, false
+}
 
 type Agent struct {
 	reg          *prometheus.Registry
@@ -43,6 +83,72 @@ type Agent struct {
 
 	spoolDir     string
 	maxSpoolSize int64
+
+	// Payloads scraped while the spool could not be written (e.g. a full disk), oldest first.
+	// They are sent from memory so node metrics keep flowing, and moved to the spool once it recovers.
+	// Every spool file is older than every payload kept here; memMu guards that order too.
+	memMu        sync.Mutex
+	memBuf       []memPayload
+	memBufBytes  int
+	memSeq       uint64
+	maxMemBytes  int
+	spoolFailing atomic.Bool
+
+	metrics *agentMetrics
+}
+
+type memPayload struct {
+	seq       uint64
+	timestamp int64
+	data      []byte
+}
+
+type agentMetrics struct {
+	spoolHealthy      prometheus.Gauge
+	memoryBufferBytes prometheus.Gauge
+	droppedPayloads   prometheus.Counter
+	rejectedPayloads  *prometheus.CounterVec
+}
+
+func newAgentMetrics(reg prometheus.Registerer) *agentMetrics {
+	m := &agentMetrics{
+		spoolHealthy:      prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "node_agent", Subsystem: "metrics", Name: "spool_healthy", Help: "Whether the on-disk metrics spool can be written."}),
+		memoryBufferBytes: prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "node_agent", Subsystem: "metrics", Name: "memory_buffer_bytes", Help: "Bytes of metrics payloads kept in memory because the spool could not be written."}),
+		droppedPayloads:   prometheus.NewCounter(prometheus.CounterOpts{Namespace: "node_agent", Subsystem: "metrics", Name: "dropped_payloads_total", Help: "Metrics payloads dropped because the in-memory buffer was full."}),
+		rejectedPayloads:  prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "node_agent", Subsystem: "metrics", Name: "rejected_payloads_total", Help: "Metrics payloads the collector rejected for good, by HTTP status."}, []string{"code"}),
+	}
+	reg.MustRegister(m.spoolHealthy, m.memoryBufferBytes, m.droppedPayloads, m.rejectedPayloads)
+	m.spoolHealthy.Set(1)
+	return m
+}
+
+func (m *agentMetrics) setSpoolHealthy(healthy bool) {
+	if m == nil {
+		return
+	}
+	if healthy {
+		m.spoolHealthy.Set(1)
+	} else {
+		m.spoolHealthy.Set(0)
+	}
+}
+
+func (m *agentMetrics) setMemoryBufferBytes(n int) {
+	if m != nil {
+		m.memoryBufferBytes.Set(float64(n))
+	}
+}
+
+func (m *agentMetrics) incDroppedPayloads() {
+	if m != nil {
+		m.droppedPayloads.Inc()
+	}
+}
+
+func (m *agentMetrics) incRejectedPayloads(code int) {
+	if m != nil {
+		m.rejectedPayloads.WithLabelValues(strconv.Itoa(code)).Inc()
+	}
 }
 
 // SeriesSource supplies transient application metrics that must be committed
@@ -52,7 +158,8 @@ type SeriesSource interface {
 	Commit(count int)
 }
 
-func StartAgent(reg *prometheus.Registry, machineId, systemUuid string, sources ...SeriesSource) error {
+// StartAgent starts scraping and remote-writing metrics. It returns nil when no metrics endpoint is configured.
+func StartAgent(reg *prometheus.Registry, machineId, systemUuid string, sources ...SeriesSource) *Agent {
 	if *flags.MetricsEndpoint == nil {
 		return nil
 	}
@@ -82,20 +189,31 @@ func StartAgent(reg *prometheus.Registry, machineId, systemUuid string, sources 
 		},
 		spoolDir:     path.Join(*flags.WalDir, "spool"),
 		maxSpoolSize: int64(*flags.MaxSpoolSize),
+		maxMemBytes:  memoryBufferMaxBytes,
+		metrics:      newAgentMetrics(reg),
 	}
-	if _, err := os.Stat(*flags.WalDir); os.IsNotExist(err) {
-		if err = os.Mkdir(*flags.WalDir, 0750); err != nil {
-			return err
-		}
-	}
-	if _, err := os.Stat(a.spoolDir); os.IsNotExist(err) {
-		if err = os.Mkdir(a.spoolDir, 0750); err != nil {
-			return err
-		}
+	// A full disk must not stop the agent (and its logs) from running: until the spool
+	// directory can be created, metrics are kept in memory and writeToSpool retries it.
+	if err := os.MkdirAll(a.spoolDir, 0750); err != nil {
+		klog.Warningln("failed to create the metrics spool directory, metrics will be kept in memory:", err)
+		a.setSpoolFailing(true)
 	}
 	go a.sendLoop()
 	go a.scrapeLoop()
-	return nil
+	return a
+}
+
+// Healthy reports whether metrics can be written to the on-disk spool.
+// A nil Agent (metrics disabled) is healthy.
+func (a *Agent) Healthy() bool {
+	return a == nil || !a.spoolFailing.Load()
+}
+
+func (a *Agent) setSpoolFailing(failing bool) {
+	if a.spoolFailing.Swap(failing) && !failing {
+		klog.Infoln("metrics spool can be written again")
+	}
+	a.metrics.setSpoolHealthy(!failing)
 }
 
 // SourceLabels returns the protected identity labels shared by node telemetry
@@ -136,20 +254,7 @@ func (a *Agent) scrapeLoop() {
 func (a *Agent) sendLoop() {
 	b := backoff.Backoff{Factor: 2, Min: 5 * time.Second, Max: time.Minute}
 	for {
-		fName, err := a.getOldestSpoolFile()
-		if err != nil || fName == "" {
-			if err != nil {
-				klog.Warningln("failed to get oldest spool file:", err)
-			}
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		err = func() error {
-			if err := a.send(fName); err != nil {
-				return err
-			}
-			return os.Remove(fName)
-		}()
+		sent, err := a.sendOnce()
 		if err != nil {
 			dur := b.Duration()
 			klog.Warningf(
@@ -159,8 +264,144 @@ func (a *Agent) sendLoop() {
 			time.Sleep(dur)
 			continue
 		}
+		if !sent {
+			time.Sleep(5 * time.Second)
+			continue
+		}
 		b.Reset()
 	}
+}
+
+// sendOnce sends the oldest pending payload: spool files first, then payloads kept in
+// memory while the spool could not be written. It reports whether anything was pending.
+func (a *Agent) sendOnce() (bool, error) {
+	fName, p, err := a.nextPending()
+	if err != nil && !a.spoolFailing.Load() {
+		klog.Warningln("failed to get oldest spool file:", err)
+	}
+	if fName != "" {
+		if err := a.send(fName); err != nil {
+			if rejected, ok := permanentRejection(err); ok {
+				return true, a.quarantine(fName, rejected)
+			}
+			return true, err
+		}
+		// The spool may have evicted the file while it was being sent.
+		if err := os.Remove(fName); err != nil && !os.IsNotExist(err) {
+			return true, err
+		}
+		return true, nil
+	}
+	if p == nil {
+		return false, nil
+	}
+	// The payload stays buffered while it is sent: on a retryable failure it is simply
+	// still there, and a scrape may move it to the spool meanwhile without reordering it.
+	if err := a.post(bytes.NewReader(p.data)); err != nil {
+		if rejected, ok := permanentRejection(err); ok {
+			a.metrics.incRejectedPayloads(rejected.code)
+			klog.Errorf("collector rejected a buffered metrics payload, dropping it: %s", rejected)
+			a.dropFromMemory(p.seq)
+			return true, nil
+		}
+		return true, err
+	}
+	a.dropFromMemory(p.seq)
+	return true, nil
+}
+
+// nextPending returns the oldest spool file or, when the spool is empty, the oldest payload kept
+// in memory, which is left in the buffer. Holding memMu, which flushMemoryToSpool holds while it
+// moves payloads to the spool, means a payload is never picked ahead of an older one in transit.
+func (a *Agent) nextPending() (string, *memPayload, error) {
+	a.memMu.Lock()
+	defer a.memMu.Unlock()
+	fName, err := a.getOldestSpoolFile()
+	if fName != "" || len(a.memBuf) == 0 {
+		return fName, nil, err
+	}
+	p := a.memBuf[0]
+	return "", &p, err
+}
+
+// dropFromMemory removes a payload nextPending returned once it was delivered or rejected for good.
+// It does nothing when the buffer already let go of it: trimmed, or moved to the spool and then
+// sent again from there, which is a duplicate of identical samples rather than a reordering.
+func (a *Agent) dropFromMemory(seq uint64) {
+	a.memMu.Lock()
+	defer a.memMu.Unlock()
+	if len(a.memBuf) > 0 && a.memBuf[0].seq == seq {
+		a.popOldestLocked()
+		a.metrics.setMemoryBufferBytes(a.memBufBytes)
+	}
+}
+
+// quarantine moves a spool file the collector rejected for good out of the queue, so the files after it are sent.
+func (a *Agent) quarantine(fName string, rejected *remoteWriteError) error {
+	a.metrics.incRejectedPayloads(rejected.code)
+	dest, err := quarantineSpoolFile(fName, path.Join(a.spoolDir, quarantineDirName), rejected.code, metricsQuarantineMaxBytes)
+	switch {
+	case err == nil:
+		klog.Errorf("collector rejected %s with %s, moved to %s", fName, rejected, dest)
+		return nil
+	case os.IsNotExist(err):
+		return nil
+	}
+	klog.Errorf("collector rejected %s with %s and it could not be quarantined (%s), deleting it", fName, rejected, err)
+	if err := os.Remove(fName); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("deleting rejected spool file %s: %w", fName, err)
+	}
+	return nil
+}
+
+// quarantineSpoolFile moves src into dir, then deletes the oldest quarantined files while dir holds more than maxBytes.
+func quarantineSpoolFile(src, dir string, code int, maxBytes int64) (string, error) {
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return "", err
+	}
+	dest := path.Join(dir, fmt.Sprintf("%s.%d.failed", path.Base(src), code))
+	if err := os.Rename(src, dest); err != nil {
+		return "", err
+	}
+	// The file is quarantined at this point; a failed trim must not be reported as a failed move.
+	if err := trimQuarantine(dir, maxBytes); err != nil {
+		klog.Warningln("failed to trim the metrics quarantine:", err)
+	}
+	return dest, nil
+}
+
+func trimQuarantine(dir string, maxBytes int64) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var files []string
+	sizes := map[string]int64{}
+	var total int64
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".failed") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		name := path.Join(dir, e.Name())
+		files = append(files, name)
+		sizes[name] = info.Size()
+		total += info.Size()
+	}
+	sort.Strings(files)
+	for _, name := range files {
+		if total <= maxBytes {
+			break
+		}
+		if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		total -= sizes[name]
+	}
+	return nil
 }
 
 func (a *Agent) send(fPath string) error {
@@ -169,7 +410,11 @@ func (a *Agent) send(fPath string) error {
 		return err
 	}
 	defer f.Close()
-	req, err := http.NewRequest(http.MethodPost, a.url.String(), f)
+	return a.post(f)
+}
+
+func (a *Agent) post(body io.Reader) error {
+	req, err := http.NewRequest(http.MethodPost, a.url.String(), body)
 	if err != nil {
 		return err
 	}
@@ -187,7 +432,9 @@ func (a *Agent) send(fPath string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return errors.New(resp.Status)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, rejectedBodyLogBytes))     // a cut-off body is still worth logging
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainedBodyBytes)) // drained so the connection is reused
+		return &remoteWriteError{status: resp.Status, code: resp.StatusCode, body: strings.TrimSpace(string(body))}
 	}
 	klog.Infof("sent metrics in %s", time.Since(t).Truncate(time.Millisecond))
 	return nil
@@ -205,6 +452,7 @@ func (a *Agent) scrape() error {
 		mfsByName[mf.GetName()] = mf
 	}
 	wr := buildWriteRequest(mfs, timestamp, a.labels)
+	nodeSeries := len(wr.Timeseries)
 	type sourceSnapshot struct {
 		source SeriesSource
 		count  int
@@ -229,11 +477,76 @@ func (a *Agent) scrape() error {
 	}
 
 	compressed := snappy.Encode(nil, decompressed)
-	if err = a.writeToSpool(timestamp, compressed); err != nil {
-		return err
+	// Payloads kept in memory are older, so they reach the spool first: spooling this one ahead
+	// of them would let the send loop deliver it first and the collector reject them as out of order.
+	err = a.flushMemoryToSpool()
+	if err == nil {
+		err = a.writeToSpool(timestamp, compressed)
 	}
+	if err != nil {
+		a.setSpoolFailing(true)
+		payload := compressed
+		if len(snapshots) > 0 {
+			// External series are committed only once they are safely on disk, so they stay
+			// with their source and the in-memory copy carries only the agent's own metrics.
+			nodeOnly := prompb.WriteRequest{Timeseries: wr.Timeseries[:nodeSeries], Metadata: wr.Metadata}
+			raw, marshalErr := nodeOnly.Marshal()
+			if marshalErr != nil {
+				return marshalErr
+			}
+			payload = snappy.Encode(nil, raw)
+		}
+		a.bufferInMemory(timestamp, payload)
+		return fmt.Errorf("spool write failed, keeping metrics in memory: %w", err)
+	}
+	a.setSpoolFailing(false)
 	for _, snapshot := range snapshots {
 		snapshot.source.Commit(snapshot.count)
+	}
+	return nil
+}
+
+// bufferInMemory keeps a payload that could not be spooled. Over the byte limit the oldest
+// payloads are dropped, but the newest one is always kept.
+func (a *Agent) bufferInMemory(timestamp int64, data []byte) {
+	a.memMu.Lock()
+	defer a.memMu.Unlock()
+	a.memSeq++
+	a.memBuf = append(a.memBuf, memPayload{seq: a.memSeq, timestamp: timestamp, data: data})
+	a.memBufBytes += len(data)
+	a.trimMemoryLocked()
+}
+
+func (a *Agent) popOldestLocked() {
+	a.memBufBytes -= len(a.memBuf[0].data)
+	a.memBuf[0] = memPayload{}
+	a.memBuf = a.memBuf[1:]
+}
+
+func (a *Agent) trimMemoryLocked() {
+	limit := a.maxMemBytes
+	if limit <= 0 {
+		limit = memoryBufferMaxBytes
+	}
+	for len(a.memBuf) > 1 && a.memBufBytes > limit {
+		a.popOldestLocked()
+		a.metrics.incDroppedPayloads()
+	}
+	a.metrics.setMemoryBufferBytes(a.memBufBytes)
+}
+
+// flushMemoryToSpool moves payloads kept in memory to the spool, oldest first and under their
+// original timestamps, so the send loop delivers them in order. It stops at the first failure.
+// memMu is held throughout, so nextPending sees each payload either in memory or in the spool.
+func (a *Agent) flushMemoryToSpool() error {
+	a.memMu.Lock()
+	defer a.memMu.Unlock()
+	defer func() { a.metrics.setMemoryBufferBytes(a.memBufBytes) }()
+	for len(a.memBuf) > 0 {
+		if err := a.writeToSpool(a.memBuf[0].timestamp, a.memBuf[0].data); err != nil {
+			return fmt.Errorf("moving buffered metrics to the spool: %w", err)
+		}
+		a.popOldestLocked()
 	}
 	return nil
 }
@@ -264,6 +577,9 @@ func withExternalLabels(series prompb.TimeSeries, agentLabels map[string]string)
 }
 
 func (a *Agent) writeToSpool(timestamp int64, payload []byte) error {
+	if err := os.MkdirAll(a.spoolDir, 0750); err != nil {
+		return err
+	}
 	if err := a.truncateSpoolIfNeeded(); err != nil {
 		return err
 	}
@@ -297,8 +613,12 @@ func (a *Agent) truncateSpoolIfNeeded() error {
 		return nil
 	}
 	totalSize := int64(0)
+	// The send loop removes files as it delivers them, so a listed file may already be gone.
 	for _, f := range files {
 		st, err := os.Stat(f)
+		if os.IsNotExist(err) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -306,7 +626,7 @@ func (a *Agent) truncateSpoolIfNeeded() error {
 	}
 	if totalSize > a.maxSpoolSize {
 		klog.Warningln("spool size exceeded, removing the oldest file:", files[0])
-		if err = os.Remove(files[0]); err != nil {
+		if err = os.Remove(files[0]); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}

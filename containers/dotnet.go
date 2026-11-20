@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"debug/elf"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -29,7 +30,13 @@ const (
 	dotNetDiagnosticTimeout = 500 * time.Millisecond
 	dotNetEventInterval     = 5 * time.Second
 	provider                = "System.Runtime"
+
+	// After this many attempts without a socket the process likely has diagnostics off, so retries slow down.
+	dotNetNoSocketAttempts      = 6
+	dotNetNoSocketRetryInterval = 10 * time.Minute
 )
+
+var errNoDiagnosticSocket = errors.New("no socket found")
 
 type dotNetMetric struct {
 	fields map[string]string
@@ -160,22 +167,42 @@ func (m *DotNetMonitor) processMetric(name, units string, v float64) {
 
 func (m *DotNetMonitor) run(ctx context.Context) {
 	b := backoff.Backoff{Factor: 2, Min: time.Second, Max: time.Minute}
-	for {
+	noSocketStreak := 0
+	for ctx.Err() == nil {
+		err := m.connect(ctx)
+		if err == nil {
+			return
+		}
+		if errors.Is(err, errNoDiagnosticSocket) {
+			noSocketStreak++
+		} else {
+			noSocketStreak = 0
+		}
+		d, warn := nextDotNetAttempt(err, noSocketStreak, &b)
+		const msg = "failed to establish connection with the .NET diagnostic socket pid=%d, next attempt in %s: %s"
+		if warn {
+			klog.Warningf(msg, m.pid, d, err)
+		} else {
+			klog.V(1).Infof(msg, m.pid, d, err)
+		}
 		select {
 		case <-ctx.Done():
 			return
-		default:
-			err := m.connect(ctx)
-			if err == nil {
-				return
-			}
-			d := b.Duration()
-			klog.Warningf(
-				"failed to establish connection with the .NET diagnostic socket pid=%d, next attempt in %s: %s",
-				m.pid, d.String(), err,
-			)
-			time.Sleep(d)
+		case <-time.After(d):
 		}
+	}
+}
+
+// nextDotNetAttempt returns the wait before reconnecting and whether this failure deserves a warning.
+// A missing socket is warned about once, when retries slow down.
+func nextDotNetAttempt(err error, noSocketStreak int, b *backoff.Backoff) (time.Duration, bool) {
+	switch {
+	case !errors.Is(err, errNoDiagnosticSocket):
+		return b.Duration(), true
+	case noSocketStreak < dotNetNoSocketAttempts:
+		return b.Duration(), false
+	default:
+		return dotNetNoSocketRetryInterval, noSocketStreak == dotNetNoSocketAttempts
 	}
 }
 
@@ -187,7 +214,7 @@ func (m *DotNetMonitor) connect(ctx context.Context) error {
 	files, _ := filepath.Glob(proc.Path(m.pid, fmt.Sprintf("root/tmp/dotnet-diagnostic-%d-*-socket", nsPid)))
 
 	if len(files) != 1 {
-		return fmt.Errorf("no socket found")
+		return errNoDiagnosticSocket
 	}
 	klog.Infoln(".NET diagnostic socket:", files[0])
 	c := dotnetdiag.NewClient(files[0], dotnetdiag.WithDialer(func(addr string) (net.Conn, error) {
