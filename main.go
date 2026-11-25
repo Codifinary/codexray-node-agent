@@ -9,6 +9,8 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"flag"
+	"io"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -38,7 +40,8 @@ import (
 )
 
 var (
-	version = flags.Version
+	version   = flags.Version
+	startedAt = time.Now()
 )
 
 func uname() (string, string, error) {
@@ -115,8 +118,14 @@ func whitelistNodeExternalNetworks() {
 }
 
 func main() {
-	klog.LogToStderr(false)
-	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
+	configureLogging(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
+
+	previousRun, markCleanShutdown, err := startCrashCapture(*flags.WalDir)
+	if err != nil {
+		klog.Warningln("crash capture is off:", err)
+	}
+	// Written now for docker logs; reportStartupDiagnostics repeats it once the agent ships its own log.
+	previousRun.report()
 
 	klog.Infoln("agent version:", version)
 
@@ -163,6 +172,8 @@ func main() {
 		klog.Exitln(err)
 	}
 	registerer.MustRegister(info("node_agent_info", version))
+	registerer.MustRegister(uptime("node_agent_uptime_seconds", startedAt))
+	registerer.MustRegister(previousRunOutcome(previousRun))
 
 	if md := nodeCollector.Metadata(); md != nil {
 		region := md.Region
@@ -177,6 +188,7 @@ func main() {
 		klog.Exitln(err)
 	}
 	defer cr.Close()
+	go reportStartupDiagnostics(previousRun)
 
 	profiling.Start()
 	defer profiling.Stop()
@@ -271,9 +283,7 @@ func main() {
 		dogStatsDReceiver = receiver
 	}
 
-	if err := prom.StartAgent(registry, machineId, systemUuid, seriesSources...); err != nil {
-		klog.Exitln(err)
-	}
+	metricsAgent := prom.StartAgent(registry, machineId, systemUuid, seriesSources...)
 
 	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -281,6 +291,10 @@ func main() {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	http.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !metricsAgent.Healthy() {
+			http.Error(w, "metrics spool not writable", http.StatusServiceUnavailable)
+			return
+		}
 		if *flags.DogStatsDEnabled && (dogStatsDReceiver == nil || !dogStatsDReceiver.Ready() || dogStatsDPipeline == nil || !dogStatsDPipeline.Healthy()) {
 			http.Error(w, "dogstatsd pipeline not ready", http.StatusServiceUnavailable)
 			return
@@ -310,6 +324,7 @@ func main() {
 			klog.Warningln("HTTP shutdown did not complete cleanly:", err)
 		}
 		cancel()
+		markCleanShutdown()
 	case err := <-serverErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			klog.Errorln("HTTP server failed:", err)
@@ -336,10 +351,32 @@ func info(name, version string) prometheus.Collector {
 	return g
 }
 
+// uptime reports elapsed seconds rather than a start timestamp: the backend
+// stores float32, which rounds unix seconds to 128-second steps.
+func uptime(name string, since time.Time) prometheus.Collector {
+	return prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: name}, func() float64 {
+		return time.Since(since).Seconds()
+	})
+}
+
 type logger struct{}
 
 func (l logger) Println(v ...interface{}) {
 	klog.Errorln(v...)
+}
+
+// configureLogging sends every klog message to w once: by default klog repeats a message
+// for each lower severity and also copies errors straight to stderr, which w already writes to.
+func configureLogging(w io.Writer) {
+	klogFlags := flag.NewFlagSet("klog", flag.ContinueOnError)
+	klog.InitFlags(klogFlags)
+	for name, value := range map[string]string{"one_output": "true", "stderrthreshold": "FATAL"} {
+		if err := klogFlags.Set(name, value); err != nil {
+			klog.Warningf("failed to set klog flag %s: %v", name, err)
+		}
+	}
+	klog.LogToStderr(false)
+	klog.SetOutput(w)
 }
 
 type RateLimitedLogOutput struct {

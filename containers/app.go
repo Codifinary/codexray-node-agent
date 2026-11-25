@@ -13,7 +13,8 @@ var (
 	phpCmd    = regexp.MustCompile(`.*php\d*\.?\d*$`)
 	pythonCmd = regexp.MustCompile(`.*python\d*\.?\d*$`)
 	rubyCmd   = regexp.MustCompile(`.*ruby\d*\.?\d*$`)
-	nodejsCmd = regexp.MustCompile(`.*node(js)?\d*\.?\d*$`)
+	// Matches the file name only: calico-node and similar are not Node.js.
+	nodejsCmd = regexp.MustCompile(`(^|/)node(js)?\d*\.?\d*$`)
 )
 
 func guessApplicationTypeByCmdline(cmdline []byte) string {

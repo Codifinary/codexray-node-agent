@@ -19,6 +19,8 @@ var (
 	DisablePinger     = kingpin.Flag("disable-pinger", "Don't ping upstreams").Default("false").Envar("DISABLE_PINGER").Bool()
 	DisableL7Tracing  = kingpin.Flag("disable-l7-tracing", "Disable L7 tracing").Default("false").Envar("DISABLE_L7_TRACING").Bool()
 
+	L7EventsBufferPages = kingpin.Flag("l7-events-buffer-pages", "Per-CPU size of the L7 events perf buffer, in memory pages. Raise it when the agent logs 'l7_events lost samples'").Default("128").Envar("L7_EVENTS_BUFFER_PAGES").Int()
+
 	ContainerAllowlist = kingpin.Flag("container-allowlist", "List of allowed containers (regex patterns)").Envar("CONTAINER_ALLOWLIST").Strings()
 	ContainerDenylist  = kingpin.Flag("container-denylist", "List of denied containers (regex patterns)").Envar("CONTAINER_DENYLIST").Strings()
 
@@ -109,6 +111,10 @@ func init() {
 	kingpin.HelpFlag.Short('h').Hidden()
 	normalizeLegacyStatsDConfig()
 	kingpin.Parse()
+
+	if *L7EventsBufferPages <= 0 {
+		kingpin.Fatalf("--l7-events-buffer-pages must be positive, got %d", *L7EventsBufferPages)
+	}
 
 	if *agentVersion {
 		fmt.Println("Version:", Version)

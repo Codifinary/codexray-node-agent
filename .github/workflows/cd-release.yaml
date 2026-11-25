@@ -39,7 +39,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ref: main # Always use main branch for releases
+          # Build the commit this run was started on (the release branch it was
+          # dispatched from), not main: a release branch ships what was merged
+          # into it, and main lags it until the release -> main PR merges.
+          ref: ${{ github.sha }}
 
       # Set version and tags
       - name: Set version and tags
@@ -149,6 +152,9 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ env.TAG_NAME }}
+          # Tag the commit that was built. Without it the new tag is created on
+          # the default branch (main), not on what the binaries came from.
+          target_commitish: ${{ github.sha }}
           name: Release ${{ env.TAG_NAME }}
           body: |
             Release ${{ env.TAG_NAME }}

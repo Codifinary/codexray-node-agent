@@ -5,6 +5,7 @@
 package containers
 
 import (
+	"errors"
 	"os"
 	"sort"
 	"strings"
@@ -1096,7 +1097,12 @@ func (c *Container) runLogParser(logPath string) {
 	case cgroup.ContainerTypeSystemdService:
 		ch := make(chan logparser.LogEntry)
 		if err := JournaldSubscribe(c.cgroup, ch); err != nil {
-			klog.Warningln(err)
+			// The startup report already says why the journal can't be read; repeating it for every unit is noise.
+			if errors.Is(err, errJournaldNotInitialized) {
+				klog.V(1).Infoln(err)
+			} else {
+				klog.Warningln(err)
+			}
 			return
 		}
 		parser := logparser.NewParser(ch, nil, logs.OtelLogEmitter(containerId), multilineCollectorTimeout)
