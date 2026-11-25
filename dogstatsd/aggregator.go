@@ -261,7 +261,7 @@ func (a *Aggregator) Snapshot(at time.Time) []prompb.TimeSeries {
 		state := window[key]
 		switch state.metricType {
 		case MetricTypeCounter:
-			result = append(result, aggregateSeries(state.name+"_counter_count", state.labels, state.value, at))
+			result = append(result, aggregateSeries(state.name+"_counter_count", withDeltaSemantics(state.labels, "Sum"), state.value, at))
 		case MetricTypeGauge:
 			result = append(result, aggregateSeries(state.name+"_gauge", state.labels, state.value, at))
 		case MetricTypeTimer:
@@ -342,19 +342,37 @@ func cloneSeries(series []prompb.TimeSeries) []prompb.TimeSeries {
 
 func distributionSeries(baseName string, state *aggregateState, bounds []float64, at time.Time) []prompb.TimeSeries {
 	result := make([]prompb.TimeSeries, 0, len(bounds)+3)
+	base := withDeltaSemantics(state.labels, "Histogram")
 	for i, bound := range bounds {
-		labels := cloneLabels(state.labels)
+		labels := cloneLabels(base)
 		labels["le"] = strconv.FormatFloat(bound, 'g', -1, 64)
 		result = append(result, aggregateSeries(baseName+"_bucket", labels, state.buckets[i], at))
 	}
-	labels := cloneLabels(state.labels)
+	labels := cloneLabels(base)
 	labels["le"] = "+Inf"
 	result = append(result, aggregateSeries(baseName+"_bucket", labels, state.buckets[len(state.buckets)-1], at))
 	result = append(result,
-		aggregateSeries(baseName+"_sum", state.labels, state.sum, at),
-		aggregateSeries(baseName+"_count", state.labels, state.count, at),
+		aggregateSeries(baseName+"_sum", base, state.sum, at),
+		aggregateSeries(baseName+"_count", base, state.count, at),
 	)
 	return result
+}
+
+// Semantic labels read (and stripped) by the Codexray collector. Without them
+// the collector infers Cumulative from the _count/_bucket/_sum suffixes, but
+// every flush here is a fresh per-window value, so the series must be Delta.
+const (
+	temporalityLabel = "__codexray_temporality__"
+	monotonicLabel   = "__codexray_is_monotonic__"
+	metricTypeLabel  = "__codexray_metric_type__"
+)
+
+func withDeltaSemantics(labels map[string]string, metricType string) map[string]string {
+	out := cloneLabels(labels)
+	out[temporalityLabel] = "Delta"
+	out[monotonicLabel] = "true"
+	out[metricTypeLabel] = metricType
+	return out
 }
 
 func aggregateSeries(name string, labels map[string]string, value float64, at time.Time) prompb.TimeSeries {

@@ -46,12 +46,15 @@ func parseLine(line string, now time.Time, maxMetricNameLength int) (*Metric, er
 
 	m := &Metric{Name: name, SampleRate: 1, ReceivedAt: now}
 	switch MetricType(typeToken) {
-	case MetricTypeCounter, MetricTypeGauge, MetricTypeTimer, MetricTypeHistogram:
+	case MetricTypeCounter, MetricTypeGauge, MetricTypeTimer, MetricTypeHistogram, MetricTypeDistribution:
 		v, err := strconv.ParseFloat(valueToken, 64)
 		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 			return nil, fmt.Errorf("invalid numeric value %q", valueToken)
 		}
 		m.Type = MetricType(typeToken)
+		if m.Type == MetricTypeDistribution {
+			m.Type = MetricTypeHistogram
+		}
 		m.Value = v
 		if m.Type == MetricTypeGauge && (strings.HasPrefix(valueToken, "+") || strings.HasPrefix(valueToken, "-")) {
 			m.Relative = true
@@ -113,13 +116,28 @@ func parseTags(raw string) (map[string]string, error) {
 			continue
 		}
 		kv := strings.SplitN(piece, ":", 2)
-		key := normalizeLabelKey(kv[0])
+		// Some clients wrap tags in template braces ("{env}:{prod}"). Drop the
+		// braces so the key does not become "_env_" and the value keeps no "}".
+		rawKey := stripTagBraces(kv[0])
+		if rawKey == "" {
+			continue
+		}
+		key := strings.Trim(normalizeLabelKey(rawKey), "_")
 		if key == "" || key == "label" {
 			return nil, fmt.Errorf("invalid empty tag key in %q", piece)
 		}
+		if key[0] >= '0' && key[0] <= '9' {
+			key = "_" + key
+		}
 		value := "true"
 		if len(kv) == 2 {
-			value = sanitizeLabelValue(kv[1])
+			rawValue := stripTagBraces(kv[1])
+			if rawValue == "" {
+				// "key:" or "key:{}" carries no value; drop the tag instead of
+				// inventing one.
+				continue
+			}
+			value = sanitizeLabelValue(rawValue)
 		}
 		if _, exists := tags[key]; exists {
 			return nil, fmt.Errorf("duplicate or normalized-colliding tag key %q", key)
@@ -130,4 +148,8 @@ func parseTags(raw string) (map[string]string, error) {
 		return nil, nil
 	}
 	return tags, nil
+}
+
+func stripTagBraces(s string) string {
+	return strings.TrimSpace(strings.Trim(strings.TrimSpace(s), "{}"))
 }

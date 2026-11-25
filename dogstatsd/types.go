@@ -18,6 +18,9 @@ const (
 	MetricTypeTimer     MetricType = "ms"
 	MetricTypeHistogram MetricType = "h"
 	MetricTypeSet       MetricType = "s"
+	// MetricTypeDistribution is the DogStatsD distribution type. The agent
+	// aggregates it locally exactly like a histogram.
+	MetricTypeDistribution MetricType = "d"
 )
 
 type Metric struct {
