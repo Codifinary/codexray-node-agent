@@ -144,8 +144,9 @@ func TestAggregatorEnforcesByteLimitAcrossInflightAndActiveWindows(t *testing.T)
 		TimerBucketsMS:        []float64{10},
 		HistogramBuckets:      []float64{10},
 		MaxSetValuesPerSeries: 10,
-		MaxBytes:              300,
-		GaugeTTL:              time.Hour,
+		// One counter state plus the semantic labels its series flushes with.
+		MaxBytes: 300 + deltaSemanticBytes,
+		GaugeTTL: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)

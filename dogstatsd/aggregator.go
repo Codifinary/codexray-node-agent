@@ -93,6 +93,9 @@ type Aggregator struct {
 	gauges         map[string]gaugeBaseline
 	gaugeBytes     int64
 	lastGaugePrune time.Time
+	// windowStart is when the active window began: the previous rotation, or
+	// the first Add. Delta series report it as their start time.
+	windowStart time.Time
 }
 
 type gaugeBaseline struct {
@@ -125,6 +128,9 @@ func (a *Aggregator) Add(metric Metric, tags map[string]string) (accepted bool, 
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.windowStart.IsZero() {
+		a.windowStart = now
+	}
 	a.pruneGaugesLocked(now)
 	state := a.series[key]
 	createdState := false
@@ -249,6 +255,11 @@ func (a *Aggregator) Snapshot(at time.Time) []prompb.TimeSeries {
 	a.series = make(map[string]*aggregateState)
 	windowBytes := a.activeBytes
 	a.activeBytes = 0
+	start := a.windowStart
+	if start.IsZero() || start.After(at) {
+		start = at
+	}
+	a.windowStart = at
 	a.mu.Unlock()
 
 	keys := make([]string, 0, len(window))
@@ -261,13 +272,13 @@ func (a *Aggregator) Snapshot(at time.Time) []prompb.TimeSeries {
 		state := window[key]
 		switch state.metricType {
 		case MetricTypeCounter:
-			result = append(result, aggregateSeries(state.name+"_counter_count", withDeltaSemantics(state.labels, "Sum"), state.value, at))
+			result = append(result, aggregateSeries(state.name+"_counter_count", withDeltaSemantics(state.labels, "Sum", start, 0), state.value, at))
 		case MetricTypeGauge:
 			result = append(result, aggregateSeries(state.name+"_gauge", state.labels, state.value, at))
 		case MetricTypeTimer:
-			result = append(result, distributionSeries(state.name+"_timer_ms", state, a.cfg.TimerBucketsMS, at)...)
+			result = append(result, distributionSeries(state.name+"_timer_ms", state, a.cfg.TimerBucketsMS, start, at)...)
 		case MetricTypeHistogram:
-			result = append(result, distributionSeries(state.name+"_histogram", state, a.cfg.HistogramBuckets, at)...)
+			result = append(result, distributionSeries(state.name+"_histogram", state, a.cfg.HistogramBuckets, start, at)...)
 		case MetricTypeSet:
 			result = append(result, aggregateSeries(state.name+"_set_cardinality", state.labels, float64(len(state.setValues)), at))
 		}
@@ -326,6 +337,14 @@ func estimateAggregateStateBytes(state *aggregateState) int64 {
 	for key, value := range state.labels {
 		result += int64(48 + len(key) + len(value))
 	}
+	// Counters, timers and histograms gain the semantic labels on every series
+	// they flush: one counter series, or one per bucket plus +Inf, _sum, _count.
+	switch state.metricType {
+	case MetricTypeCounter:
+		result += deltaSemanticBytes
+	case MetricTypeTimer, MetricTypeHistogram:
+		result += int64(len(state.buckets)+2) * deltaSemanticBytes
+	}
 	return result
 }
 
@@ -340,20 +359,21 @@ func cloneSeries(series []prompb.TimeSeries) []prompb.TimeSeries {
 	return result
 }
 
-func distributionSeries(baseName string, state *aggregateState, bounds []float64, at time.Time) []prompb.TimeSeries {
+func distributionSeries(baseName string, state *aggregateState, bounds []float64, start, at time.Time) []prompb.TimeSeries {
 	result := make([]prompb.TimeSeries, 0, len(bounds)+3)
-	base := withDeltaSemantics(state.labels, "Histogram")
+	// One map for every series: labelsMapToSortedPromLabels copies it, so
+	// "le" is overwritten per bucket and removed before _sum and _count.
+	labels := withDeltaSemantics(state.labels, "Histogram", start, 1)
 	for i, bound := range bounds {
-		labels := cloneLabels(base)
 		labels["le"] = strconv.FormatFloat(bound, 'g', -1, 64)
 		result = append(result, aggregateSeries(baseName+"_bucket", labels, state.buckets[i], at))
 	}
-	labels := cloneLabels(base)
 	labels["le"] = "+Inf"
 	result = append(result, aggregateSeries(baseName+"_bucket", labels, state.buckets[len(state.buckets)-1], at))
+	delete(labels, "le")
 	result = append(result,
-		aggregateSeries(baseName+"_sum", base, state.sum, at),
-		aggregateSeries(baseName+"_count", base, state.count, at),
+		aggregateSeries(baseName+"_sum", labels, state.sum, at),
+		aggregateSeries(baseName+"_count", labels, state.count, at),
 	)
 	return result
 }
@@ -361,17 +381,35 @@ func distributionSeries(baseName string, state *aggregateState, bounds []float64
 // Semantic labels read (and stripped) by the Codexray collector. Without them
 // the collector infers Cumulative from the _count/_bucket/_sum suffixes, but
 // every flush here is a fresh per-window value, so the series must be Delta.
+// Clients cannot send these: see semanticLabelPrefix.
 const (
 	temporalityLabel = "__codexray_temporality__"
 	monotonicLabel   = "__codexray_is_monotonic__"
 	metricTypeLabel  = "__codexray_metric_type__"
+	startTimeLabel   = "__codexray_start_unix_milli__"
 )
 
-func withDeltaSemantics(labels map[string]string, metricType string) map[string]string {
-	out := cloneLabels(labels)
+// deltaSemanticBytes is the estimated size the semantic labels add to each
+// flushed series, counted in estimateAggregateStateBytes.
+var deltaSemanticBytes = int64(4*48 + len(temporalityLabel) + len("Delta") + len(monotonicLabel) + len("true") +
+	len(metricTypeLabel) + len("Histogram") + len(startTimeLabel) + 13)
+
+// withDeltaSemantics returns a copy of labels marked as one Delta window
+// starting at start, with room for extra more keys.
+//
+// Counters are always marked monotonic. A DogStatsD count may carry a negative
+// increment, but each window is still an additive total, and the query service
+// reads a non-monotonic Sum as a gauge: one negative window would turn the
+// metric into a gauge and break increase and rate on it.
+func withDeltaSemantics(labels map[string]string, metricType string, start time.Time, extra int) map[string]string {
+	out := make(map[string]string, len(labels)+4+extra)
+	for k, v := range labels {
+		out[k] = v
+	}
 	out[temporalityLabel] = "Delta"
 	out[monotonicLabel] = "true"
 	out[metricTypeLabel] = metricType
+	out[startTimeLabel] = strconv.FormatInt(start.UnixMilli(), 10)
 	return out
 }
 

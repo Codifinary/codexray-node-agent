@@ -12,9 +12,15 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 )
 
+// reservedLabelKeys are labels clients may not set. Keys are compared after
+// normalizeLabelKey, which trims edge underscores, so "__name__" cannot be
+// produced by a client and is not listed.
 var reservedLabelKeys = []string{
-	"__name__",
 	"is_custom",
+	// The aggregator owns histogram bucket and summary quantile labels; a
+	// client "le" would otherwise ride onto _sum and _count.
+	"le",
+	"quantile",
 	// Do not allow applications to reintroduce the removed generated label.
 	"statsd_type",
 	"instance",
@@ -24,6 +30,11 @@ var reservedLabelKeys = []string{
 	"tenant_id",
 	"project_id",
 }
+
+// semanticLabelPrefix marks the labels the Codexray collector reads and
+// strips (temporality, metric type, monotonicity, start time). After
+// normalization "__codexray_x__" becomes "codexray_x"; clients may not send it.
+const semanticLabelPrefix = "codexray_"
 
 type tagDropStats struct {
 	BlockedKeys      int
@@ -66,7 +77,7 @@ func (p tagPolicy) Apply(tags map[string]string) (map[string]string, tagDropStat
 	var drops tagDropStats
 	for _, rawKey := range keys {
 		key := normalizeLabelKey(rawKey)
-		if _, blocked := p.blockedKeys[key]; blocked {
+		if _, blocked := p.blockedKeys[key]; blocked || strings.HasPrefix(key, semanticLabelPrefix) {
 			drops.BlockedKeys++
 			continue
 		}

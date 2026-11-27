@@ -51,8 +51,11 @@ func normalizeLabelKey(key string) string {
 		}
 		b.WriteByte('_')
 	}
-	out := collapseUnderscores(b.String())
-	if strings.Trim(out, "_") == "" {
+	// Leading and trailing underscores are trimmed so "{env}", "_env_" and
+	// "env" are one key. The parser, the tag policy and the blocklist all go
+	// through here, so they agree on what a key is.
+	out := strings.Trim(collapseUnderscores(b.String()), "_")
+	if out == "" {
 		out = "label"
 	}
 	if out[0] >= '0' && out[0] <= '9' {
