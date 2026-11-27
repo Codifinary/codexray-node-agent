@@ -10,10 +10,11 @@ DogStatsD series are stored with the right temporality, and template-style tags 
 
 ### Fixed
 - **Counters, timers, histograms and distributions are sent as Delta.** Each flush window is a fresh per-window value; the collector used to read the `_count`/`_bucket`/`_sum` suffixes as Cumulative. Every such series now carries `__codexray_temporality__=Delta`, `__codexray_metric_type__` (`Sum` or `Histogram`), `__codexray_is_monotonic__=true` and `__codexray_start_unix_milli__` (the window start). Counters stay monotonic even after a negative increment: each window is still an additive total, and the query service reads a non-monotonic Sum as a gauge.
-- **A client `le` or `quantile` tag no longer rides onto a histogram's `_sum` and `_count`.** Both are reserved, as are tags that normalize to `codexray_*`.
 - **Memory accounting** counts the semantic labels each flushed series carries.
 
 ### Changed
+- **Client `le` and `quantile` tags are dropped on every metric type.** They previously rode onto a histogram's `_sum` and `_count`. On gauges, sets and counters too, series that differed only by such a tag now merge. The collector's four semantic labels (`__codexray_temporality__` and the others, in any spelling) are blocked the same way; other `codexray_*` tags are kept.
+- **A tag named `label` is kept.** `label:x`, `_label_:x` and `{label}:x` all give `label=x`; before, `label` was the placeholder for an empty key and the line was rejected.
 - **Template braces are stripped from tags:** one pair, only when a key or value both starts with `{` and ends with `}`. `{env}:{prod}` becomes `env=prod`; values such as `{"a":1}` lose only that outer pair.
 - **Tag keys lose leading and trailing underscores** (`_env_` becomes `env`), in the parser, the tag policy and `--statsd-tag-key-blocklist` alike. Series of clients that sent such keys get new label names, and a line with both `env` and `_env_` is rejected as colliding, like any other normalized collision.
 - **Distributions (`d`) are accepted** and aggregated exactly like histograms, sample rate included.

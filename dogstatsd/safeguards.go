@@ -31,10 +31,11 @@ var reservedLabelKeys = []string{
 	"project_id",
 }
 
-// semanticLabelPrefix marks the labels the Codexray collector reads and
-// strips (temporality, metric type, monotonicity, start time). After
-// normalization "__codexray_x__" becomes "codexray_x"; clients may not send it.
-const semanticLabelPrefix = "codexray_"
+// semanticLabelKeys are the collector's semantic labels (see aggregator.go).
+// normalizeLabelKey trims edge underscores, so a client can never send them
+// as-is; their normalized forms ("codexray_temporality", ...) are blocked too so
+// a client tag can't be mistaken for one. Other codexray_* tags are kept.
+var semanticLabelKeys = []string{temporalityLabel, monotonicLabel, metricTypeLabel, startTimeLabel}
 
 type tagDropStats struct {
 	BlockedKeys      int
@@ -52,9 +53,11 @@ type tagPolicy struct {
 
 func newTagPolicy(blocklistCSV string, maxTagsPerMetric, maxTagKeyLength, maxTagValueLength int) tagPolicy {
 	blocked := make(map[string]struct{})
-	for _, raw := range append(strings.Split(blocklistCSV, ","), reservedLabelKeys...) {
+	sources := append(strings.Split(blocklistCSV, ","), reservedLabelKeys...)
+	sources = append(sources, semanticLabelKeys...)
+	for _, raw := range sources {
 		key := normalizeLabelKey(raw)
-		if key != "" && key != "label" {
+		if key != "" {
 			blocked[key] = struct{}{}
 		}
 	}
@@ -77,7 +80,7 @@ func (p tagPolicy) Apply(tags map[string]string) (map[string]string, tagDropStat
 	var drops tagDropStats
 	for _, rawKey := range keys {
 		key := normalizeLabelKey(rawKey)
-		if _, blocked := p.blockedKeys[key]; blocked || strings.HasPrefix(key, semanticLabelPrefix) {
+		if _, blocked := p.blockedKeys[key]; blocked || key == "" {
 			drops.BlockedKeys++
 			continue
 		}

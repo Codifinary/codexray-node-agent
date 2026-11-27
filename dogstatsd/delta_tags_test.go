@@ -37,6 +37,13 @@ func TestAggregatorMarksWindowedSeriesAsDelta(t *testing.T) {
 			if mt := labelValue(s.Labels, metricTypeLabel); mt != wantType {
 				t.Errorf("%s: metric type %q, want %q", name, mt, wantType)
 			}
+			if m := labelValue(s.Labels, monotonicLabel); m != "true" {
+				t.Errorf("%s: monotonic %q, want true", name, m)
+			}
+		}
+		// le is set on histogram buckets and nowhere else.
+		if strings.HasSuffix(name, "_bucket") == (labelValue(s.Labels, "le") == "") {
+			t.Errorf("%s: le only on buckets: %v", name, s.Labels)
 		}
 	}
 }
@@ -71,10 +78,41 @@ func TestParseTagsBracesAndEmptyValues(t *testing.T) {
 // Every unusable key rejects the line, as before: empty and symbol-only keys,
 // and keys that normalize alike (braces and edge underscores included).
 func TestParseTagsRejectsEmptyAndCollidingKeys(t *testing.T) {
-	for _, raw := range []string{":x", "{}:y", "___:z", "_label_:x", "env:a,_env_:b", "env:a,{env}:b", "}}env{{:p,env:q"} {
+	for _, raw := range []string{":x", "{}:y", "___:z", "env:a,_env_:b", "env:a,{env}:b", "}}env{{:p,env:q", "label:a,_label_:b"} {
 		if tags, err := parseTags(raw); err == nil {
 			t.Fatalf("%s: want an error, got %v", raw, tags)
 		}
+	}
+}
+
+// A real tag named "label" is kept: empty keys normalize to "", not "label".
+func TestParseTagsKeepsLabelKey(t *testing.T) {
+	for _, raw := range []string{"label:x", "_label_:x", "{label}:x"} {
+		tags, err := parseTags(raw)
+		if err != nil || len(tags) != 1 || tags["label"] != "x" {
+			t.Fatalf("%s: got %v, %v", raw, tags, err)
+		}
+	}
+}
+
+// Each semantic label constant, sent by a client in any spelling, is blocked;
+// other codexray_* tags are ordinary tags and pass.
+func TestTagPolicyBlocksEverySemanticLabel(t *testing.T) {
+	policy := newTagPolicy("", 64, 200, 200)
+	for _, key := range []string{temporalityLabel, monotonicLabel, metricTypeLabel, startTimeLabel} {
+		for _, spelling := range []string{key, strings.Trim(key, "_"), strings.ToUpper(key), "{" + key + "}"} {
+			tags, err := parseTags(spelling + ":x")
+			if err != nil {
+				t.Fatalf("%s: %v", spelling, err)
+			}
+			if out, _ := policy.Apply(tags); len(out) != 0 {
+				t.Fatalf("%s passed the policy: %v", spelling, out)
+			}
+		}
+	}
+	tags, _ := parseTags("codexray_env:prod,CODEXRAY_team:x,x_codexray_y:z")
+	if out, drops := policy.Apply(tags); len(out) != 3 || drops.BlockedKeys != 0 {
+		t.Fatalf("ordinary codexray_* tags dropped: %v %+v", out, drops)
 	}
 }
 
@@ -126,8 +164,10 @@ func TestClientTagsCannotChangeSemantics(t *testing.T) {
 			}
 		}
 		for _, l := range s.Labels {
-			if strings.HasPrefix(l.Name, "codexray_") {
-				t.Fatalf("%s: client semantic tag survived as %s", name, l.Name)
+			for _, key := range semanticLabelKeys {
+				if l.Name == normalizeLabelKey(key) {
+					t.Fatalf("%s: client semantic tag survived as %s", name, l.Name)
+				}
 			}
 		}
 	}
@@ -166,21 +206,6 @@ func TestDeltaSeriesCarryWindowStart(t *testing.T) {
 	for _, s := range agg.Snapshot(flush.Add(10 * time.Second)) {
 		if got := labelValue(s.Labels, startTimeLabel); got != "1700000010000" {
 			t.Fatalf("second window starts at the first flush, got %q", got)
-		}
-	}
-}
-
-func TestEveryDeltaSeriesIsMarked(t *testing.T) {
-	agg := testAggregator(t)
-	now := time.Now()
-	agg.Add(Metric{Name: "lat", Type: MetricTypeTimer, Value: 20, SampleRate: 1, ReceivedAt: now}, nil)
-	for _, s := range agg.Snapshot(now) {
-		name := labelValue(s.Labels, "__name__")
-		if labelValue(s.Labels, monotonicLabel) != "true" || labelValue(s.Labels, temporalityLabel) != "Delta" || labelValue(s.Labels, metricTypeLabel) != "Histogram" {
-			t.Fatalf("%s: %v", name, s.Labels)
-		}
-		if strings.HasSuffix(name, "_bucket") == (labelValue(s.Labels, "le") == "") {
-			t.Fatalf("%s: le only on buckets: %v", name, s.Labels)
 		}
 	}
 }

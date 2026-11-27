@@ -272,7 +272,7 @@ func (a *Aggregator) Snapshot(at time.Time) []prompb.TimeSeries {
 		state := window[key]
 		switch state.metricType {
 		case MetricTypeCounter:
-			result = append(result, aggregateSeries(state.name+"_counter_count", withDeltaSemantics(state.labels, "Sum", start, 0), state.value, at))
+			result = append(result, aggregateSeries(state.name+"_counter_count", withDeltaSemantics(state.labels, "Sum", start), state.value, at))
 		case MetricTypeGauge:
 			result = append(result, aggregateSeries(state.name+"_gauge", state.labels, state.value, at))
 		case MetricTypeTimer:
@@ -363,7 +363,7 @@ func distributionSeries(baseName string, state *aggregateState, bounds []float64
 	result := make([]prompb.TimeSeries, 0, len(bounds)+3)
 	// One map for every series: labelsMapToSortedPromLabels copies it, so
 	// "le" is overwritten per bucket and removed before _sum and _count.
-	labels := withDeltaSemantics(state.labels, "Histogram", start, 1)
+	labels := withDeltaSemantics(state.labels, "Histogram", start)
 	for i, bound := range bounds {
 		labels["le"] = strconv.FormatFloat(bound, 'g', -1, 64)
 		result = append(result, aggregateSeries(baseName+"_bucket", labels, state.buckets[i], at))
@@ -381,7 +381,7 @@ func distributionSeries(baseName string, state *aggregateState, bounds []float64
 // Semantic labels read (and stripped) by the Codexray collector. Without them
 // the collector infers Cumulative from the _count/_bucket/_sum suffixes, but
 // every flush here is a fresh per-window value, so the series must be Delta.
-// Clients cannot send these: see semanticLabelPrefix.
+// Clients cannot send these: see semanticLabelKeys.
 const (
 	temporalityLabel = "__codexray_temporality__"
 	monotonicLabel   = "__codexray_is_monotonic__"
@@ -395,17 +395,15 @@ var deltaSemanticBytes = int64(4*48 + len(temporalityLabel) + len("Delta") + len
 	len(metricTypeLabel) + len("Histogram") + len(startTimeLabel) + 13)
 
 // withDeltaSemantics returns a copy of labels marked as one Delta window
-// starting at start, with room for extra more keys.
+// starting at start. The copy has room for one more key, the le a histogram
+// sets per bucket.
 //
 // Counters are always marked monotonic. A DogStatsD count may carry a negative
 // increment, but each window is still an additive total, and the query service
 // reads a non-monotonic Sum as a gauge: one negative window would turn the
 // metric into a gauge and break increase and rate on it.
-func withDeltaSemantics(labels map[string]string, metricType string, start time.Time, extra int) map[string]string {
-	out := make(map[string]string, len(labels)+4+extra)
-	for k, v := range labels {
-		out[k] = v
-	}
+func withDeltaSemantics(labels map[string]string, metricType string, start time.Time) map[string]string {
+	out := cloneLabelsCap(labels, 5)
 	out[temporalityLabel] = "Delta"
 	out[monotonicLabel] = "true"
 	out[metricTypeLabel] = metricType
@@ -440,7 +438,12 @@ func aggregationKey(name string, metricType MetricType, labels map[string]string
 }
 
 func cloneLabels(labels map[string]string) map[string]string {
-	result := make(map[string]string, len(labels)+1)
+	return cloneLabelsCap(labels, 1)
+}
+
+// cloneLabelsCap copies labels into a map with room for extra more keys.
+func cloneLabelsCap(labels map[string]string, extra int) map[string]string {
+	result := make(map[string]string, len(labels)+extra)
 	for key, value := range labels {
 		result[key] = value
 	}

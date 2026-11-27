@@ -123,7 +123,7 @@ func parseTags(raw string) (map[string]string, error) {
 		kv := strings.SplitN(piece, ":", 2)
 		// Some clients wrap tags in template braces ("{env}:{prod}").
 		key := normalizeLabelKey(stripTagBraces(kv[0]))
-		if key == "label" {
+		if key == "" {
 			return nil, fmt.Errorf("invalid empty tag key in %q", piece)
 		}
 		value := "true"
