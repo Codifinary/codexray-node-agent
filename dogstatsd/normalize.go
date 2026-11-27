@@ -37,7 +37,7 @@ func normalizeMetricName(name string) string {
 func normalizeLabelKey(key string) string {
 	k := strings.ToLower(strings.TrimSpace(key))
 	if k == "" {
-		return "label"
+		return ""
 	}
 	var b strings.Builder
 	b.Grow(len(k))
@@ -51,9 +51,14 @@ func normalizeLabelKey(key string) string {
 		}
 		b.WriteByte('_')
 	}
-	out := collapseUnderscores(b.String())
-	if strings.Trim(out, "_") == "" {
-		out = "label"
+	// Leading and trailing underscores are trimmed so "{env}", "_env_" and
+	// "env" are one key. The parser, the tag policy and the blocklist all go
+	// through here, so they agree on what a key is.
+	// An empty or symbol-only key normalizes to "", which callers reject; a
+	// real tag named "label" is kept.
+	out := strings.Trim(collapseUnderscores(b.String()), "_")
+	if out == "" {
+		return ""
 	}
 	if out[0] >= '0' && out[0] <= '9' {
 		out = "_" + out

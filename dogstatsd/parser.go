@@ -46,12 +46,15 @@ func parseLine(line string, now time.Time, maxMetricNameLength int) (*Metric, er
 
 	m := &Metric{Name: name, SampleRate: 1, ReceivedAt: now}
 	switch MetricType(typeToken) {
-	case MetricTypeCounter, MetricTypeGauge, MetricTypeTimer, MetricTypeHistogram:
+	case MetricTypeCounter, MetricTypeGauge, MetricTypeTimer, MetricTypeHistogram, MetricTypeDistribution:
 		v, err := strconv.ParseFloat(valueToken, 64)
 		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 			return nil, fmt.Errorf("invalid numeric value %q", valueToken)
 		}
 		m.Type = MetricType(typeToken)
+		if m.Type == MetricTypeDistribution {
+			m.Type = MetricTypeHistogram
+		}
 		m.Value = v
 		if m.Type == MetricTypeGauge && (strings.HasPrefix(valueToken, "+") || strings.HasPrefix(valueToken, "-")) {
 			m.Relative = true
@@ -102,6 +105,11 @@ func parseLine(line string, now time.Time, maxMetricNameLength int) (*Metric, er
 	return m, nil
 }
 
+// parseTags parses a DogStatsD tag section. As before template braces were
+// handled, a line is rejected when a key is empty or symbol-only (":x",
+// "___:x") or when two keys normalize alike ("env" and "_env_"): one rule for
+// every unusable key, counted as a parse error. "key" and "key:" both mean
+// key=true.
 func parseTags(raw string) (map[string]string, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, nil
@@ -113,13 +121,14 @@ func parseTags(raw string) (map[string]string, error) {
 			continue
 		}
 		kv := strings.SplitN(piece, ":", 2)
-		key := normalizeLabelKey(kv[0])
-		if key == "" || key == "label" {
+		// Some clients wrap tags in template braces ("{env}:{prod}").
+		key := normalizeLabelKey(stripTagBraces(kv[0]))
+		if key == "" {
 			return nil, fmt.Errorf("invalid empty tag key in %q", piece)
 		}
 		value := "true"
 		if len(kv) == 2 {
-			value = sanitizeLabelValue(kv[1])
+			value = sanitizeLabelValue(stripTagBraces(kv[1]))
 		}
 		if _, exists := tags[key]; exists {
 			return nil, fmt.Errorf("duplicate or normalized-colliding tag key %q", key)
@@ -130,4 +139,15 @@ func parseTags(raw string) (map[string]string, error) {
 		return nil, nil
 	}
 	return tags, nil
+}
+
+// stripTagBraces removes one pair of template braces, only when the text both
+// starts with "{" and ends with "}". Values such as {"a":1} or a{b} keep theirs
+// apart from that one outer pair.
+func stripTagBraces(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}' {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	return s
 }

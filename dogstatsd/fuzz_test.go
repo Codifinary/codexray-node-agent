@@ -59,7 +59,8 @@ func FuzzTagNormalization(f *testing.F) {
 			return
 		}
 		key := normalizeLabelKey(input)
-		if !validNormalizedLabelKey(key) {
+		// "" is the rejection value for empty or symbol-only input.
+		if key != "" && !validNormalizedLabelKey(key) {
 			t.Fatalf("normalizeLabelKey(%q)=%q", input, key)
 		}
 		value := sanitizeLabelValue(input)

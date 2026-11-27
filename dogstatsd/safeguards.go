@@ -12,9 +12,15 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 )
 
+// reservedLabelKeys are labels clients may not set. Keys are compared after
+// normalizeLabelKey, which trims edge underscores, so "__name__" cannot be
+// produced by a client and is not listed.
 var reservedLabelKeys = []string{
-	"__name__",
 	"is_custom",
+	// The aggregator owns histogram bucket and summary quantile labels; a
+	// client "le" would otherwise ride onto _sum and _count.
+	"le",
+	"quantile",
 	// Do not allow applications to reintroduce the removed generated label.
 	"statsd_type",
 	"instance",
@@ -24,6 +30,12 @@ var reservedLabelKeys = []string{
 	"tenant_id",
 	"project_id",
 }
+
+// semanticLabelKeys are the collector's semantic labels (see aggregator.go).
+// normalizeLabelKey trims edge underscores, so a client can never send them
+// as-is; their normalized forms ("codexray_temporality", ...) are blocked too so
+// a client tag can't be mistaken for one. Other codexray_* tags are kept.
+var semanticLabelKeys = []string{temporalityLabel, monotonicLabel, metricTypeLabel, startTimeLabel}
 
 type tagDropStats struct {
 	BlockedKeys      int
@@ -41,9 +53,11 @@ type tagPolicy struct {
 
 func newTagPolicy(blocklistCSV string, maxTagsPerMetric, maxTagKeyLength, maxTagValueLength int) tagPolicy {
 	blocked := make(map[string]struct{})
-	for _, raw := range append(strings.Split(blocklistCSV, ","), reservedLabelKeys...) {
+	sources := append(strings.Split(blocklistCSV, ","), reservedLabelKeys...)
+	sources = append(sources, semanticLabelKeys...)
+	for _, raw := range sources {
 		key := normalizeLabelKey(raw)
-		if key != "" && key != "label" {
+		if key != "" {
 			blocked[key] = struct{}{}
 		}
 	}
@@ -66,7 +80,7 @@ func (p tagPolicy) Apply(tags map[string]string) (map[string]string, tagDropStat
 	var drops tagDropStats
 	for _, rawKey := range keys {
 		key := normalizeLabelKey(rawKey)
-		if _, blocked := p.blockedKeys[key]; blocked {
+		if _, blocked := p.blockedKeys[key]; blocked || key == "" {
 			drops.BlockedKeys++
 			continue
 		}
