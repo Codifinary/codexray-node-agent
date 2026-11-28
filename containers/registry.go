@@ -57,8 +57,15 @@ type Registry struct {
 	containersByCgroupId   map[string]*Container
 	containersByPid        map[uint32]*Container
 	containersByPidIgnored map[uint32]*time.Time
-	ip2fqdn                map[netaddr.IP]*common.Domain
-	ip2fqdnLock            sync.RWMutex
+	// exitedPids keeps the container of each pid that exited in the last exitedPidTTL: a
+	// listen event can arrive after its process has already exited.
+	exitedPids         map[uint32]exitedPid
+	exitedPidsPrunedAt time.Time
+	// recentStarts is when each container last registered a process: a listen whose process
+	// exited unseen was most likely handed to a process one of them just started.
+	recentStarts map[*Container]time.Time
+	ip2fqdn      map[netaddr.IP]*common.Domain
+	ip2fqdnLock  sync.RWMutex
 
 	processInfoCh chan<- ProcessInfo
 
@@ -116,6 +123,8 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 		containersByCgroupId:   map[string]*Container{},
 		containersByPid:        map[uint32]*Container{},
 		containersByPidIgnored: map[uint32]*time.Time{},
+		exitedPids:             map[uint32]exitedPid{},
+		recentStarts:           map[*Container]time.Time{},
 		ip2fqdn:                map[netaddr.IP]*common.Domain{},
 
 		processInfoCh: processInfoCh,
@@ -252,11 +261,16 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			case ebpftracer.EventTypeProcessStart:
 				r.revalidatePidMapping(e.Pid)
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
-					r.sendProcessInfo(c, c.onProcessStart(e.Pid))
+					p := c.onProcessStart(e.Pid)
+					if p != nil {
+						r.recentStarts[c] = time.Now()
+					}
+					r.sendProcessInfo(c, p)
 				}
 			case ebpftracer.EventTypeProcessExit:
 				if c := r.containersByPid[e.Pid]; c != nil {
 					c.onProcessExit(e.Pid, e.Reason == ebpftracer.EventReasonOOMKill)
+					r.rememberExitedPid(e.Pid, c, time.Now())
 				}
 				delete(r.containersByPid, e.Pid)
 
@@ -312,6 +326,46 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 	}
 }
 
+type exitedPid struct {
+	container *Container
+	at        time.Time
+}
+
+// exitedPidTTL is how long after a process exits its late listen events are still tied to its container.
+const exitedPidTTL = 30 * time.Second
+
+func (r *Registry) rememberExitedPid(pid uint32, c *Container, now time.Time) {
+	r.exitedPids[pid] = exitedPid{container: c, at: now}
+	if now.Sub(r.exitedPidsPrunedAt) < exitedPidTTL {
+		return
+	}
+	for p, exited := range r.exitedPids {
+		if now.Sub(exited.at) >= exitedPidTTL {
+			delete(r.exitedPids, p)
+		}
+	}
+	r.exitedPidsPrunedAt = now
+}
+
+// requestListenResyncsFor asks for a listen resync of the container pid exited from, or else of
+// every container that registered a process within exitedPidTTL; it reports whether it asked any.
+func (r *Registry) requestListenResyncsFor(pid uint32, now time.Time) bool {
+	if exited, ok := r.exitedPids[pid]; ok && now.Sub(exited.at) < exitedPidTTL {
+		exited.container.requestListenResync()
+		return true
+	}
+	requested := false
+	for c, at := range r.recentStarts {
+		if now.Sub(at) >= exitedPidTTL {
+			delete(r.recentStarts, c)
+			continue
+		}
+		c.requestListenResync()
+		requested = true
+	}
+	return requested
+}
+
 // revalidatePidMapping forgets pid's container when the pid now lives in another cgroup: pids
 // wrap around and a process-exit event can be missed.
 func (r *Registry) revalidatePidMapping(pid uint32) {
@@ -324,6 +378,7 @@ func (r *Registry) revalidatePidMapping(pid uint32) {
 		if err != nil || cg.Id != c.cgroup.Id {
 			delete(r.containersByPid, pid)
 			c.onProcessExit(pid, false)
+			r.rememberExitedPid(pid, c, time.Now())
 		}
 	}
 }
@@ -345,6 +400,13 @@ func (r *Registry) handleListenOpen(pid uint32, addr netaddr.IPPort) {
 	r.revalidatePidMapping(pid)
 	c := r.getOrCreateContainer(pid)
 	if c == nil {
+		// A forking daemon's listener often exits before its listen event is handled, even
+		// before its start event is; the socket then lives on in a child, which a resync of
+		// the child's container finds.
+		if r.requestListenResyncsFor(pid, time.Now()) {
+			agentMetrics.listenOpenEvents.WithLabelValues(listenResyncRequested).Inc()
+			return
+		}
 		agentMetrics.listenOpenEvents.WithLabelValues(listenNoContainer).Inc()
 		klog.Infoln("TCP listen open from unknown container", pid, addr)
 		return

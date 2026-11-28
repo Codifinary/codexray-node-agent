@@ -147,3 +147,52 @@ func TestOwnerExitAsksForAResync(t *testing.T) {
 	c.onProcessExit(200, false)
 	assert.Len(t, c.listenResyncCh, 1, "the listen's owner")
 }
+
+func TestLateListenOfAnExitedProcessResyncsItsContainer(t *testing.T) {
+	const gonePid = 4_000_000 // beyond any pid_max, so its cgroup can't be read
+	c := newTestContainer()
+	c.listenResyncCh = make(chan struct{}, 1)
+	r := &Registry{containersByPid: map[uint32]*Container{}, containersByPidIgnored: map[uint32]*time.Time{},
+		exitedPids: map[uint32]exitedPid{}, recentStarts: map[*Container]time.Time{}}
+	resyncs := counterValue(t, agentMetrics.listenOpenEvents, listenResyncRequested)
+	unknown := counterValue(t, agentMetrics.listenOpenEvents, listenNoContainer)
+
+	r.handleListenOpen(gonePid, netaddr.MustParseIPPort("[::]:8080"))
+	assert.Empty(t, c.listenResyncCh, "a pid the registry never saw, and no container started a process")
+	assert.Equal(t, unknown+1, counterValue(t, agentMetrics.listenOpenEvents, listenNoContainer))
+
+	r.rememberExitedPid(gonePid, c, time.Now())
+	r.handleListenOpen(gonePid, netaddr.MustParseIPPort("[::]:8080"))
+	assert.Len(t, c.listenResyncCh, 1, "the container it exited from")
+	assert.Equal(t, resyncs+1, counterValue(t, agentMetrics.listenOpenEvents, listenResyncRequested))
+}
+
+func TestLateListenOfAnUnseenProcessResyncsRecentlyStartedContainers(t *testing.T) {
+	now := time.Now()
+	recent, idle := newTestContainer(), newTestContainer()
+	recent.listenResyncCh, idle.listenResyncCh = make(chan struct{}, 1), make(chan struct{}, 1)
+	r := &Registry{exitedPids: map[uint32]exitedPid{},
+		recentStarts: map[*Container]time.Time{recent: now.Add(-time.Second), idle: now.Add(-exitedPidTTL)}}
+
+	assert.True(t, r.requestListenResyncsFor(4_000_000, now))
+	assert.Len(t, recent.listenResyncCh, 1, "it just started a process: maybe the one the socket went to")
+	assert.Empty(t, idle.listenResyncCh)
+	assert.NotContains(t, r.recentStarts, idle, "stale entries are dropped")
+	assert.False(t, (&Registry{exitedPids: map[uint32]exitedPid{}, recentStarts: map[*Container]time.Time{}}).requestListenResyncsFor(1, now))
+}
+
+func TestExitedPidsArePruned(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	r := &Registry{exitedPids: map[uint32]exitedPid{}}
+	r.rememberExitedPid(1, nil, now)
+	r.rememberExitedPid(2, nil, now.Add(exitedPidTTL))
+	assert.Equal(t, []uint32{2}, keysOf(r.exitedPids), "the first is past its TTL")
+}
+
+func keysOf(m map[uint32]exitedPid) []uint32 {
+	var res []uint32
+	for k := range m {
+		res = append(res, k)
+	}
+	return res
+}

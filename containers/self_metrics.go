@@ -24,6 +24,9 @@ const (
 	listenStored       = "stored"
 	listenPortFiltered = "port_filtered"
 	listenNoContainer  = "no_container"
+	// listenResyncRequested: no container was found, so the containers the listen may
+	// have been handed to are resynced instead.
+	listenResyncRequested = "resync_requested"
 
 	lookupCgroup   = "cgroup"
 	lookupMetadata = "metadata"
@@ -60,7 +63,8 @@ func newSelfMetrics() *selfMetrics {
 	}
 	return &selfMetrics{
 		listenOpenEvents: counterVec("node_agent_listen_open_events_total",
-			"TCP listen open events by what became of them", "result", listenStored, listenPortFiltered, listenNoContainer),
+			"TCP listen open events by what became of them", "result",
+			listenStored, listenPortFiltered, listenNoContainer, listenResyncRequested),
 		containerLookupFailures: counterVec("node_agent_container_lookup_failures_total",
 			"Pids whose container could not be resolved, by the step that failed", "reason",
 			lookupCgroup, lookupMetadata, lookupCreate, lookupRegister),

@@ -24,7 +24,7 @@ func TestSelfMetricsStartAtZero(t *testing.T) {
 		}
 	}
 	assert.Equal(t, map[string]int{
-		"node_agent_listen_open_events_total":        3,
+		"node_agent_listen_open_events_total":        4,
 		"node_agent_container_lookup_failures_total": 4,
 		"node_agent_process_registrations_total":     4,
 		"node_agent_listen_attributions_total":       3,

@@ -622,10 +622,7 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	}
 	delete(c.processes, pid)
 	if c.ownsOpenListenLocked(pid) {
-		select {
-		case c.listenResyncCh <- struct{}{}:
-		default:
-		}
+		c.requestListenResync()
 	}
 	if len(c.processes) == 0 {
 		c.zombieAt = time.Now()
@@ -638,6 +635,14 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 
 // listenResyncDelay lets the processes a listen's owner leaves behind settle before the resync.
 var listenResyncDelay = 5 * time.Second
+
+// requestListenResync asks the container goroutine to revalidate the listens soon; it never blocks.
+func (c *Container) requestListenResync() {
+	select {
+	case c.listenResyncCh <- struct{}{}:
+	default:
+	}
+}
 
 func (c *Container) ownsOpenListenLocked(pid uint32) bool {
 	for _, byPid := range c.listens {
