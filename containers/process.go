@@ -16,7 +16,6 @@ import (
 	"github.com/codifinary/codexray-node-agent/gpu"
 	"github.com/codifinary/codexray-node-agent/proc"
 	"github.com/jpillora/backoff"
-	"github.com/mdlayher/taskstats"
 )
 
 type GpuUsage struct {
@@ -54,8 +53,16 @@ type Process struct {
 	gpuUsageSamples []gpu.ProcessUsageSample
 }
 
-func NewProcess(pid uint32, stats *taskstats.Stats, tracer *ebpftracer.Tracer) *Process {
-	p := &Process{Pid: pid, StartedAt: stats.BeginTime}
+// newProcessFn and procStartTimeFn are NewProcess and proc.GetStartTime; tests replace them.
+var (
+	newProcessFn = func(pid uint32, startedAt time.Time, r *Registry) *Process {
+		return NewProcess(pid, startedAt, r.tracer)
+	}
+	procStartTimeFn = proc.GetStartTime
+)
+
+func NewProcess(pid uint32, startedAt time.Time, tracer *ebpftracer.Tracer) *Process {
+	p := &Process{Pid: pid, StartedAt: startedAt}
 	p.Flags, _ = proc.GetFlags(pid)
 	p.ctx, p.cancelFunc = context.WithCancel(context.Background())
 	go p.instrument(tracer)

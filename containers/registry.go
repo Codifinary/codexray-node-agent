@@ -250,22 +250,9 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			}
 			switch e.Type {
 			case ebpftracer.EventTypeProcessStart:
-				c, seen := r.containersByPid[e.Pid]
-				switch { // possible pids wraparound + missed `process-exit` event
-				case c == nil && seen: // ignored
-					delete(r.containersByPid, e.Pid)
-				case c != nil: // revalidating by cgroup
-					cg, err := proc.ReadCgroup(e.Pid)
-					if err != nil || cg.Id != c.cgroup.Id {
-						delete(r.containersByPid, e.Pid)
-						c.onProcessExit(e.Pid, false)
-					}
-				}
+				r.revalidatePidMapping(e.Pid)
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
-					p := c.onProcessStart(e.Pid)
-					if r.processInfoCh != nil && p != nil {
-						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}
-					}
+					r.sendProcessInfo(c, c.onProcessStart(e.Pid))
 				}
 			case ebpftracer.EventTypeProcessExit:
 				if c := r.containersByPid[e.Pid]; c != nil {
@@ -279,17 +266,7 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 
 			case ebpftracer.EventTypeListenOpen:
-				if c := r.getOrCreateContainer(e.Pid); c != nil {
-					if common.PortFilter.ShouldBeSkipped(e.SrcAddr.Port()) {
-						agentMetrics.listenOpenEvents.WithLabelValues(listenPortFiltered).Inc()
-					} else {
-						agentMetrics.listenOpenEvents.WithLabelValues(listenStored).Inc()
-					}
-					c.onListenOpen(e.Pid, e.SrcAddr, false)
-				} else {
-					agentMetrics.listenOpenEvents.WithLabelValues(listenNoContainer).Inc()
-					klog.Infoln("TCP listen open from unknown container", e)
-				}
+				r.handleListenOpen(e.Pid, e.SrcAddr)
 			case ebpftracer.EventTypeListenClose:
 				if c := r.containersByPid[e.Pid]; c != nil {
 					c.onListenClose(e.Pid, e.SrcAddr)
@@ -333,6 +310,51 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			}
 		}
 	}
+}
+
+// revalidatePidMapping forgets pid's container when the pid now lives in another cgroup: pids
+// wrap around and a process-exit event can be missed.
+func (r *Registry) revalidatePidMapping(pid uint32) {
+	c, seen := r.containersByPid[pid]
+	switch {
+	case c == nil && seen: // ignored
+		delete(r.containersByPid, pid)
+	case c != nil:
+		cg, err := proc.ReadCgroup(pid)
+		if err != nil || cg.Id != c.cgroup.Id {
+			delete(r.containersByPid, pid)
+			c.onProcessExit(pid, false)
+		}
+	}
+}
+
+func (r *Registry) sendProcessInfo(c *Container, p *Process) {
+	if r.processInfoCh != nil && p != nil {
+		r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}
+	}
+}
+
+// handleListenOpen stores a listen with its container, registering the listening process
+// first if its start event was missed or could not be handled: an unregistered owner's
+// listen is never reported.
+func (r *Registry) handleListenOpen(pid uint32, addr netaddr.IPPort) {
+	if common.PortFilter.ShouldBeSkipped(addr.Port()) {
+		agentMetrics.listenOpenEvents.WithLabelValues(listenPortFiltered).Inc()
+		return
+	}
+	r.revalidatePidMapping(pid)
+	c := r.getOrCreateContainer(pid)
+	if c == nil {
+		agentMetrics.listenOpenEvents.WithLabelValues(listenNoContainer).Inc()
+		klog.Infoln("TCP listen open from unknown container", pid, addr)
+		return
+	}
+	if p := c.ensureProcess(pid); p != nil {
+		agentMetrics.listenAttributions.WithLabelValues(attributionEventRetry).Inc()
+		r.sendProcessInfo(c, p)
+	}
+	agentMetrics.listenOpenEvents.WithLabelValues(listenStored).Inc()
+	c.onListenOpen(pid, addr, false)
 }
 
 func (r *Registry) getOrCreateContainer(pid uint32) *Container {

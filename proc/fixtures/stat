@@ -1,0 +1,4 @@
+cpu  1 2 3 4
+intr 0
+btime 1700000000
+processes 99

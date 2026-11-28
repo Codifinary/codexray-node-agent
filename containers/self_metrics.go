@@ -68,7 +68,7 @@ func newSelfMetrics() *selfMetrics {
 			"Attempts to register a process with its container", "result",
 			registrationOK, registrationTaskstatsFallback, registrationGone, registrationTaskstatsFailed),
 		listenAttributions: counterVec("node_agent_listen_attributions_total",
-			"Listens tied to a process after the listen event itself could not be", "source",
+			"Listens whose process was registered by the listen event or gc rather than by its own start event", "source",
 			attributionEventRetry, attributionGCMissing, attributionGCRekey),
 		listensUnattributed: prometheus.NewCounter(prometheus.CounterOpts{Name: "node_agent_listens_unattributed_total",
 			Help: "Listens still open in the kernel that no registered process of their container holds, so they are not reported"}),

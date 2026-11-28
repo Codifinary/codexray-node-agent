@@ -12,6 +12,8 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/codifinary/codexray-node-agent/cgroup"
 )
@@ -87,4 +89,63 @@ func ListPids() ([]uint32, error) {
 		res = append(res, uint32(pid64))
 	}
 	return res, nil
+}
+
+// clockTicks is USER_HZ, the unit of /proc/<pid>/stat times; it is 100 on every architecture the agent runs on.
+const clockTicks = 100
+
+var (
+	bootTimeOnce sync.Once
+	bootTime     time.Time
+	bootTimeErr  error
+)
+
+// GetStartTime is when the process started, from /proc/<pid>/stat and the boot time in /proc/stat.
+func GetStartTime(pid uint32) (time.Time, error) {
+	data, err := os.ReadFile(Path(pid, "stat"))
+	if err != nil {
+		return time.Time{}, err
+	}
+	// The command (field 2) is in parentheses and may hold spaces or parentheses itself.
+	end := bytes.LastIndexByte(data, ')')
+	if end < 0 {
+		return time.Time{}, errors.New("invalid stat: no command")
+	}
+	fields := strings.Fields(string(data[end+1:]))
+	const startTimeField = 22 - 3 // fields after the command start at field 3
+	if len(fields) <= startTimeField {
+		return time.Time{}, errors.New("invalid stat: no start time")
+	}
+	ticks, err := strconv.ParseUint(fields[startTimeField], 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid start time: %w", err)
+	}
+	boot, err := getBootTime()
+	if err != nil {
+		return time.Time{}, err
+	}
+	return boot.Add(time.Duration(ticks) * time.Second / clockTicks), nil
+}
+
+func getBootTime() (time.Time, error) {
+	bootTimeOnce.Do(func() {
+		data, err := os.ReadFile(path.Join(root, "stat"))
+		if err != nil {
+			bootTimeErr = err
+			return
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if v, ok := strings.CutPrefix(line, "btime "); ok {
+				seconds, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+				if err != nil {
+					bootTimeErr = fmt.Errorf("invalid btime: %w", err)
+					return
+				}
+				bootTime = time.Unix(seconds, 0)
+				return
+			}
+		}
+		bootTimeErr = errors.New("btime not found")
+	})
+	return bootTime, bootTimeErr
 }

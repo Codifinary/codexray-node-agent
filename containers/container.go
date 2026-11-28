@@ -463,35 +463,85 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 func (c *Container) onProcessStart(pid uint32) *Process {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	stats, err := taskstatsPIDFn(pid)
-	if err != nil {
-		agentMetrics.processRegistrations.WithLabelValues(registrationTaskstatsFailed).Inc()
+	return c.startProcessLocked(pid, false)
+}
+
+// ensureProcess registers pid unless it already is, taking its start time from /proc when
+// taskstats can't read it: the event loop calls it for a listen's owner, which must be
+// registered for the listen to be reported.
+func (c *Container) ensureProcess(pid uint32) *Process {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if c.processes[pid] != nil {
 		return nil
 	}
-	c.zombieAt = time.Time{}
-	p := NewProcess(pid, stats, c.registry.tracer)
+	return c.startProcessLocked(pid, true)
+}
 
+// startProcessLocked registers pid and returns it, or nil when it is already registered
+// (a duplicate start event) or can't be read.
+func (c *Container) startProcessLocked(pid uint32, allowFallback bool) *Process {
+	startedAt, result, ok := processStartTime(pid, allowFallback)
+	if !ok {
+		agentMetrics.processRegistrations.WithLabelValues(result).Inc()
+		return nil
+	}
+	if old := c.processes[pid]; old != nil {
+		if d := old.StartedAt.Sub(startedAt); d > -sameProcessStartSlack && d < sameProcessStartSlack {
+			return nil
+		}
+		old.Close() // the pid was reused
+	}
+	p := newProcessFn(pid, startedAt, c.registry)
 	if p == nil {
 		return nil
 	}
+	c.zombieAt = time.Time{}
 	c.processes[pid] = p
-	agentMetrics.processRegistrations.WithLabelValues(registrationOK).Inc()
+	agentMetrics.processRegistrations.WithLabelValues(result).Inc()
+	c.updateStartedAtLocked(startedAt)
+	return p
+}
 
+// sameProcessStartSlack is how far apart two start times of one pid may be and still be the
+// same process: taskstats and /proc round them differently.
+const sameProcessStartSlack = 2 * time.Second
+
+// processStartTime is when pid started, and the registration result it stands for.
+func processStartTime(pid uint32, allowFallback bool) (time.Time, string, bool) {
+	stats, err := taskstatsPIDFn(pid)
+	if err == nil {
+		return stats.BeginTime, registrationOK, true
+	}
+	if !allowFallback {
+		return time.Time{}, registrationTaskstatsFailed, false
+	}
+	startedAt, err := procStartTimeFn(pid)
+	if err != nil {
+		return time.Time{}, registrationGone, false
+	}
+	return startedAt, registrationTaskstatsFallback, true
+}
+
+// updateStartedAtLocked moves the container's start to its oldest process; a later oldest
+// process means the container restarted.
+func (c *Container) updateStartedAtLocked(begin time.Time) (restarted bool) {
 	if c.startedAt.IsZero() {
-		c.startedAt = stats.BeginTime
-	} else {
-		min := stats.BeginTime
-		for _, p := range c.processes {
-			if p.StartedAt.Before(min) {
-				min = p.StartedAt
-			}
-		}
-		if min.After(c.startedAt) {
-			c.restarts++
-			c.startedAt = min
+		c.startedAt = begin
+		return false
+	}
+	min := begin
+	for _, p := range c.processes {
+		if p.StartedAt.Before(min) {
+			min = p.StartedAt
 		}
 	}
-	return p
+	if min.After(c.startedAt) {
+		c.restarts++
+		c.startedAt = min
+		return true
+	}
+	return false
 }
 
 func (c *Container) onProcessExit(pid uint32, oomKill bool) {
