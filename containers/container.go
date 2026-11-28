@@ -44,7 +44,12 @@ type ContainerNetwork struct {
 }
 
 type ContainerMetadata struct {
-	name               string
+	name string
+	// runtimeID is the runtime's own container id (Docker's 64-hex id), imageID the local image id.
+	runtimeID          string
+	imageID            string
+	otelServiceName    string
+	otelServiceVersion string
 	labels             map[string]string
 	volumes            map[string]string
 	logPath            string
@@ -263,7 +268,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	if c.metadata.image != "" || c.metadata.systemdTriggeredBy != "" {
-		ch <- gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemdTriggeredBy)
+		ch <- containerInfoMetric(c.metadata)
 	}
 
 	ch <- counter(metrics.Restarts, float64(c.restarts))
@@ -1307,6 +1312,12 @@ func resolveFd(pid uint32, fd uint64) (mntId string, logPath string) {
 
 func counter(desc *prometheus.Desc, value float64, labelValues ...string) prometheus.Metric {
 	return prometheus.MustNewConstMetric(desc, prometheus.CounterValue, value, labelValues...)
+}
+
+// containerInfoMetric is container_info; its label values follow metrics.ContainerInfo's labels.
+func containerInfoMetric(md *ContainerMetadata) prometheus.Metric {
+	return gauge(metrics.ContainerInfo, 1, md.image, md.systemdTriggeredBy,
+		md.runtimeID, md.imageID, md.otelServiceName, md.otelServiceVersion)
 }
 
 func gauge(desc *prometheus.Desc, value float64, labelValues ...string) prometheus.Metric {

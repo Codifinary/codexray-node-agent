@@ -106,6 +106,9 @@ func (c *Client) ContainerInspect(ctx context.Context, id string) (*ContainerJSO
 // ContainerJSON mirrors the fields of github.com/docker/docker/api/types.ContainerJSON
 // that the agent reads. Anything not needed is intentionally omitted.
 type ContainerJSON struct {
+	ID string `json:"Id"`
+	// Image is the local image id ("sha256:…"); Config.Image is the reference it was run as.
+	Image           string
 	Name            string
 	LogPath         string
 	Config          *Config

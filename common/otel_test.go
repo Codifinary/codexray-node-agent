@@ -40,3 +40,33 @@ func TestContainerIdToServiceName(t *testing.T) {
 		f("/docker/container_name"),
 		"/docker/container_name")
 }
+
+func TestOtelServiceFromEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name, wantName, wantVersion string
+		env                         map[string]string
+	}{
+		{name: "no env", env: nil},
+		{name: "service name only", env: map[string]string{OtelServiceNameEnv: "shop"}, wantName: "shop"},
+		{name: "resource attributes", env: map[string]string{
+			OtelResourceAttributesEnv: "service.name=shop,service.version=1.2.3,deployment.environment=lab"},
+			wantName: "shop", wantVersion: "1.2.3"},
+		{name: "OTEL_SERVICE_NAME wins", env: map[string]string{
+			OtelServiceNameEnv: " orders ", OtelResourceAttributesEnv: "service.name=shop,service.version=2"},
+			wantName: "orders", wantVersion: "2"},
+		{name: "spaces and percent-encoding", env: map[string]string{
+			OtelResourceAttributesEnv: " service.version = 1.0%2Brc1 , service.name=a%20b"},
+			wantName: "a b", wantVersion: "1.0+rc1"},
+		{name: "malformed pairs are skipped", env: map[string]string{
+			OtelResourceAttributesEnv: "garbage,service.version=3,=x,service.name"},
+			wantVersion: "3"},
+		{name: "undecodable value kept as is", env: map[string]string{
+			OtelResourceAttributesEnv: "service.version=1%zz"}, wantVersion: "1%zz"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name, version := OtelServiceFromEnv(tc.env)
+			assert.Equal(t, tc.wantName, name)
+			assert.Equal(t, tc.wantVersion, version)
+		})
+	}
+}

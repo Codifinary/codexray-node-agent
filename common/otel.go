@@ -5,8 +5,15 @@
 package common
 
 import (
+	"net/url"
 	"regexp"
 	"strings"
+)
+
+// The container env keys the agent reads the OpenTelemetry service identity from.
+const (
+	OtelServiceNameEnv        = "OTEL_SERVICE_NAME"
+	OtelResourceAttributesEnv = "OTEL_RESOURCE_ATTRIBUTES"
 )
 
 var (
@@ -26,4 +33,29 @@ func ContainerIdToOtelServiceName(containerId string) string {
 		}
 	}
 	return containerId
+}
+
+// OtelServiceFromEnv is the service name and version an OpenTelemetry SDK would report from
+// this env: OTEL_SERVICE_NAME, else service.name of OTEL_RESOURCE_ATTRIBUTES, and its
+// service.version. Malformed attribute pairs are skipped.
+func OtelServiceFromEnv(env map[string]string) (name, version string) {
+	for _, pair := range strings.Split(env[OtelResourceAttributesEnv], ",") {
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok {
+			continue
+		}
+		if decoded, err := url.PathUnescape(strings.TrimSpace(value)); err == nil {
+			value = decoded
+		}
+		switch strings.TrimSpace(key) {
+		case "service.name":
+			name = strings.TrimSpace(value)
+		case "service.version":
+			version = strings.TrimSpace(value)
+		}
+	}
+	if serviceName := strings.TrimSpace(env[OtelServiceNameEnv]); serviceName != "" {
+		name = serviceName
+	}
+	return name, version
 }

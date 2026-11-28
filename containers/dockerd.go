@@ -50,17 +50,23 @@ func DockerdInspect(containerID string) (*ContainerMetadata, error) {
 	}
 	res := &ContainerMetadata{
 		name:        strings.TrimPrefix(c.Name, "/"),
-		labels:      c.Config.Labels,
-		image:       c.Config.Image,
+		runtimeID:   c.ID,
+		imageID:     c.Image,
 		volumes:     map[string]string{},
 		hostListens: map[string][]netaddr.IPPort{},
 		networks:    map[string]ContainerNetwork{},
 		env:         map[string]string{},
 	}
+	if c.Config != nil {
+		res.labels = c.Config.Labels
+		res.image = c.Config.Image
+		res.env = dockerEnv(c.Config.Env)
+	}
+	res.otelServiceName, res.otelServiceVersion = common.OtelServiceFromEnv(res.env)
 	for _, m := range c.Mounts {
 		res.volumes[m.Destination] = common.ParseKubernetesVolumeSource(m.Source)
 	}
-	if c.LogPath != "" && c.HostConfig.LogConfig.Type == "json-file" {
+	if c.LogPath != "" && c.HostConfig != nil && c.HostConfig.LogConfig.Type == "json-file" {
 		res.logPath = c.LogPath
 		res.logDecoder = logparser.DockerJsonDecoder{}
 	}
@@ -92,16 +98,23 @@ func DockerdInspect(containerID string) (*ContainerMetadata, error) {
 			}
 		}
 	}
-	if c.Config != nil {
-		for _, value := range c.Config.Env {
-			idx := strings.Index(value, "=")
-			if idx < 0 {
-				continue
-			}
-			k := value[:idx]
-			v := value[idx+1:]
-			res.env[k] = v
+	return res, nil
+}
+
+// dockerEnvKeys are the env keys the agent reads: the Nomad ids calcId builds a container id
+// from, and the OpenTelemetry service identity. The rest of the env is not kept.
+var dockerEnvKeys = map[string]bool{
+	"NOMAD_ALLOC_ID": true, "NOMAD_GROUP_NAME": true, "NOMAD_JOB_NAME": true, "NOMAD_NAMESPACE": true, "NOMAD_TASK_NAME": true,
+	common.OtelServiceNameEnv: true, common.OtelResourceAttributesEnv: true,
+}
+
+func dockerEnv(env []string) map[string]string {
+	res := map[string]string{}
+	for _, value := range env {
+		k, v, ok := strings.Cut(value, "=")
+		if ok && dockerEnvKeys[k] {
+			res[k] = v
 		}
 	}
-	return res, nil
+	return res
 }
