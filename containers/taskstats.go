@@ -14,6 +14,8 @@ import (
 var (
 	taskstatsClient *taskstats.Client
 	taskstatsLock   sync.Mutex
+	// taskstatsPIDFn is TaskstatsPID; tests replace it.
+	taskstatsPIDFn = TaskstatsPID
 )
 
 func TaskstatsInit() error {

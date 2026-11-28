@@ -25,6 +25,7 @@ import (
 	"github.com/codifinary/codexray-node-agent/common"
 	"github.com/codifinary/codexray-node-agent/ebpftracer/l7"
 	"github.com/codifinary/codexray-node-agent/proc"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 	"inet.af/netaddr"
@@ -250,6 +251,7 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 
 	pageSize := os.Getpagesize()
 	for _, pm := range perfMaps {
+		lostSamples.WithLabelValues(pm.name)
 		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: 100})
 		if err != nil {
 			t.Close()
@@ -376,6 +378,17 @@ type l7Event struct {
 	PayloadSize         uint64
 }
 
+// lostSamples counts events the kernel dropped because a perf map's buffer was full.
+var lostSamples = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_agent_ebpf_lost_samples_total",
+	Help: "eBPF events dropped because a perf map's buffer was full, by map",
+}, []string{"map"})
+
+// Metrics are the tracer's own metrics.
+func Metrics() []prometheus.Collector {
+	return []prometheus.Collector{lostSamples}
+}
+
 func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType, readTimeout time.Duration) {
 	if readTimeout == 0 {
 		readTimeout = 100 * time.Millisecond
@@ -390,6 +403,7 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			continue
 		}
 		if rec.LostSamples > 0 {
+			lostSamples.WithLabelValues(name).Add(float64(rec.LostSamples))
 			klog.Errorln(name, "lost samples:", rec.LostSamples)
 			continue
 		}

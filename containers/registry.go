@@ -131,6 +131,11 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, gp
 	if err = reg.Register(r); err != nil {
 		return nil, err
 	}
+	for _, c := range append(agentMetrics.collectors(), ebpftracer.Metrics()...) {
+		if err = reg.Register(c); err != nil {
+			return nil, err
+		}
+	}
 	go r.handleEvents(r.events)
 	if err = r.tracer.Run(r.events); err != nil {
 		close(r.events)
@@ -275,8 +280,14 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 
 			case ebpftracer.EventTypeListenOpen:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
+					if common.PortFilter.ShouldBeSkipped(e.SrcAddr.Port()) {
+						agentMetrics.listenOpenEvents.WithLabelValues(listenPortFiltered).Inc()
+					} else {
+						agentMetrics.listenOpenEvents.WithLabelValues(listenStored).Inc()
+					}
 					c.onListenOpen(e.Pid, e.SrcAddr, false)
 				} else {
+					agentMetrics.listenOpenEvents.WithLabelValues(listenNoContainer).Inc()
 					klog.Infoln("TCP listen open from unknown container", e)
 				}
 			case ebpftracer.EventTypeListenClose:
@@ -339,6 +350,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	cg, err := proc.ReadCgroup(pid)
 	if err != nil {
 		if !common.IsNotExist(err) {
+			agentMetrics.containerLookupFailures.WithLabelValues(lookupCgroup).Inc()
 			klog.Warningln("failed to read proc cgroup:", err)
 		}
 		return nil
@@ -360,6 +372,7 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	}
 	md, err := getContainerMetadata(cg)
 	if err != nil {
+		agentMetrics.containerLookupFailures.WithLabelValues(lookupMetadata).Inc()
 		klog.Warningf("failed to get container metadata for pid %d -> %s: %s", pid, cg.Id, err)
 		return nil
 	}
@@ -395,11 +408,13 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	}
 	c, err := NewContainer(id, cg, md, pid, r)
 	if err != nil {
+		agentMetrics.containerLookupFailures.WithLabelValues(lookupCreate).Inc()
 		klog.Warningf("failed to create container pid=%d cg=%s id=%s: %s", pid, cg.Id, id, err)
 		return nil
 	}
 	klog.InfoS("detected a new container", "pid", pid, "cg", cg.Id, "id", id, "app", c.appId)
 	if err := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id), "app_id": c.appId}, r.reg).Register(c); err != nil {
+		agentMetrics.containerLookupFailures.WithLabelValues(lookupRegister).Inc()
 		klog.Warningln("failed to register container:", err)
 		return nil
 	}
@@ -560,7 +575,7 @@ func getContainerMetadata(cg *cgroup.Cgroup) (*ContainerMetadata, error) {
 	}
 	var dockerdErr error
 	if dockerdClient != nil {
-		md, err := DockerdInspect(cg.ContainerId)
+		md, err := dockerdInspectFn(cg.ContainerId)
 		if err == nil {
 			return md, nil
 		}

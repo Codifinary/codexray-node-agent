@@ -463,8 +463,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 func (c *Container) onProcessStart(pid uint32) *Process {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	stats, err := TaskstatsPID(pid)
+	stats, err := taskstatsPIDFn(pid)
 	if err != nil {
+		agentMetrics.processRegistrations.WithLabelValues(registrationTaskstatsFailed).Inc()
 		return nil
 	}
 	c.zombieAt = time.Time{}
@@ -474,6 +475,7 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 		return nil
 	}
 	c.processes[pid] = p
+	agentMetrics.processRegistrations.WithLabelValues(registrationOK).Inc()
 
 	if c.startedAt.IsZero() {
 		c.startedAt = stats.BeginTime
@@ -1251,6 +1253,7 @@ func (c *Container) revalidateListens(now time.Time, actualListens map[netaddr.I
 				continue
 			}
 			klog.Warningln("missing listen found:", addr, pid)
+			agentMetrics.listenAttributions.WithLabelValues(attributionGCMissing).Inc()
 			c.onListenOpen(pid, addr, true)
 		}
 	}

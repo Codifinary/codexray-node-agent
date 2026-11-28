@@ -21,6 +21,8 @@ const dockerdTimeout = 30 * time.Second
 
 var (
 	dockerdClient *dockerclient.Client
+	// dockerdInspectFn is DockerdInspect; tests replace it.
+	dockerdInspectFn = DockerdInspect
 )
 
 func DockerdInit() error {
@@ -79,6 +81,8 @@ func DockerdInspect(containerID string) (*ContainerMetadata, error) {
 			for _, b := range bindings {
 				if ipp, err := netaddr.ParseIPPort(b.HostIP + ":" + b.HostPort); err == nil {
 					addrs[ipp] = struct{}{}
+				} else {
+					agentMetrics.dockerPortBindings.WithLabelValues(bindingParseFailed).Inc()
 				}
 			}
 		}
@@ -86,8 +90,10 @@ func DockerdInspect(containerID string) (*ContainerMetadata, error) {
 			s := make([]netaddr.IPPort, 0, len(addrs))
 			for addr := range addrs {
 				if common.PortFilter.ShouldBeSkipped(addr.Port()) {
+					agentMetrics.dockerPortBindings.WithLabelValues(bindingPortFiltered).Inc()
 					continue
 				}
+				agentMetrics.dockerPortBindings.WithLabelValues(bindingOK).Inc()
 				s = append(s, addr)
 			}
 			res.hostListens["dockerd"] = s
