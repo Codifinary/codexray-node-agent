@@ -7,6 +7,8 @@ package containers
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,22 +75,11 @@ func DockerdInspect(containerID string) (*ContainerMetadata, error) {
 		res.logDecoder = logparser.DockerJsonDecoder{}
 	}
 	if c.NetworkSettings != nil {
-		addrs := map[netaddr.IPPort]struct{}{}
-		for port, bindings := range c.NetworkSettings.Ports {
-			if port.Proto() != "tcp" {
-				continue
-			}
-			for _, b := range bindings {
-				if ipp, err := netaddr.ParseIPPort(b.HostIP + ":" + b.HostPort); err == nil {
-					addrs[ipp] = struct{}{}
-				} else {
-					agentMetrics.dockerPortBindings.WithLabelValues(bindingParseFailed).Inc()
-				}
-			}
-		}
+		addrs, invalid := dockerPublishedListens(c.NetworkSettings.Ports)
+		agentMetrics.dockerPortBindings.WithLabelValues(bindingParseFailed).Add(float64(invalid))
 		if len(addrs) > 0 {
 			s := make([]netaddr.IPPort, 0, len(addrs))
-			for addr := range addrs {
+			for _, addr := range addrs {
 				if common.PortFilter.ShouldBeSkipped(addr.Port()) {
 					agentMetrics.dockerPortBindings.WithLabelValues(bindingPortFiltered).Inc()
 					continue
@@ -105,6 +96,54 @@ func DockerdInspect(containerID string) (*ContainerMetadata, error) {
 		}
 	}
 	return res, nil
+}
+
+// dockerPublishedListens are the host addresses of the TCP ports a container publishes, and how
+// many bindings could not be parsed. An empty HostIP binds every interface, of both families.
+func dockerPublishedListens(ports map[dockerclient.Port][]dockerclient.PortBinding) ([]netaddr.IPPort, int) {
+	seen := map[netaddr.IPPort]bool{}
+	invalid := 0
+	for port, bindings := range ports {
+		if port.Proto() != "tcp" {
+			continue
+		}
+		for _, b := range bindings {
+			if b.HostPort == "" {
+				continue
+			}
+			hostPort, err := strconv.ParseUint(b.HostPort, 10, 16)
+			if err != nil {
+				invalid++
+				continue
+			}
+			if hostPort == 0 {
+				continue
+			}
+			var ips []netaddr.IP
+			if host := strings.TrimSuffix(strings.TrimPrefix(b.HostIP, "["), "]"); host == "" {
+				ips = []netaddr.IP{netaddr.IPv4(0, 0, 0, 0), netaddr.IPv6Unspecified()}
+			} else if ip, err := netaddr.ParseIP(host); err == nil {
+				ips = []netaddr.IP{ip.Unmap()}
+			} else {
+				invalid++
+				continue
+			}
+			for _, ip := range ips {
+				seen[netaddr.IPPortFrom(ip, uint16(hostPort))] = true
+			}
+		}
+	}
+	res := make([]netaddr.IPPort, 0, len(seen))
+	for addr := range seen {
+		res = append(res, addr)
+	}
+	sort.Slice(res, func(i, j int) bool {
+		if res[i].IP() != res[j].IP() {
+			return res[i].IP().Less(res[j].IP())
+		}
+		return res[i].Port() < res[j].Port()
+	})
+	return res, invalid
 }
 
 // dockerEnvKeys are the env keys the agent reads: the Nomad ids calcId builds a container id

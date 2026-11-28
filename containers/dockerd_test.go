@@ -9,6 +9,7 @@ import (
 	"github.com/codifinary/codexray-node-agent/internal/dockerclient"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"inet.af/netaddr"
 )
 
 // fakeDockerd answers every container inspect with body for the rest of the test.
@@ -58,4 +59,63 @@ func TestDockerdInspectWithoutConfigOrHostConfig(t *testing.T) {
 	assert.Empty(t, md.image)
 	assert.Empty(t, md.logPath, "no log driver is known without HostConfig")
 	assert.Empty(t, md.env)
+}
+
+func TestDockerPublishedListens(t *testing.T) {
+	addr := netaddr.MustParseIPPort
+	for _, tc := range []struct {
+		name        string
+		ports       map[dockerclient.Port][]dockerclient.PortBinding
+		want        []netaddr.IPPort
+		wantInvalid int
+	}{
+		{name: "IPv4 and IPv6 bindings of one port", ports: map[dockerclient.Port][]dockerclient.PortBinding{
+			"80/tcp": {{HostIP: "0.0.0.0", HostPort: "8080"}, {HostIP: "::", HostPort: "8080"}}},
+			want: []netaddr.IPPort{addr("0.0.0.0:8080"), addr("[::]:8080")}},
+		{name: "empty host IP binds both families", ports: map[dockerclient.Port][]dockerclient.PortBinding{
+			"80/tcp": {{HostIP: "", HostPort: "8080"}}},
+			want: []netaddr.IPPort{addr("0.0.0.0:8080"), addr("[::]:8080")}},
+		{name: "bracketed and plain IPv6", ports: map[dockerclient.Port][]dockerclient.PortBinding{
+			"80/tcp": {{HostIP: "[::1]", HostPort: "18081"}, {HostIP: "fd00::5", HostPort: "18082"}}},
+			want: []netaddr.IPPort{addr("[::1]:18081"), addr("[fd00::5]:18082")}},
+		{name: "IPv4-mapped is unmapped", ports: map[dockerclient.Port][]dockerclient.PortBinding{
+			"80/tcp": {{HostIP: "::ffff:10.0.0.1", HostPort: "80"}}},
+			want: []netaddr.IPPort{addr("10.0.0.1:80")}},
+		{name: "udp ignored, duplicates merged", ports: map[dockerclient.Port][]dockerclient.PortBinding{
+			"53/udp": {{HostIP: "0.0.0.0", HostPort: "53"}},
+			"80/tcp": {{HostIP: "10.0.0.1", HostPort: "80"}, {HostIP: "10.0.0.1", HostPort: "80"}}},
+			want: []netaddr.IPPort{addr("10.0.0.1:80")}},
+		{name: "unpublished and invalid", ports: map[dockerclient.Port][]dockerclient.PortBinding{
+			"80/tcp":   nil,
+			"81/tcp":   {{HostIP: "0.0.0.0", HostPort: ""}, {HostIP: "0.0.0.0", HostPort: "0"}},
+			"82/tcp":   {{HostIP: "0.0.0.0", HostPort: "abc"}, {HostIP: "0.0.0.0", HostPort: "70000"}},
+			"83/tcp":   {{HostIP: "not-an-ip", HostPort: "83"}},
+			"8443/tcp": {{HostIP: "127.0.0.1", HostPort: "8443"}}},
+			want: []netaddr.IPPort{addr("127.0.0.1:8443")}, wantInvalid: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, invalid := dockerPublishedListens(tc.ports)
+			assert.Equal(t, tc.want, got)
+			assert.Equal(t, tc.wantInvalid, invalid)
+		})
+	}
+}
+
+func TestExpandProxiedListensKeepsTheFamily(t *testing.T) {
+	addr := netaddr.MustParseIPPort
+	hostIps := []netaddr.IP{netaddr.MustParseIP("192.168.1.10"), netaddr.MustParseIP("2001:db8::10")}
+	got := expandProxiedListens(map[string][]netaddr.IPPort{
+		"dockerd": {addr("0.0.0.0:8080"), addr("[::]:8080"), addr("[::1]:18081")},
+	}, hostIps)
+	assert.Equal(t, map[string]map[netaddr.IPPort]struct{}{"dockerd": {
+		addr("192.168.1.10:8080"): {}, addr("[2001:db8::10]:8080"): {}, addr("[::1]:18081"): {},
+	}}, got)
+}
+
+func TestDockerdInspectIPv6PublishedPort(t *testing.T) {
+	fakeDockerd(t, `{"Id":"1","Name":"/v6","Config":{},"HostConfig":{},
+		"NetworkSettings":{"Ports":{"80/tcp":[{"HostIp":"::1","HostPort":"18081"}]}}}`)
+	md, err := DockerdInspect("v6")
+	require.NoError(t, err)
+	assert.Equal(t, []netaddr.IPPort{netaddr.MustParseIPPort("[::1]:18081")}, md.hostListens["dockerd"])
 }

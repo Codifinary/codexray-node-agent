@@ -996,9 +996,13 @@ func (c *Container) getProxiedListens() map[string]map[netaddr.IPPort]struct{} {
 			}
 		}
 	}
+	return expandProxiedListens(c.metadata.hostListens, hostIps)
+}
 
+// expandProxiedListens replaces each unspecified host address with the host's IPs of its family.
+func expandProxiedListens(hostListens map[string][]netaddr.IPPort, hostIps []netaddr.IP) map[string]map[netaddr.IPPort]struct{} {
 	res := map[string]map[netaddr.IPPort]struct{}{}
-	for proxy, addrs := range c.metadata.hostListens {
+	for proxy, addrs := range hostListens {
 		res[proxy] = map[netaddr.IPPort]struct{}{}
 		for _, addr := range addrs {
 			if addr.IP().IsUnspecified() {
