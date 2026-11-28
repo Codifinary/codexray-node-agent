@@ -160,6 +160,8 @@ type Container struct {
 	lock sync.Mutex
 	// listenResyncCh asks the container goroutine to revalidate listens soon: a listen's owner exited.
 	listenResyncCh chan struct{}
+	// metadataRefreshInFlight: a re-inspection after a restart is running.
+	metadataRefreshInFlight bool
 
 	done chan struct{}
 }
@@ -510,8 +512,65 @@ func (c *Container) startProcessLocked(pid uint32, allowFallback bool) *Process 
 	c.zombieAt = time.Time{}
 	c.processes[pid] = p
 	agentMetrics.processRegistrations.WithLabelValues(result).Inc()
-	c.updateStartedAtLocked(startedAt)
+	if c.updateStartedAtLocked(startedAt) {
+		c.scheduleMetadataRefreshLocked()
+	}
 	return p
+}
+
+// Restart re-inspections wait metadataRefreshDelay for the runtime to settle, at most
+// len(metadataRefreshSlots) of them at a time.
+var (
+	metadataRefreshDelay = 5 * time.Second
+	metadataRefreshSlots = make(chan struct{}, 4)
+)
+
+// scheduleMetadataRefreshLocked re-inspects a restarted Docker container in the background: a
+// restart can publish its ports on new host ports, which the metadata from its creation lacks.
+func (c *Container) scheduleMetadataRefreshLocked() {
+	if c.cgroup == nil || c.cgroup.ContainerType != cgroup.ContainerTypeDocker || c.cgroup.ContainerId == "" {
+		return
+	}
+	if c.metadataRefreshInFlight {
+		agentMetrics.dockerMetadataRefreshes.WithLabelValues(refreshSkipped).Inc()
+		return
+	}
+	c.metadataRefreshInFlight = true
+	go c.refreshMetadata(c.cgroup.Id, c.cgroup.ContainerId, metadataRefreshDelay, dockerdInspectFn)
+}
+
+func (c *Container) refreshMetadata(cgroupID, dockerID string, delay time.Duration,
+	inspect func(string) (*ContainerMetadata, error)) {
+	select {
+	case <-c.done:
+		return
+	case <-time.After(delay):
+	}
+	metadataRefreshSlots <- struct{}{}
+	md, err := inspect(dockerID)
+	<-metadataRefreshSlots
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.metadataRefreshInFlight = false
+	if err != nil {
+		agentMetrics.dockerMetadataRefreshes.WithLabelValues(refreshError).Inc()
+		klog.Warningf("failed to re-inspect restarted container %s: %s", c.id, err)
+		return
+	}
+	select {
+	case <-c.done:
+		return
+	default:
+	}
+	if c.cgroup.Id != cgroupID {
+		agentMetrics.dockerMetadataRefreshes.WithLabelValues(refreshSkipped).Inc()
+		return
+	}
+	// Only what a restart changes: swapping the whole metadata would restart the log tail.
+	c.metadata.hostListens = md.hostListens
+	c.metadata.networks = md.networks
+	agentMetrics.dockerMetadataRefreshes.WithLabelValues(refreshOK).Inc()
 }
 
 // sameProcessStartSlack is how far apart two start times of one pid may be and still be the

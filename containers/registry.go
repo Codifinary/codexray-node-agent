@@ -419,11 +419,13 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 
 	if c := r.containersById[id]; c != nil {
 		klog.Warningln("id conflict:", id)
+		c.lock.Lock()
 		if cg.CreatedAt().After(c.cgroup.CreatedAt()) {
 			c.cgroup = cg
 			c.metadata = md
 			c.runLogParser("")
 		}
+		c.lock.Unlock()
 		r.containersByPid[pid] = c
 		r.containersByCgroupId[cg.Id] = c
 		return c
