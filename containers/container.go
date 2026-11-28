@@ -158,6 +158,8 @@ type Container struct {
 	registry *Registry
 
 	lock sync.Mutex
+	// listenResyncCh asks the container goroutine to revalidate listens soon: a listen's owner exited.
+	listenResyncCh chan struct{}
 
 	done chan struct{}
 }
@@ -205,19 +207,28 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 
 		registry: registry,
 
-		done: make(chan struct{}),
+		listenResyncCh: make(chan struct{}, 1),
+		done:           make(chan struct{}),
 	}
 	c.runLogParser("")
 
 	go func() {
 		ticker := time.NewTicker(gcInterval)
 		defer ticker.Stop()
+		var resync <-chan time.Time
 		for {
 			select {
 			case <-c.done:
 				return
 			case t := <-ticker.C:
 				c.gc(t)
+			case <-c.listenResyncCh:
+				if resync == nil {
+					resync = time.After(listenResyncDelay)
+				}
+			case t := <-resync:
+				resync = nil
+				c.resyncListens(t)
 			}
 		}
 	}()
@@ -551,6 +562,12 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 		p.Close()
 	}
 	delete(c.processes, pid)
+	if c.ownsOpenListenLocked(pid) {
+		select {
+		case c.listenResyncCh <- struct{}{}:
+		default:
+		}
+	}
 	if len(c.processes) == 0 {
 		c.zombieAt = time.Now()
 	}
@@ -558,6 +575,18 @@ func (c *Container) onProcessExit(pid uint32, oomKill bool) {
 	if oomKill {
 		c.oomKills++
 	}
+}
+
+// listenResyncDelay lets the processes a listen's owner leaves behind settle before the resync.
+var listenResyncDelay = 5 * time.Second
+
+func (c *Container) ownsOpenListenLocked(pid uint32) bool {
+	for _, byPid := range c.listens {
+		if details := byPid[pid]; details != nil && details.ClosedAt.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Container) onFileOpen(pid uint32, fd uint64, mnt uint64, log bool) {
@@ -1198,28 +1227,10 @@ func (c *Container) gc(now time.Time) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	established := map[ConnectionKey]struct{}{}
-	listens := map[netaddr.IPPort]string{}
-	seenNamespaces := map[string]bool{}
-	for _, p := range c.processes {
-		if seenNamespaces[p.NetNsId()] {
-			continue
-		}
-		sockets, err := proc.GetSockets(p.Pid)
-		if err != nil {
-			continue
-		}
-		for _, s := range sockets {
-			if s.Listen {
-				listens[s.SAddr] = s.Inode
-			} else {
-				established[ConnectionKey{src: s.SAddr, dst: s.DAddr}] = struct{}{}
-			}
-		}
-		seenNamespaces[p.NetNsId()] = true
+	listens, established, complete := c.scanSocketsLocked()
+	if complete {
+		c.revalidateListens(now, listens, c.inodeOwnersLocked)
 	}
-
-	c.revalidateListens(now, listens)
 
 	establishedDst := map[common.HostPort]struct{}{}
 	for k, conn := range c.activeConnections {
@@ -1255,7 +1266,58 @@ func (c *Container) gc(now time.Time) {
 	}
 }
 
-func (c *Container) revalidateListens(now time.Time, actualListens map[netaddr.IPPort]string) {
+// scanSocketsLocked reads the kernel's TCP sockets of every network namespace the container's
+// processes are in; complete is false when a namespace could not be read, so its listens
+// must not be judged closed.
+func (c *Container) scanSocketsLocked() (map[netaddr.IPPort]string, map[ConnectionKey]struct{}, bool) {
+	listens := map[netaddr.IPPort]string{}
+	established := map[ConnectionKey]struct{}{}
+	seenNamespaces := map[string]bool{}
+	namespaces := map[string]bool{}
+	for _, p := range c.processes {
+		ns := p.NetNsId()
+		if ns != "" {
+			namespaces[ns] = true
+		}
+		if seenNamespaces[ns] {
+			continue
+		}
+		sockets, err := proc.GetSockets(p.Pid)
+		// A process that just exited reads as no sockets: another one of the namespace may still read it.
+		if err != nil || len(sockets) == 0 {
+			continue
+		}
+		for _, s := range sockets {
+			if s.Listen {
+				listens[s.SAddr] = s.Inode
+			} else {
+				established[ConnectionKey{src: s.SAddr, dst: s.DAddr}] = struct{}{}
+			}
+		}
+		seenNamespaces[ns] = true
+	}
+	for ns := range namespaces {
+		if !seenNamespaces[ns] {
+			return listens, established, false
+		}
+	}
+	return listens, established, true
+}
+
+// resyncListens revalidates the listens soon after a listen's owner exited, so one another
+// process keeps open (a forking daemon, a handed-over socket) is reported again within seconds.
+func (c *Container) resyncListens(now time.Time) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if listens, _, complete := c.scanSocketsLocked(); complete {
+		c.revalidateListens(now, listens, c.inodeOwnersLocked)
+	}
+}
+
+// revalidateListens reconciles the listens with the kernel's (address -> socket inode): gone
+// ones close, and one with no open entry of a registered process moves to the registered
+// process that holds its socket. owners maps socket inodes to those processes.
+func (c *Container) revalidateListens(now time.Time, actualListens map[netaddr.IPPort]string, owners func() map[string]uint32) {
 	for addr, byPid := range c.listens {
 		if _, open := actualListens[addr]; open {
 			continue
@@ -1268,46 +1330,50 @@ func (c *Container) revalidateListens(now time.Time, actualListens map[netaddr.I
 		}
 	}
 
-	missingListens := map[netaddr.IPPort]string{}
+	type missingListen struct {
+		inode string
+		// orphaned: the listen has an open entry, but of a process that is not registered.
+		orphaned bool
+	}
+	missingListens := map[netaddr.IPPort]missingListen{}
 	for addr, inode := range actualListens {
-		byPids, found := c.listens[addr]
-		if !found {
-			missingListens[addr] = inode
-			continue
-		}
-		open := false
-		for _, details := range byPids {
-			if details.ClosedAt.IsZero() {
-				open = true
+		owned, orphaned := false, false
+		for pid, details := range c.listens[addr] {
+			if !details.ClosedAt.IsZero() {
+				continue
+			}
+			if c.processes[pid] != nil {
+				owned = true
 				break
 			}
+			orphaned = true
 		}
-		if !open {
-			missingListens[addr] = inode
+		if !owned {
+			missingListens[addr] = missingListen{inode: inode, orphaned: orphaned}
 		}
 	}
 
 	if len(missingListens) > 0 {
-		inodeToPid := map[string]uint32{}
-		for pid := range c.processes {
-			fds, err := proc.ReadFds(pid)
-			if err != nil {
-				klog.Warningln(err)
+		inodeToPid := owners()
+		for addr, missing := range missingListens {
+			pid, found := inodeToPid[missing.inode]
+			if !found {
+				if missing.orphaned {
+					agentMetrics.listensUnattributed.Inc()
+				}
 				continue
 			}
-			for _, fd := range fds {
-				if fd.SocketInode != "" {
-					inodeToPid[fd.SocketInode] = pid
+			for owner := range c.listens[addr] {
+				if c.processes[owner] == nil {
+					delete(c.listens[addr], owner)
 				}
 			}
-		}
-		for addr, inode := range missingListens {
-			pid, found := inodeToPid[inode]
-			if !found {
-				continue
-			}
 			klog.Warningln("missing listen found:", addr, pid)
-			agentMetrics.listenAttributions.WithLabelValues(attributionGCMissing).Inc()
+			source := attributionGCMissing
+			if missing.orphaned {
+				source = attributionGCRekey
+			}
+			agentMetrics.listenAttributions.WithLabelValues(source).Inc()
 			c.onListenOpen(pid, addr, true)
 		}
 	}
@@ -1322,6 +1388,41 @@ func (c *Container) revalidateListens(now time.Time, actualListens map[netaddr.I
 			delete(c.listens, addr)
 		}
 	}
+}
+
+// inodeOwnersLocked maps the socket inodes the container's registered processes hold to one of them.
+func (c *Container) inodeOwnersLocked() map[string]uint32 {
+	fdsByPid := map[uint32][]proc.Fd{}
+	startedAt := map[uint32]time.Time{}
+	for pid, p := range c.processes {
+		fds, err := readFdsFn(pid)
+		if err != nil {
+			klog.Warningln(err)
+			continue
+		}
+		fdsByPid[pid] = fds
+		startedAt[pid] = p.StartedAt
+	}
+	return pickInodeOwners(fdsByPid, startedAt)
+}
+
+// pickInodeOwners gives each socket inode to the earliest-started process holding it (the
+// lowest pid on a tie), so a pre-fork server's listens stay with its master.
+func pickInodeOwners(fdsByPid map[uint32][]proc.Fd, startedAt map[uint32]time.Time) map[string]uint32 {
+	res := map[string]uint32{}
+	for pid, fds := range fdsByPid {
+		for _, fd := range fds {
+			if fd.SocketInode == "" {
+				continue
+			}
+			current, taken := res[fd.SocketInode]
+			if !taken || startedAt[pid].Before(startedAt[current]) ||
+				startedAt[pid].Equal(startedAt[current]) && pid < current {
+				res[fd.SocketInode] = pid
+			}
+		}
+	}
+	return res
 }
 
 func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32) {

@@ -53,12 +53,14 @@ type Process struct {
 	gpuUsageSamples []gpu.ProcessUsageSample
 }
 
-// newProcessFn and procStartTimeFn are NewProcess and proc.GetStartTime; tests replace them.
+// newProcessFn, procStartTimeFn and readFdsFn are NewProcess, proc.GetStartTime and
+// proc.ReadFds; tests replace them.
 var (
 	newProcessFn = func(pid uint32, startedAt time.Time, r *Registry) *Process {
 		return NewProcess(pid, startedAt, r.tracer)
 	}
 	procStartTimeFn = proc.GetStartTime
+	readFdsFn       = proc.ReadFds
 )
 
 func NewProcess(pid uint32, startedAt time.Time, tracer *ebpftracer.Tracer) *Process {
